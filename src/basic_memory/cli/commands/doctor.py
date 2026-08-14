@@ -7,28 +7,88 @@ import uuid
 from pathlib import Path
 
 from loguru import logger
-from mcp.server.fastmcp.exceptions import ToolError
 from rich.console import Console
 import typer
 
 from basic_memory.cli.app import app
 from basic_memory.cli.commands.command_utils import run_with_cleanup
 from basic_memory.cli.commands.routing import force_routing, validate_routing_flags
-from basic_memory.markdown.entity_parser import EntityParser
-from basic_memory.markdown.markdown_processor import MarkdownProcessor
-from basic_memory.markdown.schemas import EntityFrontmatter, EntityMarkdown
 from basic_memory.mcp.async_client import get_client
 from basic_memory.mcp.clients import KnowledgeClient, ProjectClient, SearchClient
 from basic_memory.schemas.base import Entity
 from basic_memory.schemas.project_info import ProjectInfoRequest
 from basic_memory.schemas.search import SearchQuery
-from basic_memory.schemas import SyncReportResponse
+from basic_memory.schemas import ProjectIndexRunResponse
 
 console = Console()
 
 
+def _is_default_project_delete_error(error: Exception) -> bool:
+    """Return True only for the API guard that blocks deleting the default project."""
+    error_text = str(error)
+    return "Cannot delete default project" in error_text
+
+
+async def _delete_doctor_project_locally(project_name: str, project_id: str) -> None:
+    """Remove the generated doctor project when the public API guard blocks cleanup."""
+    from basic_memory import db
+    from basic_memory.config import ConfigManager
+    from basic_memory.repository import ProjectRepository
+
+    config_manager = ConfigManager()
+    repository = ProjectRepository()
+    _, session_maker = await db.get_or_create_db(
+        db_path=config_manager.config.database_path,
+        db_type=db.DatabaseType.FILESYSTEM,
+    )
+
+    async with db.scoped_session(session_maker) as session:
+        project = await repository.get_by_external_id(session, project_id)
+        if project is None:
+            raise ValueError(f"Doctor cleanup project '{project_id}' not found")
+        if project.name != project_name:
+            raise ValueError(
+                f"Doctor cleanup expected project '{project_name}', found '{project.name}'"
+            )
+        await repository.delete(session, project.id)
+
+    config = config_manager.load_config()
+    if project_name in config.projects:
+        del config.projects[project_name]
+        if config.default_project == project_name:
+            config.default_project = next(iter(config.projects), None)
+        config_manager.save_config(config)
+
+
+async def _delete_doctor_project(
+    project_client: ProjectClient, project_name: str, project_id: str
+) -> None:
+    """Delete the generated doctor project without weakening the public API guard."""
+    # Deferred: ToolError lives in FastMCP's runtime, which must not load at CLI startup (#886).
+    from fastmcp.exceptions import ToolError
+
+    try:
+        await project_client.delete_project(project_id)
+    except ToolError as exc:
+        if not _is_default_project_delete_error(exc):
+            raise
+
+        # Trigger: fresh local configs can promote the generated doctor project
+        # to default because the placeholder default has no DB row.
+        # Why: the project is disposable doctor-owned state, while the public API
+        # must keep rejecting default-project deletion for normal callers.
+        # Outcome: cleanup removes only the exact doctor project it created.
+        await _delete_doctor_project_locally(project_name, project_id)
+
+
 async def run_doctor() -> None:
     """Run local consistency checks for file <-> database flows."""
+    # Deferred: the markdown parsing stack is only needed while the checks run,
+    # and importing it at module level slows every CLI invocation (#886).
+    from basic_memory.markdown.entity_parser import EntityParser
+    from basic_memory.markdown.markdown_processor import MarkdownProcessor
+    from basic_memory.markdown.schemas import EntityFrontmatter, EntityMarkdown
+
     console.print("[blue]Running Basic Memory doctor checks...[/blue]")
 
     project_name = f"doctor-{uuid.uuid4().hex[:8]}"
@@ -81,7 +141,7 @@ async def run_doctor() -> None:
 
                 console.print("[green]OK[/green] API write created file")
 
-                # --- File -> DB: write markdown file directly, then sync ---
+                # --- File -> DB: write markdown file directly, then index ---
                 parser = EntityParser(project_path)
                 processor = MarkdownProcessor(parser)
                 manual_markdown = EntityMarkdown(
@@ -100,14 +160,14 @@ async def run_doctor() -> None:
                 await processor.write_file(manual_path, manual_markdown)
                 console.print("[green]OK[/green] Manual file written")
 
-                sync_data = await project_client.sync(
+                index_data = await project_client.index(
                     project_id, force_full=False, run_in_background=False
                 )
-                sync_report = SyncReportResponse.model_validate(sync_data)
-                if sync_report.total == 0:
-                    raise ValueError("Sync did not detect any changes")
+                project_index_run = ProjectIndexRunResponse.model_validate(index_data)
+                if project_index_run.enqueued_files == 0:
+                    raise ValueError("Project index did not enqueue any files")
 
-                console.print("[green]OK[/green] Sync indexed manual file")
+                console.print("[green]OK[/green] Project index processed manual file")
 
                 search_client = SearchClient(client, project_id)
                 search_query = SearchQuery(title=manual_note_title)
@@ -120,14 +180,17 @@ async def run_doctor() -> None:
                 console.print("[green]OK[/green] Search confirmed manual file")
 
                 status_report = await project_client.get_status(project_id)
-                if status_report.total != 0:
-                    raise ValueError("Project status not clean after sync")
+                observed_paths = {
+                    observed_file.path for observed_file in status_report.observed_files
+                }
+                if "doctor/manual-note.md" not in observed_paths:
+                    raise ValueError("Project index status did not observe manual note")
 
-                console.print("[green]OK[/green] Status clean after sync")
+                console.print("[green]OK[/green] Status observed indexed file")
 
             finally:
                 if project_id:
-                    await project_client.delete_project(project_id)
+                    await _delete_doctor_project(project_client, project_name, project_id)
 
     console.print("[green]Doctor checks passed.[/green]")
 
@@ -139,7 +202,10 @@ def doctor(
     ),
     cloud: bool = typer.Option(False, "--cloud", help="Force cloud API routing"),
 ) -> None:
-    """Run local consistency checks to verify file/database sync."""
+    """Run local consistency checks to verify file/database indexing."""
+    # Deferred: ToolError lives in FastMCP's runtime, which must not load at CLI startup (#886).
+    from fastmcp.exceptions import ToolError
+
     try:
         validate_routing_flags(local, cloud)
         # Doctor runs local filesystem checks — always default to local routing
@@ -148,9 +214,13 @@ def doctor(
         with force_routing(local=local, cloud=cloud):
             run_with_cleanup(run_doctor())
     except (ToolError, ValueError) as e:
-        console.print(f"[red]Doctor failed: {e}[/red]")
+        # str() of a message-less exception (e.g. httpx.ReadTimeout) is empty;
+        # fall back to repr so the failure line always names the error (#1027).
+        error_detail = str(e) or repr(e)
+        console.print(f"[red]Doctor failed: {error_detail}[/red]")
         raise typer.Exit(code=1)
     except Exception as e:
-        logger.error(f"Doctor failed: {e}")
-        typer.echo(f"Doctor failed: {e}", err=True)
+        error_detail = str(e) or repr(e)
+        logger.error(f"Doctor failed: {error_detail}")
+        typer.echo(f"Doctor failed: {error_detail}", err=True)
         raise typer.Exit(code=1)  # pragma: no cover

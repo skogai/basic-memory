@@ -2,11 +2,12 @@
 
 These models define the API response format for schema validation,
 inference, and drift detection operations. They mirror the dataclass
-structures in basic_memory.schema but are Pydantic models suitable
+structures in basic_memory.picoschema but are Pydantic models suitable
 for API serialization.
 """
 
 from pydantic import BaseModel, Field
+from typing import Any
 
 
 # --- Validation Response Models ---
@@ -42,6 +43,17 @@ class NoteValidationResponse(BaseModel):
     errors: list[str] = Field(default_factory=list)
 
 
+class TypeValidationSummary(BaseModel):
+    """Per-type rollup used when validating all schema-covered types at once."""
+
+    note_type: str
+    total_notes: int = 0
+    total_entities: int = 0
+    valid_count: int = 0
+    warning_count: int = 0
+    error_count: int = 0
+
+
 class ValidationReport(BaseModel):
     """Full validation report for one or more notes."""
 
@@ -52,6 +64,10 @@ class ValidationReport(BaseModel):
     warning_count: int = 0
     error_count: int = 0
     results: list[NoteValidationResponse] = Field(default_factory=list)
+    type_summaries: list[TypeValidationSummary] = Field(
+        default_factory=list,
+        description="Per-type breakdown, populated when validating all schema-covered types",
+    )
 
 
 # --- Inference Response Models ---
@@ -82,7 +98,7 @@ class InferenceReport(BaseModel):
     note_type: str
     notes_analyzed: int
     field_frequencies: list[FieldFrequencyResponse] = Field(default_factory=list)
-    suggested_schema: dict = Field(
+    suggested_schema: dict[str, Any] = Field(
         default_factory=dict,
         description="Ready-to-use Picoschema YAML dict",
     )

@@ -7,14 +7,10 @@ from typing import Any
 
 from httpx import AsyncClient
 
-from basic_memory.mcp.tools.utils import (
-    call_delete,
-    call_get,
-    call_patch,
-    call_post,
-    call_put,
-)
-from basic_memory.schemas import ProjectInfoResponse, SyncReportResponse
+# call_* helpers live in basic_memory.mcp.tools.utils; importing that at module
+# level executes the whole tools package (fastmcp + mcp SDK) during CLI startup,
+# so each method defers the import to call time instead (#886).
+from basic_memory.schemas import ProjectIndexStatusResponse, ProjectInfoResponse
 from basic_memory.schemas.project_info import ProjectList, ProjectStatusResponse
 from basic_memory.schemas.v2 import ProjectResolveResponse
 
@@ -53,6 +49,8 @@ class ProjectClient:
         Raises:
             ToolError: If the request fails
         """
+        from basic_memory.mcp.tools.utils import call_get
+
         response = await call_get(
             self.http_client,
             "/v2/projects/",
@@ -71,6 +69,8 @@ class ProjectClient:
         Raises:
             ToolError: If the request fails
         """
+        from basic_memory.mcp.tools.utils import call_post
+
         response = await call_post(
             self.http_client,
             "/v2/projects/",
@@ -93,6 +93,8 @@ class ProjectClient:
         Raises:
             ToolError: If the request fails
         """
+        from basic_memory.mcp.tools.utils import call_delete
+
         url = f"/v2/projects/{project_external_id}"
         if delete_notes:
             url += "?delete_notes=true"
@@ -114,6 +116,8 @@ class ProjectClient:
         Raises:
             ToolError: If the request fails
         """
+        from basic_memory.mcp.tools.utils import call_post
+
         response = await call_post(
             self.http_client,
             "/v2/projects/resolve",
@@ -133,6 +137,8 @@ class ProjectClient:
         Raises:
             ToolError: If the request fails
         """
+        from basic_memory.mcp.tools.utils import call_put
+
         response = await call_put(
             self.http_client,
             f"/v2/projects/{project_external_id}/default",
@@ -154,6 +160,8 @@ class ProjectClient:
         Raises:
             ToolError: If the request fails
         """
+        from basic_memory.mcp.tools.utils import call_patch
+
         response = await call_patch(
             self.http_client,
             f"/v2/projects/{project_external_id}",
@@ -161,27 +169,29 @@ class ProjectClient:
         )
         return ProjectStatusResponse.model_validate(response.json())
 
-    async def sync(
+    async def index(
         self,
         project_external_id: str,
         force_full: bool = False,
         run_in_background: bool = True,
     ) -> dict[str, Any]:
-        """Trigger a sync operation for a project.
+        """Trigger a project indexing operation.
 
         Args:
             project_external_id: Project external ID (UUID)
-            force_full: If True, force a full scan bypassing watermark optimization
+            force_full: If True, request a full project index run
             run_in_background: If True, return immediately; if False, wait for completion
 
         Returns:
             Raw response dict — background mode returns {"message": ...},
-            foreground mode returns a SyncReportResponse-shaped dict.
+            foreground mode returns a project-index run summary.
 
         Raises:
             ToolError: If the request fails
         """
-        url = f"/v2/projects/{project_external_id}/sync"
+        from basic_memory.mcp.tools.utils import call_post
+
+        url = f"/v2/projects/{project_external_id}/index"
         params = []
         if force_full:
             params.append("force_full=true")
@@ -192,23 +202,25 @@ class ProjectClient:
         response = await call_post(self.http_client, url)
         return response.json()
 
-    async def get_status(self, project_external_id: str) -> SyncReportResponse:
-        """Get the sync status for a project.
+    async def get_status(self, project_external_id: str) -> ProjectIndexStatusResponse:
+        """Get the current project-index observation for a project.
 
         Args:
             project_external_id: Project external ID (UUID)
 
         Returns:
-            SyncReportResponse describing pending changes
+            ProjectIndexStatusResponse describing observed indexable files
 
         Raises:
             ToolError: If the request fails
         """
+        from basic_memory.mcp.tools.utils import call_post
+
         response = await call_post(
             self.http_client,
             f"/v2/projects/{project_external_id}/status",
         )
-        return SyncReportResponse.model_validate(response.json())
+        return ProjectIndexStatusResponse.model_validate(response.json())
 
     async def get_info(self, project_external_id: str) -> ProjectInfoResponse:
         """Get detailed project information and statistics.
@@ -222,6 +234,8 @@ class ProjectClient:
         Raises:
             ToolError: If the request fails
         """
+        from basic_memory.mcp.tools.utils import call_get
+
         response = await call_get(
             self.http_client,
             f"/v2/projects/{project_external_id}/info",

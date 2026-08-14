@@ -3,10 +3,13 @@
 from basic_memory.schemas.v2.entity import (
     EntityResolveRequest,
     EntityResolveResponse,
+    LinkResolveRequest,
+    LinkResolveResponse,
     EntityResponseV2,
     MoveEntityRequestV2,
     MoveDirectoryRequestV2,
     DeleteDirectoryRequestV2,
+    IndexFileRequest,
     ProjectResolveRequest,
     ProjectResolveResponse,
 )
@@ -16,26 +19,27 @@ from basic_memory.schemas.v2.graph import (
     GraphResponse,
     OrphanEntitiesResponse,
 )
-from basic_memory.schemas.v2.resource import (
-    CreateResourceRequest,
-    UpdateResourceRequest,
-    ResourceResponse,
+from basic_memory.schemas.v2.project_index import (
+    ProjectIndexResponse,
+    ProjectIndexStartedResponse,
 )
 
 __all__ = [
     "EntityResolveRequest",
     "EntityResolveResponse",
+    "LinkResolveRequest",
+    "LinkResolveResponse",
     "EntityResponseV2",
     "MoveEntityRequestV2",
     "MoveDirectoryRequestV2",
     "DeleteDirectoryRequestV2",
+    "IndexFileRequest",
     "ProjectResolveRequest",
     "ProjectResolveResponse",
     "GraphEdge",
     "GraphNode",
     "GraphResponse",
     "OrphanEntitiesResponse",
-    "CreateResourceRequest",
-    "UpdateResourceRequest",
-    "ResourceResponse",
+    "ProjectIndexResponse",
+    "ProjectIndexStartedResponse",
 ]

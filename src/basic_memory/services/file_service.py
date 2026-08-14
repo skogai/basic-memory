@@ -20,15 +20,16 @@ if TYPE_CHECKING:  # pragma: no cover
 from basic_memory.file_utils import FileError, FileMetadata, ParseError
 from basic_memory.markdown.markdown_processor import MarkdownProcessor
 from basic_memory.models import Entity as EntityModel
+from basic_memory.runtime.storage import RUNTIME_MARKDOWN_CONTENT_TYPE
 from basic_memory.schemas import Entity as EntitySchema
 from basic_memory.services.exceptions import FileOperationError
 from basic_memory.utils import FilePath
 from loguru import logger
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class FrontmatterUpdateResult:
-    """Final content emitted by a frontmatter rewrite without a follow-up reread."""
+    """Exact persisted UTF-8 content and checksum from a frontmatter rewrite."""
 
     checksum: str
     content: str
@@ -139,6 +140,23 @@ class FileService:
         except Exception as e:
             logger.error("Failed to check file existence", path=str(path), error=str(e))
             raise FileOperationError(f"Failed to check file existence: {e}")
+
+    def paths_share_storage_target(self, left: FilePath, right: FilePath) -> bool:
+        """Return whether two project paths resolve to the same physical file.
+
+        Distinguishes a genuine rename from a case-only rename on a
+        case-insensitive filesystem (APFS/NTFS), where ``Notes/Foo.md`` and
+        ``notes/foo.md`` are the same inode. Returns False when either path is
+        absent (nothing shared to protect) or the check errors.
+        """
+        left_abs = self.base_path / left if isinstance(left, str) else left
+        right_abs = self.base_path / right if isinstance(right, str) else right
+        if not left_abs.exists() or not right_abs.exists():
+            return False
+        try:
+            return left_abs.samefile(right_abs)
+        except OSError:
+            return False
 
     async def ensure_directory(self, path: FilePath) -> None:
         """Ensure directory exists, creating if necessary.
@@ -447,7 +465,6 @@ class FileService:
 
         Raises:
             FileOperationError: If file operations fail
-            ParseError: If frontmatter parsing fails
         """
         # Convert string to Path if needed
         path_obj = self.base_path / path if isinstance(path, str) else path
@@ -463,15 +480,15 @@ class FileService:
             if file_utils.has_frontmatter(content):
                 try:
                     current_fm = file_utils.parse_frontmatter(content)
-                    content = file_utils.remove_frontmatter(content)
-                except (ParseError, yaml.YAMLError) as e:  # pragma: no cover
-                    # Log warning and treat as plain markdown without frontmatter
-                    logger.warning(  # pragma: no cover
-                        f"Failed to parse YAML frontmatter in {full_path}: {e}. "
-                        "Treating file as plain markdown without frontmatter."
-                    )
-                    # Keep full content, treat as having no frontmatter
-                    current_fm = {}  # pragma: no cover
+                except ParseError as e:
+                    # Trigger: a fenced frontmatter block cannot be parsed safely.
+                    # Why: Markdown is authoritative, and a partial update cannot know
+                    # which malformed metadata fields the user intended to preserve.
+                    # Outcome: reject the rewrite before any bytes are changed.
+                    raise FileOperationError(
+                        f"Refusing to update malformed frontmatter in {full_path}: {e}"
+                    ) from e
+                content = file_utils.remove_frontmatter(content)
 
             # Update frontmatter
             new_fm = {**current_fm, **updates}
@@ -487,31 +504,31 @@ class FileService:
             await file_utils.write_file_atomic(full_path, final_content)
 
             # Format file if configured
-            content_for_checksum = final_content
             if self.app_config:
-                formatted_content = await file_utils.format_file(
+                await file_utils.format_file(
                     full_path, self.app_config, is_markdown=self.is_markdown(path)
                 )
-                if formatted_content is not None:
-                    content_for_checksum = formatted_content  # pragma: no cover
 
             # Trigger: frontmatter normalization may persist bytes that differ from the
             # in-memory string because of formatter output or platform newline handling.
-            # Why: follow-up scans and checksum-based move detection read raw bytes from disk.
-            # Outcome: the returned checksum always matches the file that was just written.
+            # Why: generation publication must parse the same bytes whose checksum and
+            #   note_content generation are claimed; an LF payload paired with CRLF disk
+            #   bytes is not one coherent snapshot.
+            # Outcome: one binary read supplies both the exact decoded payload and checksum.
+            persisted_bytes = await self.read_file_bytes(full_path)
             return FrontmatterUpdateResult(
-                checksum=await self.compute_checksum(full_path),
-                content=content_for_checksum,
+                checksum=await file_utils.compute_checksum(persisted_bytes),
+                content=persisted_bytes.decode("utf-8"),
             )
 
+        except FileOperationError:
+            raise
         except Exception as e:  # pragma: no cover
-            # Only log real errors (not YAML parsing, which is handled above)
-            if not isinstance(e, (ParseError, yaml.YAMLError)):
-                logger.error(
-                    "Failed to update frontmatter",
-                    path=str(full_path),
-                    error=str(e),
-                )
+            logger.error(
+                "Failed to update frontmatter",
+                path=str(full_path),
+                error=str(e),
+            )
             raise FileOperationError(f"Failed to update frontmatter: {e}")
 
     async def update_frontmatter(self, path: FilePath, updates: Dict[str, Any]) -> str:
@@ -613,4 +630,4 @@ class FileService:
         Returns:
             True if the file is a markdown file, False otherwise
         """
-        return self.content_type(path) == "text/markdown"
+        return self.content_type(path) == RUNTIME_MARKDOWN_CONTENT_TYPE

@@ -11,8 +11,15 @@ from basic_memory.mcp.tools.read_note import read_note
 
 
 @mcp.tool(
+    title="View Note",
     description="View a note as a formatted artifact for better readability.",
-    annotations={"readOnlyHint": True, "openWorldHint": False},
+    tags={"notes"},
+    annotations={
+        "title": "View Note",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": False,
+    },
 )
 async def view_note(
     identifier: str,

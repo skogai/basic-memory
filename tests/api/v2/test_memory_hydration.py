@@ -8,9 +8,10 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from basic_memory.api.v2.utils import to_graph_context
 from basic_memory.schemas.memory import EntitySummary, ObservationSummary, RelationSummary
@@ -44,19 +45,25 @@ def _make_row(*, type: str, id: int, root_id: int, **kwargs: Any) -> ContextResu
     return ContextResultRow(type=type, id=id, **defaults)
 
 
+def _fake_session() -> AsyncSession:
+    return cast(AsyncSession, object())
+
+
 class SpyEntityRepository:
     """Tracks batched ID lookups and returns entities from a preset map."""
 
     def __init__(self, entities_by_id: dict[int, SimpleNamespace]):
         self.entities_by_id = entities_by_id
-        self.calls: list[list[int]] = []
+        self.calls: list[tuple[list[int], bool]] = []
 
     async def find_by_ids(self, ids: list[int]):
-        self.calls.append(ids)
+        self.calls.append((ids, False))
         return [self.entities_by_id[i] for i in ids if i in self.entities_by_id]
 
-    async def find_by_ids_for_hydration(self, ids: list[int]):
-        self.calls.append(ids)
+    async def find_by_ids_for_hydration(
+        self, session: AsyncSession, ids: list[int], *, include_cross_project: bool = False
+    ):
+        self.calls.append((ids, include_cross_project))
         return [self.entities_by_id[i] for i in ids if i in self.entities_by_id]
 
 
@@ -65,13 +72,15 @@ class LightweightOnlyEntityRepository:
 
     def __init__(self, entities_by_id: dict[int, SimpleNamespace]):
         self.entities_by_id = entities_by_id
-        self.hydration_calls: list[list[int]] = []
+        self.hydration_calls: list[tuple[list[int], bool]] = []
 
     async def find_by_ids(self, ids: list[int]):
         raise AssertionError("graph hydration must use the lightweight hydration lookup")
 
-    async def find_by_ids_for_hydration(self, ids: list[int]):
-        self.hydration_calls.append(ids)
+    async def find_by_ids_for_hydration(
+        self, session: AsyncSession, ids: list[int], *, include_cross_project: bool = False
+    ):
+        self.hydration_calls.append((ids, include_cross_project))
         return [self.entities_by_id[i] for i in ids if i in self.entities_by_id]
 
 
@@ -174,10 +183,13 @@ async def test_to_graph_context_batches_entity_hydration_for_recent_activity():
         ),
     )
 
-    graph = await to_graph_context(context, entity_repository=repo, page=1, page_size=10)
+    graph = await to_graph_context(
+        context, entity_repository=repo, session=_fake_session(), page=1, page_size=10
+    )
 
     assert len(repo.calls) == 1, f"Expected 1 entity lookup, got {len(repo.calls)}"
-    assert set(repo.calls[0]) == {1, 2, 3}
+    assert set(repo.calls[0][0]) == {1, 2, 3}
+    assert repo.calls[0][1] is True
 
     first_result = graph.results[0]
     first_primary = first_result.primary_result
@@ -213,7 +225,7 @@ async def test_to_graph_context_empty_results_skip_entity_lookup():
     repo = SpyEntityRepository({})
     context = ServiceContextResult(results=[], metadata=ContextMetadata(depth=1))
 
-    graph = await to_graph_context(context, entity_repository=repo)
+    graph = await to_graph_context(context, entity_repository=repo, session=_fake_session())
 
     assert repo.calls == []
     assert list(graph.results) == []
@@ -269,10 +281,11 @@ async def test_to_graph_context_uses_lightweight_hydration_lookup():
         ),
     )
 
-    graph = await to_graph_context(context, entity_repository=repo)
+    graph = await to_graph_context(context, entity_repository=repo, session=_fake_session())
 
     assert len(repo.hydration_calls) == 1
-    assert set(repo.hydration_calls[0]) == {1, 2}
+    assert set(repo.hydration_calls[0][0]) == {1, 2}
+    assert repo.hydration_calls[0][1] is True
     relation = graph.results[0].related_results[0]
     assert isinstance(relation, RelationSummary)
     assert relation.from_entity_external_id == "ext-root"

@@ -106,6 +106,8 @@ CREATE TABLE IF NOT EXISTS search_vector_chunks (
     source_hash TEXT NOT NULL,
     entity_fingerprint TEXT NOT NULL,
     embedding_model TEXT NOT NULL,
+    vector_index TEXT NOT NULL,
+    embedding_status TEXT NOT NULL CHECK (embedding_status IN ('pending', 'ready')),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (project_id, entity_id, chunk_key)
 )
@@ -128,6 +130,8 @@ CREATE TABLE IF NOT EXISTS search_vector_chunks (
     source_hash TEXT NOT NULL,
     entity_fingerprint TEXT NOT NULL,
     embedding_model TEXT NOT NULL,
+    vector_index TEXT NOT NULL,
+    embedding_status TEXT NOT NULL CHECK (embedding_status IN ('pending', 'ready')),
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 )
 """)
@@ -148,6 +152,9 @@ def create_sqlite_search_vector_embeddings(dimensions: int) -> DDL:
     return DDL(
         f"""
 CREATE VIRTUAL TABLE IF NOT EXISTS search_vector_embeddings
-USING vec0(embedding float[{dimensions}])
+USING vec0(
+    embedding float[{dimensions}],
+    +source_hash text
+)
 """
     )

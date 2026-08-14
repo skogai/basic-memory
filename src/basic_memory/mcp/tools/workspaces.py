@@ -1,6 +1,6 @@
 """Workspace discovery MCP tool."""
 
-from typing import Literal
+from typing import Any, Literal
 
 from fastmcp import Context
 
@@ -45,13 +45,20 @@ def _workspace_list_response(workspaces: list[WorkspaceInfo]) -> WorkspaceListRe
 
 
 @mcp.tool(
+    title="List Workspaces",
     description="List available cloud workspaces (tenant_id, type, role, and name).",
-    annotations={"readOnlyHint": True, "openWorldHint": False},
+    tags={"cloud", "projects"},
+    annotations={
+        "title": "List Workspaces",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": False,
+    },
 )
 async def list_workspaces(
     output_format: Literal["text", "json"] = "text",
     context: Context | None = None,
-) -> str | dict:
+) -> str | dict[str, Any]:
     """List workspaces available to the current cloud user.
 
     Args:

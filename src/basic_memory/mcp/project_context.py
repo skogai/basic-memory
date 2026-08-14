@@ -8,10 +8,21 @@ The resolve_project_parameter function is a thin wrapper for backwards
 compatibility with existing MCP tools.
 """
 
+# PEP 563 lazy annotations keep `Context` usable in signatures without importing
+# fastmcp at module load — the fastmcp/mcp stack costs ~0.5s of CLI startup (#886).
+from __future__ import annotations
+
 import asyncio
 from contextlib import asynccontextmanager, nullcontext
-from dataclasses import dataclass, field
-from typing import AsyncIterator, Awaitable, Callable, List, Optional, Sequence, Tuple, cast
+from typing import (
+    TYPE_CHECKING,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    List,
+    Optional,
+    Tuple,
+)
 from uuid import UUID
 
 from httpx import AsyncClient
@@ -19,8 +30,6 @@ from httpx._types import (
     HeaderTypes,
 )
 from loguru import logger
-from fastmcp import Context
-from mcp.server.fastmcp.exceptions import ToolError
 
 import logfire
 from basic_memory.config import BasicMemoryConfig, ConfigManager, ProjectMode, has_cloud_credentials
@@ -36,57 +45,62 @@ from basic_memory.schemas.cloud import (
 from basic_memory.schemas.project_info import ProjectItem, ProjectList
 from basic_memory.schemas.v2 import ProjectResolveResponse
 from basic_memory.schemas.memory import memory_url_path
-from basic_memory.utils import (
-    build_qualified_permalink_reference,
-    generate_permalink,
-    normalize_project_reference,
-)
+from basic_memory.utils import generate_permalink, normalize_project_reference
 from basic_memory.workspace_context import (
     current_workspace_permalink_context,
     workspace_permalink_context,
 )
+from basic_memory.mcp.project_context_identifiers import (
+    UnresolvedProjectRouteError,
+    WorkspaceMemoryUrlResolution,
+    add_project_metadata as _add_project_metadata,
+    canonical_memory_path_for_active_route as _canonical_memory_path_for_active_route,
+    canonical_memory_path_for_workspace as _canonical_memory_path_for_workspace,
+    canonicalize_project_name as _canonicalize_project_name,
+    detect_project_from_url_prefix,
+    identifier_path as _identifier_path,
+    project_matches_identifier as _project_matches_identifier,
+    split_project_prefix as _split_project_prefix,
+    split_qualified_project_identifier as _split_qualified_project_identifier_impl,
+    split_workspace_identifier_segments as _split_workspace_identifier_segments,
+    split_workspace_memory_url_segments as _split_workspace_memory_url_segments,
+    unqualified_project_identifier as _unqualified_project_identifier,
+)
+from basic_memory.mcp.workspace_project_index import (
+    WORKSPACE_PROJECT_INDEX_STATE_KEY as _WORKSPACE_PROJECT_INDEX_STATE_KEY,
+    WorkspaceProjectEntry,
+    WorkspaceProjectIndex,
+    WorkspaceProjectLookupMiss,
+    build_workspace_project_index as _build_workspace_project_index,
+    clear_cached_active_project as _clear_cached_active_project,
+    clear_cached_active_workspace_for_local_route as _clear_cached_active_workspace_for_local_route,
+    format_qualified_choices as _format_qualified_choices_impl,
+    get_cached_active_project as _get_cached_active_project,
+    get_cached_active_workspace as _get_cached_active_workspace,
+    get_cached_default_project as _get_cached_default_project,
+    match_workspace_identifier as _match_workspace_identifier_impl,
+    resolve_workspace_project_from_index as _resolve_workspace_project_from_index,
+    set_cached_active_project as _set_cached_active_project,
+    set_cached_active_workspace as _set_cached_active_workspace,
+    workspace_project_index_from_state as _workspace_project_index_from_state,
+    workspace_project_index_to_state as _workspace_project_index_to_state,
+)
+
+# Keep the original module's helper surface intact for callers and tests while
+# the implementations live in focused, dependency-light modules.
+add_project_metadata = _add_project_metadata
+_format_qualified_choices = _format_qualified_choices_impl
+_match_workspace_identifier = _match_workspace_identifier_impl
+_split_qualified_project_identifier = _split_qualified_project_identifier_impl
+
+if TYPE_CHECKING:
+    from fastmcp import Context
 
 # --- Workspace provider injection ---
 # Mirrors the set_client_factory() pattern in async_client.py.
 # The cloud MCP server sets a provider that queries its own database directly,
 # avoiding the control-plane HTTP round-trip that requires local credentials.
 _workspace_provider: Optional[Callable[[], Awaitable[list[WorkspaceInfo]]]] = None
-_WORKSPACE_PROJECT_INDEX_STATE_KEY = "workspace_project_index"
-
-
-@dataclass(frozen=True)
-class WorkspaceProjectEntry:
-    """A cloud project resolved together with the workspace that owns it."""
-
-    workspace: WorkspaceInfo
-    project: ProjectItem
-
-    @property
-    def qualified_name(self) -> str:
-        return f"{self.workspace.slug}/{self.project.permalink}"
-
-
-@dataclass(frozen=True)
-class WorkspaceProjectIndex:
-    """Session-local cloud project lookup index keyed by project permalink and external_id."""
-
-    workspaces: tuple[WorkspaceInfo, ...]
-    entries: tuple[WorkspaceProjectEntry, ...]
-    entries_by_permalink: dict[str, tuple[WorkspaceProjectEntry, ...]]
-    entries_by_external_id: dict[str, WorkspaceProjectEntry] = field(default_factory=dict)
-    failed_workspaces: tuple[WorkspaceInfo, ...] = ()
-
-
-@dataclass(frozen=True)
-class WorkspaceMemoryUrlResolution:
-    """Resolved workspace/project route for a workspace-qualified memory URL."""
-
-    entry: WorkspaceProjectEntry
-    canonical_path: str
-
-    @property
-    def project_identifier(self) -> str:
-        return self.entry.qualified_name
 
 
 def set_workspace_provider(provider: Callable[[], Awaitable[list[WorkspaceInfo]]]) -> None:
@@ -116,124 +130,6 @@ async def _resolve_default_project_from_api() -> Optional[str]:
     except Exception:
         pass
     return None
-
-
-async def _get_cached_active_project(context: Optional[Context]) -> Optional[ProjectItem]:
-    """Return the cached active project from context when available."""
-    if not context:
-        return None
-
-    cached_raw = await context.get_state("active_project")
-    if isinstance(cached_raw, dict):
-        return ProjectItem.model_validate(cached_raw)
-    return None
-
-
-async def _set_cached_active_project(
-    context: Optional[Context],
-    active_project: ProjectItem,
-) -> None:
-    """Persist the active project and known default-project metadata in context."""
-    if not context:
-        return
-
-    await context.set_state("active_project", active_project.model_dump())
-    if active_project.is_default:
-        await context.set_state("default_project_name", active_project.name)
-
-
-async def _clear_cached_active_project(context: Optional[Context]) -> None:
-    """Clear cached project metadata that may no longer match the active route."""
-    if not context:
-        return
-
-    await context.set_state("active_project", None)
-    await context.set_state("default_project_name", None)
-
-
-async def _get_cached_active_workspace(context: Optional[Context]) -> Optional[WorkspaceInfo]:
-    """Return the cached active workspace from context when available."""
-    if not context:
-        return None
-
-    cached_raw = await context.get_state("active_workspace")
-    if isinstance(cached_raw, dict):
-        return WorkspaceInfo.model_validate(cached_raw)
-    return None
-
-
-async def _set_cached_active_workspace(
-    context: Optional[Context],
-    active_workspace: WorkspaceInfo,
-) -> None:
-    """Persist workspace context and clear project cache when the tenant changes."""
-    if not context:
-        return
-
-    cached_workspace = await _get_cached_active_workspace(context)
-    if cached_workspace and cached_workspace.tenant_id != active_workspace.tenant_id:
-        # Trigger: project routing moved to another workspace
-        # Why: project names are only unique inside one workspace, so a cached
-        #   ProjectItem from the previous tenant can point at the wrong project
-        # Outcome: force the next validation call to resolve within the new tenant
-        await _clear_cached_active_project(context)
-
-    await context.set_state("active_workspace", active_workspace.model_dump())
-
-
-async def _clear_cached_active_workspace_for_local_route(context: Optional[Context]) -> None:
-    """Drop tenant workspace metadata before routing through a local project."""
-    if not context:
-        return
-
-    # Trigger: local routing follows a cloud route in the same MCP session
-    # Why: active_workspace is tenant metadata, not part of local project identity
-    # Outcome: memory:// resolution uses project-only local permalinks
-    await context.set_state("active_workspace", None)
-
-
-async def _get_cached_default_project(context: Optional[Context]) -> Optional[str]:
-    """Return the cached default project name from context when available."""
-    if not context:
-        return None
-
-    cached_default = await context.get_state("default_project_name")
-    if isinstance(cached_default, str):
-        return cached_default
-    return None
-
-
-def _canonicalize_project_name(
-    project_name: Optional[str],
-    config: BasicMemoryConfig,
-) -> Optional[str]:
-    """Return the configured project name when the identifier matches by permalink.
-
-    Project routing happens before API validation, so we normalize explicit inputs
-    here to keep local/cloud routing aligned with the database's case-insensitive
-    project resolver.
-    """
-    if project_name is None:
-        return None
-
-    requested_permalink = generate_permalink(project_name)
-    for configured_name in config.projects:
-        if generate_permalink(configured_name) == requested_permalink:
-            return configured_name
-
-    return project_name
-
-
-def _project_matches_identifier(project_item: ProjectItem, identifier: Optional[str]) -> bool:
-    """Return True when the identifier refers to the cached project."""
-    if identifier is None:
-        return True
-
-    normalized_identifier = generate_permalink(identifier)
-    return normalized_identifier in {
-        generate_permalink(project_item.name),
-        project_item.permalink,
-    }
 
 
 async def resolve_project_parameter(
@@ -312,204 +208,6 @@ async def get_project_names(client: AsyncClient, headers: HeaderTypes | None = N
     response = await call_get(client, "/v2/projects/", headers=headers)
     project_list = ProjectList.model_validate(response.json())
     return [project.name for project in project_list.projects]
-
-
-def _workspace_project_index_from_state(raw: object) -> WorkspaceProjectIndex | None:
-    """Deserialize a cached workspace project index from MCP context state."""
-    if not isinstance(raw, dict):
-        return None
-
-    raw_mapping = cast(dict[str, object], raw)
-    workspaces_raw = raw_mapping.get("workspaces")
-    entries_raw = raw_mapping.get("entries")
-    if not isinstance(workspaces_raw, list) or not isinstance(entries_raw, list):
-        return None
-
-    workspaces = tuple(WorkspaceInfo.model_validate(item) for item in workspaces_raw)
-    failed_workspaces_raw = raw_mapping.get("failed_workspaces")
-    failed_workspaces = (
-        tuple(WorkspaceInfo.model_validate(item) for item in failed_workspaces_raw)
-        if isinstance(failed_workspaces_raw, list)
-        else ()
-    )
-    entries_list: list[WorkspaceProjectEntry] = []
-    for item in entries_raw:
-        if not isinstance(item, dict):
-            continue
-        item_mapping = cast(dict[str, object], item)
-        workspace_raw = item_mapping.get("workspace")
-        project_raw = item_mapping.get("project")
-        if workspace_raw is None or project_raw is None:
-            continue
-        entries_list.append(
-            WorkspaceProjectEntry(
-                workspace=WorkspaceInfo.model_validate(workspace_raw),
-                project=ProjectItem.model_validate(project_raw),
-            )
-        )
-    entries = tuple(entries_list)
-    return _build_workspace_project_index(
-        workspaces,
-        entries,
-        failed_workspaces=failed_workspaces,
-    )
-
-
-def _workspace_project_index_to_state(index: WorkspaceProjectIndex) -> dict:
-    """Serialize a workspace project index for MCP context state."""
-    return {
-        "workspaces": [workspace.model_dump() for workspace in index.workspaces],
-        "failed_workspaces": [workspace.model_dump() for workspace in index.failed_workspaces],
-        "entries": [
-            {
-                "workspace": entry.workspace.model_dump(),
-                "project": entry.project.model_dump(),
-            }
-            for entry in index.entries
-        ],
-    }
-
-
-def _build_workspace_project_index(
-    workspaces: tuple[WorkspaceInfo, ...],
-    entries: tuple[WorkspaceProjectEntry, ...],
-    *,
-    failed_workspaces: tuple[WorkspaceInfo, ...] = (),
-) -> WorkspaceProjectIndex:
-    """Build the permalink and external_id lookup tables for workspace-project entries."""
-    grouped: dict[str, list[WorkspaceProjectEntry]] = {}
-    by_external_id: dict[str, WorkspaceProjectEntry] = {}
-    for entry in entries:
-        grouped.setdefault(entry.project.permalink, []).append(entry)
-        by_external_id[entry.project.external_id] = entry
-
-    return WorkspaceProjectIndex(
-        workspaces=workspaces,
-        entries=entries,
-        entries_by_permalink={
-            permalink: tuple(items)
-            for permalink, items in sorted(grouped.items(), key=lambda item: item[0])
-        },
-        entries_by_external_id=by_external_id,
-        failed_workspaces=failed_workspaces,
-    )
-
-
-def _split_qualified_project_identifier(identifier: str) -> tuple[str | None, str]:
-    """Split ``<workspace-slug>/<project>`` identifiers for cloud routing."""
-    cleaned = identifier.strip()
-    if "/" not in cleaned:
-        return None, cleaned
-
-    workspace_slug, project_identifier = cleaned.split("/", 1)
-    if not workspace_slug or not project_identifier:
-        return None, cleaned
-    return workspace_slug, project_identifier
-
-
-def _unqualified_project_identifier(identifier: str) -> str:
-    """Return the project segment from an optional qualified project identifier."""
-    _, project_identifier = _split_qualified_project_identifier(identifier)
-    return project_identifier
-
-
-def _identifier_path(identifier: str) -> str:
-    """Return the routable path portion of a raw identifier or memory URL."""
-    stripped = identifier.strip()
-    return memory_url_path(stripped) if stripped.startswith("memory://") else stripped
-
-
-def _split_workspace_identifier_segments(identifier: str) -> tuple[str, str, str] | None:
-    """Split ``<workspace>/<project>/<path>`` identifiers into route segments."""
-    normalized = normalize_project_reference(_identifier_path(identifier)).strip("/")
-    parts = normalized.split("/", 2)
-    if len(parts) != 3:
-        # Trigger: two-segment identifiers such as `workspace/project` or `project/path`.
-        # Why: without a remainder, the shape is ambiguous with existing project-prefix routing.
-        # Outcome: fall through so the normal project-prefix/default-project resolver decides.
-        return None
-
-    workspace_slug, project_identifier, remainder = parts
-    if not workspace_slug or not project_identifier or not remainder:
-        return None
-    return workspace_slug, project_identifier, remainder
-
-
-def _split_workspace_memory_url_segments(identifier: str) -> tuple[str, str, str] | None:
-    """Split ``memory://<workspace>/<project>/<path>`` into route segments."""
-    if not identifier.strip().startswith("memory://"):
-        return None
-
-    return _split_workspace_identifier_segments(identifier)
-
-
-def _canonical_memory_path_for_workspace(
-    *,
-    workspace_slug: str,
-    workspace_type: str,
-    project_permalink: str,
-    remainder: str,
-) -> str:
-    """Return the stored canonical path for a workspace-qualified memory URL."""
-    normalized_remainder = remainder.strip("/")
-    if workspace_type not in {"organization", "personal"}:
-        raise ValueError(f"Unsupported workspace_type for memory URL routing: {workspace_type}")
-
-    # Trigger: a caller supplied a workspace-qualified memory URL.
-    # Why: the first two path segments are the global route, even for Personal.
-    # Outcome: lookups preserve the complete workspace/project canonical permalink.
-    if not normalized_remainder:
-        normalized_remainder = project_permalink
-    return build_qualified_permalink_reference(
-        project_permalink,
-        normalized_remainder,
-        include_project=True,
-        workspace_permalink=workspace_slug,
-    )
-
-
-def _canonical_memory_path_for_active_route(
-    active_project: ProjectItem,
-    path: str,
-    *,
-    include_project: bool,
-    cached_workspace: WorkspaceInfo | None = None,
-) -> str:
-    """Return the canonical permalink path for the currently routed project/workspace."""
-    project_prefix = active_project.permalink
-    workspace_remainder = path
-    if include_project and (path == project_prefix or path.startswith(f"{project_prefix}/")):
-        # Trigger: the memory URL already names the active project root/prefix
-        # Why: workspace canonicalization adds the project prefix itself, so
-        #   keeping it in the remainder would produce <workspace>/<project>/<project>
-        # Outcome: keep project-root and project-prefixed URLs canonical once
-        workspace_remainder = (
-            "" if path == project_prefix else path.removeprefix(f"{project_prefix}/")
-        )
-
-    workspace_context = current_workspace_permalink_context()
-    if workspace_context is not None:
-        return _canonical_memory_path_for_workspace(
-            workspace_slug=workspace_context.workspace_slug,
-            workspace_type=workspace_context.workspace_type,
-            project_permalink=active_project.permalink,
-            remainder=workspace_remainder,
-        )
-
-    if cached_workspace is not None:
-        return _canonical_memory_path_for_workspace(
-            workspace_slug=cached_workspace.slug,
-            workspace_type=cached_workspace.workspace_type,
-            project_permalink=active_project.permalink,
-            remainder=workspace_remainder,
-        )
-
-    if not include_project:
-        return path
-
-    if path == project_prefix or path.startswith(f"{project_prefix}/"):
-        return path
-    return f"{project_prefix}/{path}"
 
 
 def _cloud_workspace_discovery_available(config: BasicMemoryConfig) -> bool:
@@ -638,11 +336,6 @@ async def _resolve_workspace_segments(
     return WorkspaceMemoryUrlResolution(entry=entry, canonical_path=canonical_path)
 
 
-def _format_qualified_choices(entries: Sequence[WorkspaceProjectEntry]) -> str:
-    """Format qualified project choices for collision errors."""
-    return " or ".join(entry.qualified_name for entry in entries)
-
-
 async def get_available_workspaces(context: Optional[Context] = None) -> list[WorkspaceInfo]:
     """Load available cloud workspaces for the current authenticated user."""
     if context:
@@ -685,6 +378,12 @@ async def invalidate_workspace_project_index(context: Optional[Context] = None) 
         await context.set_state(_WORKSPACE_PROJECT_INDEX_STATE_KEY, None)
 
 
+async def invalidate_project_caches(context: Optional[Context] = None) -> None:
+    """Invalidate project identity caches after a project lifecycle change."""
+    await _clear_cached_active_project(context)
+    await invalidate_workspace_project_index(context)
+
+
 async def _fetch_workspace_project_entries(
     workspace: WorkspaceInfo,
     context: Optional[Context] = None,
@@ -722,9 +421,15 @@ async def _fetch_workspace_project_entries(
 
 async def _ensure_workspace_project_index(
     context: Optional[Context] = None,
+    *,
+    force_refresh: bool = False,
 ) -> WorkspaceProjectIndex:
-    """Build or load the session-local workspace/project lookup index."""
-    if context:
+    """Build or load the session-local workspace/project lookup index.
+
+    force_refresh bypasses the cached index and rebuilds from discovery —
+    used by resolve_workspace_project_identifier when a lookup misses (#956).
+    """
+    if context and not force_refresh:
         cached_raw = await context.get_state(_WORKSPACE_PROJECT_INDEX_STATE_KEY)
         cached_index = _workspace_project_index_from_state(cached_raw)
         if cached_index is not None:
@@ -804,117 +509,20 @@ async def resolve_workspace_project_identifier(
 ) -> WorkspaceProjectEntry:
     """Resolve a project by external_id (UUID), qualified name, or unqualified name."""
     index = await _ensure_workspace_project_index(context=context)
-
-    # Fast path: direct lookup by external_id when the identifier is a UUID
-    # Canonicalize via str(UUID(...)) so uppercase, brace-wrapped, or urn:uuid forms
-    # all hash to the same lowercase-hyphenated key as the stored external_ids.
     try:
-        canonical_external_id = str(UUID(project))
-        entry = index.entries_by_external_id.get(canonical_external_id)
-        if entry:
-            return entry
-    except ValueError:
-        pass
-
-    workspace_slug, project_identifier = _split_qualified_project_identifier(project)
-    project_permalink = generate_permalink(project_identifier)
-
-    if workspace_slug:
-        workspace_matches = [
-            workspace
-            for workspace in index.workspaces
-            if workspace.slug.casefold() == workspace_slug.casefold()
-        ]
-        if not workspace_matches:
-            available = ", ".join(workspace.slug for workspace in index.workspaces)
-            raise ValueError(
-                f"Workspace '{workspace_slug}' was not found. "
-                f"Available workspace slugs: {available}"
-            )
-
-        workspace = workspace_matches[0]
-        matches = [
-            entry
-            for entry in index.entries_by_permalink.get(project_permalink, ())
-            if entry.workspace.tenant_id == workspace.tenant_id
-        ]
-        if not matches:
-            if any(
-                failed_workspace.tenant_id == workspace.tenant_id
-                for failed_workspace in index.failed_workspaces
-            ):
-                raise ValueError(
-                    f"Projects for workspace '{workspace.name}' ({workspace.slug}) "
-                    "could not be loaded. Retry after workspace discovery recovers."
-                )
-            available = ", ".join(
-                entry.qualified_name
-                for entry in index.entries
-                if entry.workspace.tenant_id == workspace.tenant_id
-            )
-            raise ValueError(
-                f"Project '{project_identifier}' was not found in workspace "
-                f"'{workspace.name}' ({workspace.slug}). Available projects: {available}"
-            )
-        if len(matches) > 1:
-            details = ", ".join(
-                f"{entry.qualified_name} ({entry.project.external_id})" for entry in matches
-            )
-            raise ValueError(
-                f"Project '{project_identifier}' matched multiple projects in workspace "
-                f"'{workspace.name}' ({workspace.slug}). Project permalinks must be unique. "
-                f"Matches: {details}"
-            )
-        return matches[0]
-
-    matches = list(index.entries_by_permalink.get(project_permalink, ()))
-    if not matches:
-        failed_note = ""
-        if index.failed_workspaces:
-            failed = ", ".join(workspace.slug for workspace in index.failed_workspaces)
-            failed_note = (
-                f" Project discovery failed for workspace(s): {failed}; "
-                "retry or use a qualified project from an indexed workspace."
-            )
-        available = ", ".join(entry.qualified_name for entry in index.entries)
-        raise ValueError(
-            f"Project '{project}' was not found in indexed cloud workspaces. "
-            f"Available projects: {available}.{failed_note}"
+        return await _resolve_workspace_project_from_index(index, project, context)
+    except WorkspaceProjectLookupMiss:
+        # Trigger: the lookup missed the session-cached index.
+        # Why: a miss is exactly the signal the cache may be stale — projects
+        #   created out-of-band (CLI, a teammate in a shared workspace) post-date
+        #   the index built at session start (#956).
+        # Outcome: rebuild the index once and retry; a second miss is authoritative
+        #   and its error (with the refreshed project list) propagates.
+        logger.info(
+            f"Workspace project lookup missed for '{project}'; refreshing index and retrying"
         )
-
-    cached_workspace = await _get_cached_active_workspace(context)
-    if cached_workspace:
-        cached_matches = [
-            entry for entry in matches if entry.workspace.tenant_id == cached_workspace.tenant_id
-        ]
-        if cached_matches:
-            return cached_matches[0]
-
-    if len(matches) > 1:
-        # Prefer the project in the default workspace when name is ambiguous
-        default_match = next((entry for entry in matches if entry.workspace.is_default), None)
-        if default_match:
-            return default_match
-
-        choices = _format_qualified_choices(matches)
-        details = "\n".join(
-            f"- {entry.workspace.name} ({entry.workspace.slug}): {entry.qualified_name}"
-            for entry in matches
-        )
-        raise ValueError(
-            f"Project '{project}' exists in multiple workspaces. Use: {choices}\n{details}"
-        )
-
-    if index.failed_workspaces:
-        qualified_name = matches[0].qualified_name
-        failed = ", ".join(workspace.slug for workspace in index.failed_workspaces)
-        raise ValueError(
-            f"Project '{project}' was found as {qualified_name}, but project discovery "
-            f"failed for workspace(s): {failed}. Use '{qualified_name}' to route "
-            "explicitly, or retry after discovery recovers."
-        )
-
-    return matches[0]
+        refreshed = await _ensure_workspace_project_index(context=context, force_refresh=True)
+        return await _resolve_workspace_project_from_index(refreshed, project, context)
 
 
 async def _default_workspace_project_entry(
@@ -1122,32 +730,37 @@ async def get_active_project(
         return active_project
 
 
-def _split_project_prefix(path: str) -> tuple[Optional[str], str]:
-    """Split a possible project prefix from a memory URL path."""
-    if "/" not in path:
-        return None, path
-
-    project_prefix, remainder = path.split("/", 1)
-    if not project_prefix or not remainder:
-        return None, path
-
-    if "*" in project_prefix:
-        return None, path
-
-    return project_prefix, remainder
-
-
 async def resolve_project_and_path(
     client: AsyncClient,
     identifier: str,
     project: Optional[str] = None,
     context: Optional[Context] = None,
     headers: HeaderTypes | None = None,
+    *,
+    strict_project_routing: bool = False,
+    allow_missing_project_fallback: bool = False,
+    cache_resolved_project: bool = True,
 ) -> tuple[ProjectItem, str, bool]:
     """Resolve project and normalized path for memory:// identifiers.
 
+    Args:
+        strict_project_routing: Reject a memory URL whose leading project-like
+            segment cannot be resolved. Mutating tools use this to prevent a
+            failed route from falling back to the active project.
+        allow_missing_project_fallback: When strict routing is enabled, still
+            allow a genuinely missing project prefix to be treated as an active-
+            project path. This is safe only for mutations that require an existing
+            target and cannot create content.
+        cache_resolved_project: Persist a project resolved from the memory URL in
+            MCP context. Set this to false for validation-only routing that may
+            reject a resolved cross-project source.
+
     Returns:
         Tuple of (active_project, normalized_path, is_memory_url)
+
+    Raises:
+        UnresolvedProjectRouteError: If strict routing is enabled and the
+            memory URL's leading project segment does not resolve.
     """
     is_memory_url = identifier.strip().startswith("memory://")
     config = ConfigManager().config
@@ -1212,6 +825,9 @@ async def resolve_project_and_path(
         # Why: allow project-scoped memory URLs without requiring a separate project parameter
         # Outcome: attempt to resolve the prefix as a project and route to it
         if project_prefix:
+            # Deferred: ToolError lives in FastMCP's runtime, which must not load at CLI startup (#886).
+            from fastmcp.exceptions import ToolError
+
             if cached_project and _project_matches_identifier(cached_project, project_prefix):
                 resolved_project = await resolve_project_parameter(project_prefix, context=context)
                 if resolved_project and generate_permalink(resolved_project) != generate_permalink(
@@ -1240,8 +856,24 @@ async def resolve_project_and_path(
                 )
                 resolved = ProjectResolveResponse.model_validate(response.json())
             except ToolError as exc:
-                if "project not found" not in str(exc).lower():
+                error_message = str(exc).lower()
+                project_route_missing = "project not found" in error_message
+                project_route_hidden_by_scope = (
+                    "does not have access to this project" in error_message
+                    and cached_project is not None
+                    and _project_matches_identifier(cached_project, project)
+                    and not strict_project_routing
+                )
+                if not project_route_missing and not project_route_hidden_by_scope:
                     raise
+                if strict_project_routing and not (
+                    project_route_missing and allow_missing_project_fallback
+                ):
+                    # Mutations that can create content must not reinterpret a
+                    # missing project route as an active-project path (#1066).
+                    # Existing-target mutations may opt into that legacy path
+                    # fallback, while scope-hidden routes always fail above.
+                    raise UnresolvedProjectRouteError(identifier, project_prefix) from exc
             else:
                 resolved_project = await resolve_project_parameter(project_prefix, context=context)
                 if resolved_project and generate_permalink(resolved_project) != generate_permalink(
@@ -1258,7 +890,8 @@ async def resolve_project_and_path(
                     path=resolved.path,
                     is_default=resolved.is_default,
                 )
-                await _set_cached_active_project(context, active_project)
+                if cache_resolved_project:
+                    await _set_cached_active_project(context, active_project)
 
                 resolved_path = _canonical_memory_path_for_active_route(
                     active_project,
@@ -1279,51 +912,6 @@ async def resolve_project_and_path(
             cached_workspace=cached_workspace,
         )
         return active_project, resolved_path, True
-
-
-def add_project_metadata(result: str, project_name: str) -> str:
-    """Add project context as metadata footer for assistant session tracking.
-
-    Provides clear project context to help the assistant remember which
-    project is being used throughout the conversation session.
-
-    Args:
-        result: The tool result string
-        project_name: The project name that was used
-
-    Returns:
-        Result with project session tracking metadata
-    """
-    return f"{result}\n\n[Session: Using project '{project_name}']"
-
-
-def detect_project_from_url_prefix(identifier: str, config: BasicMemoryConfig) -> Optional[str]:
-    """Check if a memory URL's first path segment matches a known project in config.
-
-    This enables automatic project routing from memory URLs like
-    ``memory://specs/in-progress`` without requiring the caller to pass
-    an explicit ``project`` parameter.
-
-    Uses local config only — no network calls.
-
-    Args:
-        identifier: Raw identifier string (may or may not start with ``memory://``).
-        config: Current BasicMemoryConfig with project entries.
-
-    Returns:
-        Matching project name from config, or None if no match.
-    """
-    path = memory_url_path(identifier) if identifier.strip().startswith("memory://") else identifier
-    normalized = normalize_project_reference(path)
-    prefix, _ = _split_project_prefix(normalized)
-    if prefix is None:
-        return None
-
-    prefix_permalink = generate_permalink(prefix)
-    for project_name in config.projects:
-        if generate_permalink(project_name) == prefix_permalink:
-            return project_name
-    return None
 
 
 async def detect_project_from_memory_url_prefix(
@@ -1437,6 +1025,9 @@ async def get_project_client(
         get_client,
         is_factory_mode,
     )
+
+    # Deferred: ToolError lives in FastMCP's runtime, which must not load at CLI startup (#886).
+    from fastmcp.exceptions import ToolError
 
     # When project_id (UUID) is provided, prefer it as the resolution identifier.
     # external_id is unambiguous across workspaces; project name can collide.

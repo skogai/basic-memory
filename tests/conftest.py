@@ -30,12 +30,16 @@ from basic_memory.config import (
     DatabaseBackend,
 )
 from basic_memory.db import DatabaseType
+from basic_memory.index.local_project import LocalProjectIndexRunner
+from basic_memory.index.watch_service import WatchService
+from basic_memory.indexing.relation_resolution import RepositoryRelationResolutionRuntime
 from basic_memory.markdown import EntityParser
 from basic_memory.markdown.markdown_processor import MarkdownProcessor
 from basic_memory.models import Base
 from basic_memory.models.knowledge import Entity
 from basic_memory.models.project import Project
 from basic_memory.repository.entity_repository import EntityRepository
+from basic_memory.repository.note_content_repository import NoteContentRepository
 from basic_memory.repository.observation_repository import ObservationRepository
 from basic_memory.repository.project_repository import ProjectRepository
 from basic_memory.repository.relation_repository import RelationRepository
@@ -45,11 +49,10 @@ from basic_memory.services import (
     ProjectService,
 )
 from basic_memory.services.directory_service import DirectoryService
+from basic_memory.services.bulk_link_resolver import BulkLinkResolver
 from basic_memory.services.file_service import FileService
 from basic_memory.services.link_resolver import LinkResolver
 from basic_memory.services.search_service import SearchService
-from basic_memory.sync.sync_service import SyncService
-from basic_memory.sync.watch_service import WatchService
 
 
 # =============================================================================
@@ -292,6 +295,13 @@ def app_config(config_home, db_backend, postgres_container, monkeypatch) -> Basi
         update_permalinks_on_move=True,
         database_backend=backend,
         database_url=database_url,
+        # Trigger: semantic_search_enabled defaults to True whenever fastembed/sqlite-vec
+        #          are importable, which they are in dev and CI environments.
+        # Why: with it on, every test that syncs pays the ONNX embedding stack (~5-7s per
+        #      sync) — embeddings are covered by the dedicated semantic suites, which
+        #      configure semantic_search_enabled explicitly themselves.
+        # Outcome: non-semantic tests skip embedding work entirely.
+        semantic_search_enabled=False,
     )
 
     return app_config
@@ -431,7 +441,7 @@ async def entity_repository(
     session_maker: async_sessionmaker[AsyncSession], test_project: Project
 ) -> EntityRepository:
     """Create an EntityRepository instance with project context."""
-    return EntityRepository(session_maker, project_id=test_project.id)
+    return EntityRepository(project_id=test_project.id)
 
 
 @pytest_asyncio.fixture(scope="function")
@@ -439,7 +449,7 @@ async def observation_repository(
     session_maker: async_sessionmaker[AsyncSession], test_project: Project
 ) -> ObservationRepository:
     """Create an ObservationRepository instance with project context."""
-    return ObservationRepository(session_maker, project_id=test_project.id)
+    return ObservationRepository(project_id=test_project.id)
 
 
 @pytest_asyncio.fixture(scope="function")
@@ -447,7 +457,7 @@ async def relation_repository(
     session_maker: async_sessionmaker[AsyncSession], test_project: Project
 ) -> RelationRepository:
     """Create a RelationRepository instance with project context."""
-    return RelationRepository(session_maker, project_id=test_project.id)
+    return RelationRepository(project_id=test_project.id)
 
 
 @pytest_asyncio.fixture(scope="function")
@@ -455,7 +465,7 @@ async def project_repository(
     session_maker: async_sessionmaker[AsyncSession],
 ) -> ProjectRepository:
     """Create a ProjectRepository instance."""
-    return ProjectRepository(session_maker)
+    return ProjectRepository()
 
 
 @pytest_asyncio.fixture(scope="function")
@@ -469,8 +479,9 @@ async def test_project(config_home, engine_factory) -> Project:
         "is_default": True,  # Explicitly set as the default project (for cli operations)
     }
     engine, session_maker = engine_factory
-    project_repository = ProjectRepository(session_maker)
-    project = await project_repository.create(project_data)
+    project_repository = ProjectRepository()
+    async with db.scoped_session(session_maker) as session:
+        project = await project_repository.create(session, project_data)
     return project
 
 
@@ -486,6 +497,7 @@ async def entity_service(
     file_service: FileService,
     link_resolver: LinkResolver,
     app_config: BasicMemoryConfig,
+    session_maker: async_sessionmaker[AsyncSession],
 ) -> EntityService:
     """Create EntityService."""
     return EntityService(
@@ -496,6 +508,7 @@ async def entity_service(
         file_service=file_service,
         link_resolver=link_resolver,
         app_config=app_config,
+        session_maker=session_maker,
     )
 
 
@@ -514,9 +527,16 @@ def markdown_processor(entity_parser: EntityParser) -> MarkdownProcessor:
 
 
 @pytest.fixture
-def link_resolver(entity_repository: EntityRepository, search_service: SearchService):
+def link_resolver(
+    entity_repository: EntityRepository,
+    search_service: SearchService,
+    session_maker: async_sessionmaker[AsyncSession],
+    app_config: BasicMemoryConfig,
+):
     """Create parser instance."""
-    return LinkResolver(entity_repository, search_service)
+    return LinkResolver(
+        entity_repository, search_service, session_maker=session_maker, app_config=app_config
+    )
 
 
 @pytest.fixture
@@ -526,34 +546,15 @@ def entity_parser(project_config):
 
 
 @pytest_asyncio.fixture
-async def sync_service(
-    app_config: BasicMemoryConfig,
-    entity_service: EntityService,
-    entity_parser: EntityParser,
-    project_repository: ProjectRepository,
-    entity_repository: EntityRepository,
-    relation_repository: RelationRepository,
-    search_service: SearchService,
-    file_service: FileService,
-) -> SyncService:
-    """Create sync service for testing."""
-    return SyncService(
-        app_config=app_config,
-        entity_service=entity_service,
-        project_repository=project_repository,
-        entity_repository=entity_repository,
-        relation_repository=relation_repository,
-        entity_parser=entity_parser,
-        search_service=search_service,
-        file_service=file_service,
-    )
-
-
-@pytest_asyncio.fixture
-async def directory_service(entity_repository, project_config) -> DirectoryService:
+async def directory_service(
+    entity_repository,
+    project_config,
+    session_maker: async_sessionmaker[AsyncSession],
+) -> DirectoryService:
     """Create directory service for testing."""
     return DirectoryService(
         entity_repository=entity_repository,
+        session_maker=session_maker,
     )
 
 
@@ -582,15 +583,24 @@ async def search_service(
     search_repository,
     entity_repository: EntityRepository,
     file_service: FileService,
+    session_maker: async_sessionmaker[AsyncSession],
 ) -> SearchService:
     """Create and initialize search service"""
-    service = SearchService(search_repository, entity_repository, file_service)
+    service = SearchService(
+        search_repository,
+        entity_repository,
+        file_service,
+        session_maker=session_maker,
+    )
     await service.init_search_index()
     return service
 
 
 @pytest_asyncio.fixture(scope="function")
-async def sample_entity(entity_repository: EntityRepository) -> Entity:
+async def sample_entity(
+    entity_repository: EntityRepository,
+    session_maker: async_sessionmaker[AsyncSession],
+) -> Entity:
     """Create a sample entity for testing."""
     entity_data = {
         "project_id": entity_repository.project_id,
@@ -602,16 +612,22 @@ async def sample_entity(entity_repository: EntityRepository) -> Entity:
         "created_at": datetime.now(timezone.utc),
         "updated_at": datetime.now(timezone.utc),
     }
-    return await entity_repository.create(entity_data)
+    async with db.scoped_session(session_maker) as session:
+        return await entity_repository.create(session, entity_data)
 
 
 @pytest_asyncio.fixture
 async def project_service(
     project_repository: ProjectRepository,
     file_service: FileService,
+    session_maker: async_sessionmaker[AsyncSession],
 ) -> ProjectService:
     """Create ProjectService with repository and file service for directory operations."""
-    return ProjectService(repository=project_repository, file_service=file_service)
+    return ProjectService(
+        repository=project_repository,
+        file_service=file_service,
+        session_maker=session_maker,
+    )
 
 
 @pytest_asyncio.fixture
@@ -646,6 +662,10 @@ async def test_graph(
     search_service,
     file_service,
     entity_service,
+    session_maker,
+    app_config,
+    project_repository,
+    test_project,
 ):
     """Create a test knowledge graph with entities, relations and observations."""
 
@@ -712,9 +732,24 @@ async def test_graph(
         )
     )
 
+    relation_resolution = RepositoryRelationResolutionRuntime(
+        session_maker=session_maker,
+        relation_repository=relation_repository,
+        entity_repository=entity_repository,
+        note_content_repository=NoteContentRepository(project_id=test_project.id),
+        target_resolver=BulkLinkResolver(
+            entity_repository=entity_repository,
+            app_config=app_config,
+            project_repository=project_repository,
+        ),
+        entity_indexer=search_service,
+    )
+    await relation_resolution.resolve_relations()
+
     # get latest
-    entities = await entity_repository.find_all()
-    relations = await relation_repository.find_all()
+    async with db.scoped_session(session_maker) as session:
+        entities = await entity_repository.find_all(session)
+        relations = await relation_repository.find_all(session)
 
     # Index everything for search
     for entity in entities:
@@ -731,21 +766,16 @@ async def test_graph(
 
 
 @pytest.fixture
-def watch_service(app_config: BasicMemoryConfig, project_repository, sync_service) -> WatchService:
-    """Create WatchService with injected sync_service factory.
-
-    The sync_service_factory allows tests to use the fixture-provided sync_service
-    instead of the production get_sync_service() which creates its own db connection.
-    """
-
-    async def sync_service_factory(project):
-        """Return the test fixture's sync_service regardless of project."""
-        return sync_service
-
+def watch_service(
+    app_config: BasicMemoryConfig,
+    project_repository,
+    session_maker: async_sessionmaker[AsyncSession],
+) -> WatchService:
+    """Create the event-index local watcher for tests."""
     return WatchService(
         app_config=app_config,
         project_repository=project_repository,
-        sync_service_factory=sync_service_factory,
+        session_maker=session_maker,
     )
 
 
@@ -779,7 +809,11 @@ def test_files(project_config, project_root) -> dict[str, Path]:
 
 
 @pytest_asyncio.fixture
-async def synced_files(sync_service, project_config, test_files):
-    # Initial sync - should create forward reference
-    await sync_service.sync(project_config.home)
+async def indexed_files(project_repository, session_maker, test_project, test_files):
+    """Index copied fixture files through the local project-index runner."""
+    runner = LocalProjectIndexRunner(
+        project_repository=project_repository,
+        session_maker=session_maker,
+    )
+    await runner.index_project(test_project.id, force_full=True)
     return test_files

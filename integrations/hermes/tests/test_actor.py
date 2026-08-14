@@ -45,6 +45,19 @@ def test_start_is_idempotent_when_thread_alive(bm):
         actor.shutdown(timeout=2.0)
 
 
+def test_is_alive_tracks_actor_lifecycle(bm):
+    """is_alive() is the reuse signal for initialize() — it must be False
+    before start, True while the loop thread runs, and False after shutdown."""
+    actor = make_scripted_actor(bm)
+    assert actor.is_alive() is False
+    actor.start(timeout=5.0)
+    try:
+        assert actor.is_alive() is True
+    finally:
+        actor.shutdown(timeout=2.0)
+    assert actor.is_alive() is False
+
+
 def test_start_init_error_raises(bm):
     boom = ValueError("BM unreachable")
     actor = make_scripted_actor(bm, raise_at_init=boom)
@@ -54,7 +67,7 @@ def test_start_init_error_raises(bm):
 
 
 def test_start_timeout_raises(bm):
-    """If _ready never gets set within the timeout, start() raises TimeoutError."""
+    """A startup timeout cancels the actor task instead of leaking its thread."""
     import asyncio
 
     actor = bm._BmMcpActor(["fake-bm", "mcp"])
@@ -68,6 +81,8 @@ def test_start_timeout_raises(bm):
     with pytest.raises(TimeoutError):
         actor.start(timeout=0.5)
     assert actor._running is False
+    assert actor._thread is not None
+    assert not actor._thread.is_alive()
 
 
 # ---- Shutdown ----

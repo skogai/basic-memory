@@ -8,7 +8,6 @@ Each test verifies:
 
 import json
 from contextlib import asynccontextmanager
-from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -17,15 +16,19 @@ from typer.testing import CliRunner
 from basic_memory.cli.main import app as cli_app
 from basic_memory.mcp.clients.project import ProjectClient
 from basic_memory.schemas.project_info import ProjectList
-from basic_memory.schemas.sync_report import SkippedFileResponse, SyncReportResponse
+from basic_memory.schemas.project_index import (
+    ProjectIndexObservedFileResponse,
+    ProjectIndexStatusResponse,
+)
 
 # Importing registers subcommands on the shared app instance.
 import basic_memory.cli.commands.project as project_cmd  # noqa: F401
+from typing import Any
 
 runner = CliRunner()
 
 
-def _parse_json_output(output: str) -> dict:
+def _parse_json_output(output: str) -> dict[str, Any]:
     """Extract and parse the JSON object from CLI output.
 
     The CliRunner may capture log lines before the JSON payload.
@@ -49,41 +52,25 @@ def _mock_config_manager():
     return mock_cm
 
 
-SYNC_REPORT_WITH_CHANGES = SyncReportResponse(
-    new={"notes/new-file.md"},
-    modified={"notes/existing.md"},
-    deleted={"notes/old.md"},
-    moves={"notes/moved-from.md": "notes/moved-to.md"},
-    checksums={"notes/new-file.md": "abc12345", "notes/existing.md": "def67890"},
-    skipped_files=[],
-    total=4,
+PROJECT_INDEX_STATUS_WITH_FILES = ProjectIndexStatusResponse(
+    total_files=2,
+    observed_files=(
+        ProjectIndexObservedFileResponse(
+            path="notes/new-file.md",
+            checksum="abc12345",
+            size=123,
+        ),
+        ProjectIndexObservedFileResponse(
+            path="notes/existing.md",
+            checksum="def67890",
+            size=456,
+        ),
+    ),
 )
 
-SYNC_REPORT_EMPTY = SyncReportResponse(
-    new=set(),
-    modified=set(),
-    deleted=set(),
-    moves={},
-    checksums={},
-    skipped_files=[],
-    total=0,
-)
-
-SYNC_REPORT_WITH_SKIPPED = SyncReportResponse(
-    new=set(),
-    modified=set(),
-    deleted=set(),
-    moves={},
-    checksums={},
-    skipped_files=[
-        SkippedFileResponse(
-            path="bad/file.md",
-            reason="parse error",
-            failure_count=3,
-            first_failed=datetime(2025, 6, 15, 12, 0, 0),
-        )
-    ],
-    total=0,
+PROJECT_INDEX_STATUS_EMPTY = ProjectIndexStatusResponse(
+    total_files=0,
+    observed_files=(),
 )
 
 VALIDATE_REPORT = {
@@ -149,13 +136,15 @@ _MOCK_PROJECT_ITEM.external_id = "11111111-1111-1111-1111-111111111111"
 @patch("basic_memory.cli.commands.status.ConfigManager")
 @patch("basic_memory.cli.commands.status.get_active_project", new_callable=AsyncMock)
 @patch("basic_memory.cli.commands.status.get_client")
-def test_status_json_outputs_sync_report(mock_get_client, mock_get_active, mock_config_cls):
-    """bm status --json outputs a valid JSON sync report with changes."""
+def test_status_json_outputs_project_index_status(
+    mock_get_client, mock_get_active, mock_config_cls
+):
+    """bm status --json outputs a valid JSON project-index observation."""
     mock_config_cls.return_value = _mock_config_manager()
     mock_get_active.return_value = _MOCK_PROJECT_ITEM
 
     mock_project_client = AsyncMock()
-    mock_project_client.get_status.return_value = SYNC_REPORT_WITH_CHANGES
+    mock_project_client.get_status.return_value = PROJECT_INDEX_STATUS_WITH_FILES
 
     @asynccontextmanager
     async def fake_get_client(project_name=None):
@@ -168,23 +157,21 @@ def test_status_json_outputs_sync_report(mock_get_client, mock_get_active, mock_
 
     assert result.exit_code == 0, f"CLI failed: {result.output}"
     data = _parse_json_output(result.output)
-    assert data["total"] == 4
-    assert "new" in data
-    assert "modified" in data
-    assert "deleted" in data
-    assert "moves" in data
+    assert data["total_files"] == 2
+    assert data["observed_files"][0]["path"] == "notes/new-file.md"
+    assert "new" not in data
 
 
 @patch("basic_memory.cli.commands.status.ConfigManager")
 @patch("basic_memory.cli.commands.status.get_active_project", new_callable=AsyncMock)
 @patch("basic_memory.cli.commands.status.get_client")
 def test_status_json_no_changes(mock_get_client, mock_get_active, mock_config_cls):
-    """bm status --json with empty report outputs total: 0."""
+    """bm status --json with no observed files outputs total_files: 0."""
     mock_config_cls.return_value = _mock_config_manager()
     mock_get_active.return_value = _MOCK_PROJECT_ITEM
 
     mock_project_client = AsyncMock()
-    mock_project_client.get_status.return_value = SYNC_REPORT_EMPTY
+    mock_project_client.get_status.return_value = PROJECT_INDEX_STATUS_EMPTY
 
     @asynccontextmanager
     async def fake_get_client(project_name=None):
@@ -197,21 +184,27 @@ def test_status_json_no_changes(mock_get_client, mock_get_active, mock_config_cl
 
     assert result.exit_code == 0, f"CLI failed: {result.output}"
     data = _parse_json_output(result.output)
-    assert data["total"] == 0
-    assert data["new"] == []
-    assert data["modified"] == []
+    assert data["total_files"] == 0
+    assert data["observed_files"] == []
+
+
+# ---------------------------------------------------------------------------
+# Status --wait
+#
+# The event-index status endpoint reports current observed files, not a pending
+# change count, so --wait is a compatibility flag and does not poll.
+# ---------------------------------------------------------------------------
 
 
 @patch("basic_memory.cli.commands.status.ConfigManager")
 @patch("basic_memory.cli.commands.status.get_active_project", new_callable=AsyncMock)
 @patch("basic_memory.cli.commands.status.get_client")
-def test_status_json_with_skipped_files(mock_get_client, mock_get_active, mock_config_cls):
-    """bm status --json serializes skipped_files with datetime fields."""
+def test_status_wait_succeeds_after_polling(mock_get_client, mock_get_active, mock_config_cls):
+    """bm status --wait returns the current observation without polling."""
     mock_config_cls.return_value = _mock_config_manager()
     mock_get_active.return_value = _MOCK_PROJECT_ITEM
 
-    mock_project_client = AsyncMock()
-    mock_project_client.get_status.return_value = SYNC_REPORT_WITH_SKIPPED
+    get_status = AsyncMock(return_value=PROJECT_INDEX_STATUS_WITH_FILES)
 
     @asynccontextmanager
     async def fake_get_client(project_name=None):
@@ -219,15 +212,94 @@ def test_status_json_with_skipped_files(mock_get_client, mock_get_active, mock_c
 
     mock_get_client.side_effect = fake_get_client
 
-    with patch.object(ProjectClient, "get_status", mock_project_client.get_status):
-        result = runner.invoke(cli_app, ["status", "--json"])
+    with patch.object(ProjectClient, "get_status", get_status):
+        result = runner.invoke(cli_app, ["status", "--wait"])
+
+    assert result.exit_code == 0, f"CLI failed: {result.output}"
+    assert get_status.await_count == 1
+
+
+@patch("basic_memory.cli.commands.status.ConfigManager")
+@patch("basic_memory.cli.commands.status.get_active_project", new_callable=AsyncMock)
+@patch("basic_memory.cli.commands.status.get_client")
+def test_status_wait_times_out(mock_get_client, mock_get_active, mock_config_cls):
+    """bm status --wait no longer times out on a pending-change counter."""
+    mock_config_cls.return_value = _mock_config_manager()
+    mock_get_active.return_value = _MOCK_PROJECT_ITEM
+
+    get_status = AsyncMock(return_value=PROJECT_INDEX_STATUS_WITH_FILES)
+
+    @asynccontextmanager
+    async def fake_get_client(project_name=None):
+        yield MagicMock()
+
+    mock_get_client.side_effect = fake_get_client
+
+    # timeout=0 makes the deadline immediate: poll once, then time out.
+    with patch.object(ProjectClient, "get_status", get_status):
+        result = runner.invoke(cli_app, ["status", "--wait", "--timeout", "0"])
+
+    assert result.exit_code == 0
+    assert "observed files" in result.output
+
+
+def test_status_wait_negative_timeout_is_rejected():
+    """A negative --timeout fails fast with a usage error instead of a confusing
+    'Timed out after -5s' message. The guard runs before any client I/O, no mocks needed."""
+    result = runner.invoke(cli_app, ["status", "--wait", "--timeout", "-5"])
+
+    assert result.exit_code != 0
+    # Typer colorizes the flag name with ANSI codes (so the literal "--timeout" is split),
+    # but the message body renders clean — assert on that.
+    assert "must be >= 0" in result.output
+
+
+@patch("basic_memory.cli.commands.status.ConfigManager")
+@patch("basic_memory.cli.commands.status.get_active_project", new_callable=AsyncMock)
+@patch("basic_memory.cli.commands.status.get_client")
+def test_status_wait_json_reports_total_zero(mock_get_client, mock_get_active, mock_config_cls):
+    """bm status --wait --json emits the current project-index observation."""
+    mock_config_cls.return_value = _mock_config_manager()
+    mock_get_active.return_value = _MOCK_PROJECT_ITEM
+
+    get_status = AsyncMock(return_value=PROJECT_INDEX_STATUS_EMPTY)
+
+    @asynccontextmanager
+    async def fake_get_client(project_name=None):
+        yield MagicMock()
+
+    mock_get_client.side_effect = fake_get_client
+
+    with patch.object(ProjectClient, "get_status", get_status):
+        result = runner.invoke(cli_app, ["status", "--wait", "--json"])
 
     assert result.exit_code == 0, f"CLI failed: {result.output}"
     data = _parse_json_output(result.output)
-    assert len(data["skipped_files"]) == 1
-    assert data["skipped_files"][0]["path"] == "bad/file.md"
-    # datetime should be serialized as ISO string via mode="json"
-    assert "2025-06-15" in data["skipped_files"][0]["first_failed"]
+    assert data["total_files"] == 0
+
+
+@patch("basic_memory.cli.commands.status.ConfigManager")
+@patch("basic_memory.cli.commands.status.get_active_project", new_callable=AsyncMock)
+@patch("basic_memory.cli.commands.status.get_client")
+def test_status_wait_json_timeout_emits_error(mock_get_client, mock_get_active, mock_config_cls):
+    """bm status --wait --json ignores timeout and emits observation JSON."""
+    mock_config_cls.return_value = _mock_config_manager()
+    mock_get_active.return_value = _MOCK_PROJECT_ITEM
+
+    get_status = AsyncMock(return_value=PROJECT_INDEX_STATUS_WITH_FILES)
+
+    @asynccontextmanager
+    async def fake_get_client(project_name=None):
+        yield MagicMock()
+
+    mock_get_client.side_effect = fake_get_client
+
+    with patch.object(ProjectClient, "get_status", get_status):
+        result = runner.invoke(cli_app, ["status", "--wait", "--timeout", "0", "--json"])
+
+    assert result.exit_code == 0
+    data = _parse_json_output(result.output)
+    assert data["total_files"] == 2
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +309,7 @@ def test_status_json_with_skipped_files(mock_get_client, mock_get_active, mock_c
 
 @patch("basic_memory.cli.commands.schema.ConfigManager")
 @patch(
-    "basic_memory.cli.commands.schema.mcp_schema_validate",
+    "basic_memory.mcp.tools.schema_validate",
     new_callable=AsyncMock,
     return_value=VALIDATE_REPORT,
 )
@@ -256,7 +328,7 @@ def test_schema_validate_json(mock_mcp, mock_config_cls):
 
 @patch("basic_memory.cli.commands.schema.ConfigManager")
 @patch(
-    "basic_memory.cli.commands.schema.mcp_schema_validate",
+    "basic_memory.mcp.tools.schema_validate",
     new_callable=AsyncMock,
     return_value={"error": "No schema found for type 'person'"},
 )
@@ -273,7 +345,7 @@ def test_schema_validate_json_error(mock_mcp, mock_config_cls):
 
 @patch("basic_memory.cli.commands.schema.ConfigManager")
 @patch(
-    "basic_memory.cli.commands.schema.mcp_schema_validate",
+    "basic_memory.mcp.tools.schema_validate",
     new_callable=AsyncMock,
     return_value=VALIDATE_REPORT,
 )
@@ -296,7 +368,7 @@ def test_schema_validate_json_strict_exit(mock_mcp, mock_config_cls):
 
 @patch("basic_memory.cli.commands.schema.ConfigManager")
 @patch(
-    "basic_memory.cli.commands.schema.mcp_schema_infer",
+    "basic_memory.mcp.tools.schema_infer",
     new_callable=AsyncMock,
     return_value=INFER_REPORT,
 )
@@ -320,7 +392,7 @@ def test_schema_infer_json(mock_mcp, mock_config_cls):
 
 @patch("basic_memory.cli.commands.schema.ConfigManager")
 @patch(
-    "basic_memory.cli.commands.schema.mcp_schema_diff",
+    "basic_memory.mcp.tools.schema_diff",
     new_callable=AsyncMock,
     return_value=DIFF_REPORT_WITH_DRIFT,
 )
@@ -346,7 +418,7 @@ def test_schema_diff_json(mock_mcp, mock_config_cls):
 def write_config(tmp_path, monkeypatch):
     """Write config.json under a temporary HOME and return the file path."""
 
-    def _write(config_data: dict):
+    def _write(config_data: dict[str, Any]):
         from basic_memory import config as config_module
 
         config_module._CONFIG_CACHE = None

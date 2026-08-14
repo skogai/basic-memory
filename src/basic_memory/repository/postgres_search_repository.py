@@ -3,28 +3,44 @@
 import asyncio
 import json
 import re
+from collections.abc import Sequence
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, override, List, Optional
 
+import logfire
 from loguru import logger
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from basic_memory import db
-from basic_memory.config import BasicMemoryConfig, ConfigManager
+from basic_memory.config import BasicMemoryConfig, ConfigManager, DatabaseBackend
 from basic_memory.repository.embedding_provider import EmbeddingProvider
 from basic_memory.repository.embedding_provider_factory import create_embedding_provider
+from basic_memory.repository.rerank_provider import RerankProvider
+from basic_memory.repository.rerank_provider_factory import create_rerank_provider
 from basic_memory.repository.search_index_row import SearchIndexRow
+from basic_memory.repository.search_query import relaxed_query_words
+from basic_memory.repository.semantic_chunking import VectorChunkRecord
 from basic_memory.repository.search_repository_base import (
     SearchRepositoryBase,
     VectorChunkState,
 )
 from basic_memory.repository.metadata_filters import parse_metadata_filters
 from basic_memory.repository.semantic_errors import SemanticDependenciesMissingError
+from basic_memory.repository.semantic_vector_index import SemanticVectorIndex
+from basic_memory.repository.semantic_vector_sync import (
+    PendingEmbeddingJob,
+    StagedVectorDeletion,
+)
+from basic_memory.repository.semantic_vector_index_factory import (
+    build_vector_index_scope,
+    resolve_semantic_vector_index_name,
+)
+from basic_memory.repository.pgvector_index import PgVectorIndex
 from basic_memory.schemas.search import SearchItemType, SearchRetrievalMode
 
 
-def _strip_nul_from_row(row_data: dict) -> dict:
+def _strip_nul_from_row(row_data: dict[str, Any]) -> dict[str, Any]:
     """Strip NUL bytes from all string values in a row dict.
 
     Secondary defense: PostgreSQL text columns cannot store \\x00.
@@ -55,6 +71,9 @@ class PostgresSearchRepository(SearchRepositoryBase):
         project_id: int,
         app_config: BasicMemoryConfig | None = None,
         embedding_provider: EmbeddingProvider | None = None,
+        vector_index_name: str | None = None,
+        vector_index: SemanticVectorIndex | None = None,
+        rerank_provider: RerankProvider | None = None,
     ):
         super().__init__(session_maker, project_id)
         self._app_config = app_config or ConfigManager().config
@@ -68,15 +87,43 @@ class PostgresSearchRepository(SearchRepositoryBase):
             self._app_config.semantic_postgres_prepare_concurrency
         )
         self._embedding_provider = embedding_provider
+        self._semantic_vector_index_name = vector_index_name or "pgvector"
+        self._rerank_provider = rerank_provider
+        self._reranker_candidates = self._app_config.reranker_candidates
+        self._reranker_max_document_chars = self._app_config.reranker_max_document_chars
         self._vector_dimensions = 384
         self._vector_tables_initialized = False
         self._vector_tables_lock = asyncio.Lock()
 
         if self._semantic_enabled and self._embedding_provider is None:
             self._embedding_provider = create_embedding_provider(self._app_config)
+        # create_rerank_provider returns None unless reranking is enabled.
+        if self._semantic_enabled and self._rerank_provider is None:
+            self._rerank_provider = create_rerank_provider(self._app_config)
         if self._embedding_provider is not None:
             self._vector_dimensions = self._embedding_provider.dimensions
+            effective_name = vector_index_name or resolve_semantic_vector_index_name(
+                self._app_config,
+                DatabaseBackend.POSTGRES,
+            )
+            if vector_index is None:
+                if effective_name != "pgvector":
+                    raise SemanticDependenciesMissingError(
+                        f"Semantic vector index '{effective_name}' must be created by the "
+                        "search repository composition root."
+                    )
+                vector_index = PgVectorIndex(
+                    session_maker,
+                    build_vector_index_scope(
+                        self._app_config,
+                        self._embedding_provider,
+                        project_id,
+                    ),
+                )
+            self._semantic_vector_index_name = effective_name
+            self._semantic_vector_index = vector_index
 
+    @override
     async def init_search_index(self):
         """Create Postgres table with tsvector column and GIN indexes.
 
@@ -91,6 +138,7 @@ class PostgresSearchRepository(SearchRepositoryBase):
         if self._semantic_enabled:
             await self._ensure_vector_tables()
 
+    @override
     async def index_item(self, search_index_row: SearchIndexRow) -> None:
         """Index or update a single item using UPSERT.
 
@@ -153,6 +201,7 @@ class PostgresSearchRepository(SearchRepositoryBase):
     # tsquery preparation (backend-specific)
     # ------------------------------------------------------------------
 
+    @override
     def _prepare_search_term(self, term: str, is_prefix: bool = True) -> str:
         """Prepare a search term for tsquery format.
 
@@ -175,6 +224,14 @@ class PostgresSearchRepository(SearchRepositoryBase):
 
         # For non-Boolean queries, prepare single term
         return self._prepare_single_term(term, is_prefix)
+
+    @staticmethod
+    def _relaxed_tsquery_text(search_text: Optional[str]) -> Optional[str]:
+        """OR-relaxed tsquery expression for a failed strict query, or None."""
+        words = relaxed_query_words(search_text)
+        if not words:
+            return None
+        return " | ".join(f"{word}:*" for word in words)
 
     def _prepare_boolean_query(self, query: str) -> str:
         """Convert Boolean query to tsquery format.
@@ -236,7 +293,12 @@ class PostgresSearchRepository(SearchRepositoryBase):
 
         # Handle multi-word queries
         if " " in cleaned_term:
-            words = [w for w in cleaned_term.split() if w.strip()]
+            # Strip sentence punctuation from word edges so question-form
+            # queries produce clean lexemes (parity with SQLite FTS5 prep).
+            # The tsquery tokenizer ignores this punctuation anyway; leaving it
+            # in only risks tsquery syntax errors. Interior characters are kept.
+            words = [w.strip("?!.,;") for w in cleaned_term.split()]
+            words = [w for w in words if w]
             if not words:
                 # All characters were special chars, search won't match anything
                 # Return a safe search term that won't cause syntax errors
@@ -249,30 +311,34 @@ class PostgresSearchRepository(SearchRepositoryBase):
             # Join with AND operator
             return " & ".join(prepared_words)
 
-        # Single word
-        cleaned_term = cleaned_term.strip()
+        # Single word: strip edge punctuation; guard the now-empty case so a
+        # bare ":*"/"" never reaches tsquery.
+        cleaned_term = cleaned_term.strip().strip("?!.,;")
+        if not cleaned_term:
+            return "NOSPECIALCHARS:*"
         if is_prefix:
             return f"{cleaned_term}:*"
         else:
             return cleaned_term
 
     # ------------------------------------------------------------------
-    # pgvector utility
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _format_pgvector_literal(vector: list[float]) -> str:
-        if not vector:
-            return "[]"
-        values = ",".join(f"{float(value):.12g}" for value in vector)
-        return f"[{values}]"
-
-    # ------------------------------------------------------------------
     # Abstract hook implementations (vector/semantic, Postgres-specific)
     # ------------------------------------------------------------------
 
+    @override
     async def _ensure_vector_tables(self) -> None:
         self._assert_semantic_available()
+        if not hasattr(self, "_semantic_vector_index"):
+            assert self._embedding_provider is not None
+            self._semantic_vector_index_name = "pgvector"
+            self._semantic_vector_index = PgVectorIndex(
+                self.session_maker,
+                build_vector_index_scope(
+                    self._app_config,
+                    self._embedding_provider,
+                    self.project_id,
+                ),
+            )
         if self._vector_tables_initialized:
             return
 
@@ -283,13 +349,6 @@ class PostgresSearchRepository(SearchRepositoryBase):
                 return
 
             async with db.scoped_session(self.session_maker) as session:
-                try:
-                    await session.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-                except Exception as exc:
-                    raise SemanticDependenciesMissingError(
-                        "pgvector extension is unavailable for this Postgres database."
-                    ) from exc
-
                 # --- Chunks table (dimension-independent, may already exist via migration) ---
                 # Trigger: fresh Postgres projects may not have vector chunk tables yet.
                 # Why: runtime can bootstrap missing tables, but schema evolution must stay
@@ -307,6 +366,9 @@ class PostgresSearchRepository(SearchRepositoryBase):
                             source_hash TEXT NOT NULL,
                             entity_fingerprint TEXT NOT NULL,
                             embedding_model TEXT NOT NULL,
+                            vector_index TEXT NOT NULL,
+                            embedding_status TEXT NOT NULL
+                                CHECK (embedding_status IN ('pending', 'ready')),
                             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                             UNIQUE (project_id, entity_id, chunk_key)
                         )
@@ -322,158 +384,51 @@ class PostgresSearchRepository(SearchRepositoryBase):
                     )
                 )
 
-                # --- Embeddings table (dimension-dependent, created at runtime) ---
-                # Trigger: provider dimensions may differ from what was previously deployed.
-                # Why: the column type `vector(N)` is fixed at table creation; switching
-                # from FastEmbed (384) to OpenAI (1536) requires recreation.
-                # Outcome: mismatched table is dropped and recreated with correct dims.
-                # Embeddings are derived data — re-indexing will repopulate them.
-                existing_dims = await self._get_existing_embedding_dims(session)
-                if existing_dims is not None and existing_dims != self._vector_dimensions:
-                    logger.warning(
-                        f"Embedding dimension mismatch: table has {existing_dims}, "
-                        f"provider expects {self._vector_dimensions}. "
-                        "Dropping and recreating search_vector_embeddings."
-                    )
-                    await session.execute(text("DROP TABLE IF EXISTS search_vector_embeddings"))
-
-                await session.execute(
-                    text(
-                        f"""
-                        CREATE TABLE IF NOT EXISTS search_vector_embeddings (
-                            chunk_id BIGINT PRIMARY KEY
-                                REFERENCES search_vector_chunks(id) ON DELETE CASCADE,
-                            project_id INTEGER NOT NULL,
-                            embedding vector({self._vector_dimensions}) NOT NULL,
-                            embedding_dims INTEGER NOT NULL,
-                            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                        )
-                        """
-                    )
-                )
-                await session.execute(
-                    text(
-                        """
-                        CREATE INDEX IF NOT EXISTS idx_search_vector_embeddings_project_dims
-                        ON search_vector_embeddings (project_id, embedding_dims)
-                        """
-                    )
-                )
-                # HNSW index for approximate nearest-neighbour search.
-                # Without this every vector query is a sequential scan.
-                await session.execute(
-                    text(
-                        """
-                        CREATE INDEX IF NOT EXISTS idx_search_vector_embeddings_hnsw
-                        ON search_vector_embeddings
-                        USING hnsw (embedding vector_cosine_ops)
-                        WITH (m = 16, ef_construction = 64)
-                        """
-                    )
-                )
                 await session.commit()
+
+            await self._semantic_vector_index.initialize()
 
             logger.debug(f"Postgres vector tables ready (dimensions={self._vector_dimensions})")
             self._vector_tables_initialized = True
 
-    async def _get_existing_embedding_dims(self, session: AsyncSession) -> int | None:
-        """Query the vector column dimension from an existing search_vector_embeddings table.
-
-        Returns None when the table does not exist.
-        Uses information_schema to avoid regclass cast errors on missing tables,
-        then reads atttypmod from pg_attribute for the actual dimension value.
-        """
-        # Check table existence via information_schema (no exception on missing)
-        exists_result = await session.execute(
-            text(
-                """
-                SELECT 1 FROM information_schema.tables
-                WHERE table_name = 'search_vector_embeddings'
-                """
-            )
-        )
-        if exists_result.fetchone() is None:
-            return None
-
-        result = await session.execute(
-            text(
-                """
-                SELECT atttypmod
-                FROM pg_attribute
-                WHERE attrelid = 'search_vector_embeddings'::regclass
-                  AND attname = 'embedding'
-                """
-            )
-        )
-        row = result.fetchone()
-        if row is None:
-            return None
-        # pgvector stores dimensions in atttypmod directly
-        return int(row[0])
-
+    @override
     async def _run_vector_query(
         self,
         session: AsyncSession,
         query_embedding: list[float],
         candidate_limit: int,
-    ) -> list[dict]:
-        if not query_embedding:
-            return []
+    ) -> list[dict[str, Any]]:
+        return await super()._run_vector_query(session, query_embedding, candidate_limit)
 
-        embedding_dims = len(query_embedding)
-        query_embedding_literal = self._format_pgvector_literal(query_embedding)
-
-        vector_result = await session.execute(
-            text(
-                """
-                WITH vector_matches AS (
-                    SELECT
-                        e.chunk_id,
-                        (e.embedding <=> CAST(:query_embedding AS vector)) AS distance
-                    FROM search_vector_embeddings e
-                    WHERE e.project_id = :project_id
-                      AND e.embedding_dims = :embedding_dims
-                    ORDER BY e.embedding <=> CAST(:query_embedding AS vector)
-                    LIMIT :vector_k
-                )
-                SELECT c.entity_id, c.chunk_key, c.chunk_text, vector_matches.distance AS best_distance
-                FROM vector_matches
-                JOIN search_vector_chunks c ON c.id = vector_matches.chunk_id
-                WHERE c.project_id = :project_id
-                ORDER BY best_distance ASC
-                LIMIT :vector_k
-                """
-            ),
-            {
-                "query_embedding": query_embedding_literal,
-                "project_id": self.project_id,
-                "embedding_dims": embedding_dims,
-                "vector_k": candidate_limit,
-            },
-        )
-        return [dict(row) for row in vector_result.mappings().all()]
-
+    @override
     def _vector_prepare_window_size(self) -> int:
         """Use a bounded config-driven prepare window for Postgres vector sync."""
         return self._semantic_postgres_prepare_concurrency
 
+    @override
     async def _upsert_scheduled_chunk_records(
         self,
         session: AsyncSession,
         *,
         entity_id: int,
-        scheduled_records: list[dict[str, str]],
+        scheduled_records: list[VectorChunkRecord],
         existing_by_key: dict[str, VectorChunkState],
         entity_fingerprint: str,
         embedding_model: str,
-    ) -> list[tuple[int, str]]:
+    ) -> list[PendingEmbeddingJob]:
         """Use Postgres UPSERT to rewrite only the scheduled chunk rows."""
         if not scheduled_records:
             return []
 
+        self._assert_manifest_vector_ownership(
+            current.vector_index
+            for record in scheduled_records
+            if (current := existing_by_key.get(record["chunk_key"])) is not None
+        )
         upsert_params: dict[str, object] = {
             "project_id": self.project_id,
             "entity_id": entity_id,
+            "vector_index": self._semantic_vector_index_name,
         }
         upsert_values: list[str] = []
         # The SQL template is built from integer enumerate() indices only.
@@ -488,7 +443,8 @@ class PostgresSearchRepository(SearchRepositoryBase):
                 "("
                 ":entity_id, :project_id, "
                 f":chunk_key_{index}, :chunk_text_{index}, :source_hash_{index}, "
-                f":entity_fingerprint_{index}, :embedding_model_{index}, NOW()"
+                f":entity_fingerprint_{index}, :embedding_model_{index}, "
+                ":vector_index, 'pending', NOW()"
                 ")"
             )
 
@@ -502,6 +458,8 @@ class PostgresSearchRepository(SearchRepositoryBase):
                     source_hash,
                     entity_fingerprint,
                     embedding_model,
+                    vector_index,
+                    embedding_status,
                     updated_at
                 ) VALUES {", ".join(upsert_values)}
                 ON CONFLICT (project_id, entity_id, chunk_key) DO UPDATE SET
@@ -509,6 +467,8 @@ class PostgresSearchRepository(SearchRepositoryBase):
                     source_hash = EXCLUDED.source_hash,
                     entity_fingerprint = EXCLUDED.entity_fingerprint,
                     embedding_model = EXCLUDED.embedding_model,
+                    vector_index = EXCLUDED.vector_index,
+                    embedding_status = EXCLUDED.embedding_status,
                     updated_at = NOW()
                 RETURNING id, chunk_key
             """),
@@ -518,86 +478,47 @@ class PostgresSearchRepository(SearchRepositoryBase):
             str(row["chunk_key"]): int(row["id"]) for row in upsert_result.mappings().all()
         }
         return [
-            (upserted_ids_by_key[record["chunk_key"]], record["chunk_text"])
+            PendingEmbeddingJob(
+                entity_id=entity_id,
+                chunk_row_id=upserted_ids_by_key[record["chunk_key"]],
+                chunk_key=record["chunk_key"],
+                chunk_text=record["chunk_text"],
+                source_hash=record["source_hash"],
+            )
             for record in scheduled_records
         ]
 
-    async def _write_embeddings(
-        self,
-        session: AsyncSession,
-        jobs: list[tuple[int, str]],
-        embeddings: list[list[float]],
-    ) -> None:
-        params: dict[str, object] = {"project_id": self.project_id}
-        value_rows: list[str] = []
-
-        # The SQL template is built from integer enumerate() indices only.
-        # No user-controlled text is interpolated into the statement.
-        for index, ((row_id, _), vector) in enumerate(zip(jobs, embeddings, strict=True)):
-            params[f"chunk_id_{index}"] = row_id
-            params[f"embedding_{index}"] = self._format_pgvector_literal(vector)
-            params[f"embedding_dims_{index}"] = len(vector)
-            value_rows.append(
-                "("
-                f":chunk_id_{index}, :project_id, CAST(:embedding_{index} AS vector), "
-                f":embedding_dims_{index}, NOW()"
-                ")"
-            )
-
-        await session.execute(
-            text(f"""
-                INSERT INTO search_vector_embeddings (
-                    chunk_id,
-                    project_id,
-                    embedding,
-                    embedding_dims,
-                    updated_at
-                ) VALUES {", ".join(value_rows)}
-                ON CONFLICT (chunk_id) DO UPDATE SET
-                    project_id = EXCLUDED.project_id,
-                    embedding = EXCLUDED.embedding,
-                    embedding_dims = EXCLUDED.embedding_dims,
-                    updated_at = NOW()
-            """),
-            params,
-        )
-
+    @override
     async def _delete_entity_chunks(
         self,
         session: AsyncSession,
         entity_id: int,
-    ) -> None:
-        # Postgres has ON DELETE CASCADE from embeddings → chunks
-        await session.execute(
-            text(
-                "DELETE FROM search_vector_chunks "
-                "WHERE project_id = :project_id AND entity_id = :entity_id"
-            ),
-            {"project_id": self.project_id, "entity_id": entity_id},
+        *,
+        expected_deletions: Sequence[StagedVectorDeletion] | None = None,
+    ) -> list[StagedVectorDeletion]:
+        return await super()._delete_entity_chunks(
+            session,
+            entity_id,
+            expected_deletions=expected_deletions,
         )
 
+    @override
     async def _delete_stale_chunks(
         self,
         session: AsyncSession,
         stale_ids: list[int],
         entity_id: int,
-    ) -> None:
-        stale_placeholders = ", ".join(f":stale_id_{idx}" for idx in range(len(stale_ids)))
-        stale_params = {
-            "project_id": self.project_id,
-            "entity_id": entity_id,
-            **{f"stale_id_{idx}": row_id for idx, row_id in enumerate(stale_ids)},
-        }
-        # CASCADE handles embedding deletion
-        await session.execute(
-            text(
-                "DELETE FROM search_vector_chunks "
-                f"WHERE id IN ({stale_placeholders}) "
-                "AND project_id = :project_id AND entity_id = :entity_id"
-            ),
-            stale_params,
+        *,
+        expected_deletions: Sequence[StagedVectorDeletion] | None = None,
+    ) -> list[StagedVectorDeletion]:
+        return await super()._delete_stale_chunks(
+            session,
+            stale_ids,
+            entity_id,
+            expected_deletions=expected_deletions,
         )
 
+    @override
     def _distance_to_similarity(self, distance: float) -> float:
         """Convert pgvector cosine distance to cosine similarity.
 
@@ -606,6 +527,7 @@ class PostgresSearchRepository(SearchRepositoryBase):
         """
         return max(0.0, 1.0 - distance)
 
+    @override
     def _timestamp_now_expr(self) -> str:
         return "NOW()"
 
@@ -613,6 +535,7 @@ class PostgresSearchRepository(SearchRepositoryBase):
     # Index / bulk index overrides (Postgres UPSERT)
     # ------------------------------------------------------------------
 
+    @override
     async def bulk_index_items(self, search_index_rows: List[SearchIndexRow]) -> None:
         """Index multiple items in a single batch operation using UPSERT.
 
@@ -705,8 +628,9 @@ class PostgresSearchRepository(SearchRepositoryBase):
         note_types: Optional[List[str]] = None,
         after_date: Optional[datetime] = None,
         search_item_types: Optional[List[SearchItemType]] = None,
-        metadata_filters: Optional[dict] = None,
-    ) -> tuple[str, str, dict, str, str]:
+        categories: Optional[List[str]] = None,
+        metadata_filters: Optional[dict[str, Any]] = None,
+    ) -> tuple[str, str, dict[str, Any], str, str]:
         """Build Postgres FTS FROM/WHERE params shared by search and count."""
         conditions = []
         params = {}
@@ -762,14 +686,36 @@ class PostgresSearchRepository(SearchRepositoryBase):
                 type_placeholders.append(f":{param_name}")
             conditions.append(f"search_index.type IN ({', '.join(type_placeholders)})")
 
-        # Handle note type filter using JSONB containment (parameterized)
+        # Handle observation category filter (parameterized for defense-in-depth).
+        # Trigger: caller passed `categories` to scope observation results.
+        # Why: `entity_types=["observation"]` only narrows to the observation row type;
+        #      callers expect exact-category matching, not incidental text matches.
+        # Outcome: only rows whose indexed category exactly equals a requested value
+        #          survive (entities/relations have NULL category and are excluded).
+        if categories:
+            category_placeholders = []
+            for idx, category in enumerate(categories):
+                param_name = f"category_{idx}"
+                params[param_name] = category
+                category_placeholders.append(f":{param_name}")
+            conditions.append(f"search_index.category IN ({', '.join(category_placeholders)})")
+
+        # Handle note type filter (frontmatter type field, parameterized).
+        # Trigger: caller passed `note_types` to scope by the frontmatter `type` field.
+        # Why: the stored note_type preserves the frontmatter casing (e.g. `Chapter`),
+        #      but the filter is documented case-insensitive. JSONB `@>` containment is
+        #      exact-match, so capitalized types were unfindable.
+        # Outcome: compare LOWER(metadata->>'note_type') against lowercased filter
+        #          values so `note_types=["Chapter"]` matches a stored `Chapter`.
         if note_types:
-            type_conditions = []
+            type_placeholders = []
             for idx, note_type in enumerate(note_types):
                 param_name = f"note_type_{idx}"
-                params[param_name] = json.dumps({"note_type": note_type})
-                type_conditions.append(f"search_index.metadata @> CAST(:{param_name} AS jsonb)")
-            conditions.append(f"({' OR '.join(type_conditions)})")
+                params[param_name] = note_type.lower()
+                type_placeholders.append(f":{param_name}")
+            conditions.append(
+                f"LOWER(search_index.metadata->>'note_type') IN ({', '.join(type_placeholders)})"
+            )
 
         # Handle date filter
         if after_date:
@@ -870,6 +816,7 @@ class PostgresSearchRepository(SearchRepositoryBase):
 
         return from_clause, where_clause, params, order_by_clause, score_expr
 
+    @override
     async def search(
         self,
         search_text: Optional[str] = None,
@@ -879,11 +826,14 @@ class PostgresSearchRepository(SearchRepositoryBase):
         note_types: Optional[List[str]] = None,
         after_date: Optional[datetime] = None,
         search_item_types: Optional[List[SearchItemType]] = None,
-        metadata_filters: Optional[dict] = None,
+        categories: Optional[List[str]] = None,
+        metadata_filters: Optional[dict[str, Any]] = None,
         retrieval_mode: SearchRetrievalMode = SearchRetrievalMode.FTS,
         min_similarity: Optional[float] = None,
         limit: int = 10,
         offset: int = 0,
+        allow_relaxed: bool = False,
+        session: AsyncSession | None = None,
     ) -> List[SearchIndexRow]:
         """Search across all indexed content using PostgreSQL tsvector."""
         # --- Dispatch vector / hybrid modes (shared logic) ---
@@ -895,6 +845,7 @@ class PostgresSearchRepository(SearchRepositoryBase):
             note_types=note_types,
             after_date=after_date,
             search_item_types=search_item_types,
+            categories=categories,
             metadata_filters=metadata_filters,
             retrieval_mode=retrieval_mode,
             min_similarity=min_similarity,
@@ -919,6 +870,7 @@ class PostgresSearchRepository(SearchRepositoryBase):
             note_types=note_types,
             after_date=after_date,
             search_item_types=search_item_types,
+            categories=categories,
             metadata_filters=metadata_filters,
         )
 
@@ -952,10 +904,65 @@ class PostgresSearchRepository(SearchRepositoryBase):
         """
 
         logger.trace(f"Search {sql} params: {params}")
+
+        use_savepoint = session is not None or allow_relaxed
+
+        async def execute_rows(active_session: AsyncSession, query_params: dict[str, Any]):
+            # PostgreSQL leaves a transaction unusable after invalid tsquery syntax.
+            # Scope retryable or caller-owned attempts to a savepoint so a relaxed
+            # retry—and any caller continuing to use its session—starts healthy.
+            if use_savepoint:
+                async with active_session.begin_nested():
+                    result = await active_session.execute(text(sql), query_params)
+                    return result.fetchall()
+            result = await active_session.execute(text(sql), query_params)
+            return result.fetchall()
+
+        async def run_search(active_session: AsyncSession):
+            relaxed = self._relaxed_tsquery_text(search_text) if allow_relaxed else None
+            strict_syntax_error = False
+            try:
+                rows = await execute_rows(active_session, params)
+            except Exception as exc:
+                if not (self._is_tsquery_syntax_error(exc) and relaxed and params.get("text")):
+                    raise
+                strict_syntax_error = True
+                rows = []
+
+            # Trigger: multi-word natural-language query matched nothing
+            # under the default all-terms-AND tsquery semantics, or its punctuation
+            # produced invalid strict tsquery syntax.
+            # Why: questions rarely have every word in one document;
+            # without relaxation the FTS half of hybrid search contributes zero
+            # candidates. The relaxed renderer also tokenizes punctuation safely.
+            # Outcome: one retry with OR-joined prefix lexemes; ts_rank
+            # still ranks multi-term matches first.
+            if relaxed and not rows and params.get("text"):
+                retry_reason = "invalid syntax" if strict_syntax_error else "0 results"
+                logger.debug(
+                    f"Strict Postgres FTS returned {retry_reason}; retrying relaxed FTS query "
+                    f"strict='{search_text}' relaxed='{relaxed}'"
+                )
+                with logfire.span(
+                    "search.relaxed_fts_retry",
+                    backend="postgres",
+                    reason="syntax_error" if strict_syntax_error else "empty_result",
+                    token_count=len(relaxed_query_words(search_text) or ()),
+                    limit=limit,
+                    offset=offset,
+                ):
+                    rows = await execute_rows(
+                        active_session,
+                        {**params, "text": relaxed},
+                    )
+            return rows
+
         try:
-            async with db.scoped_session(self.session_maker) as session:
-                result = await session.execute(text(sql), params)
-                rows = result.fetchall()
+            if session is not None:
+                rows = await run_search(session)
+            else:
+                async with db.scoped_session(self.session_maker) as owned_session:
+                    rows = await run_search(owned_session)
         except Exception as e:
             if self._is_tsquery_syntax_error(e):
                 logger.warning(f"tsquery syntax error for search term: {search_text}, error: {e}")
@@ -965,31 +972,7 @@ class PostgresSearchRepository(SearchRepositoryBase):
             logger.error(f"Database error during search: {e}")
             raise
 
-        results = [
-            SearchIndexRow(
-                project_id=self.project_id,
-                id=row.id,
-                title=row.title,
-                permalink=row.permalink,
-                file_path=row.file_path,
-                type=row.type,
-                score=float(row.score) if row.score else 0.0,
-                metadata=(
-                    row.metadata
-                    if isinstance(row.metadata, dict)
-                    else (json.loads(row.metadata) if row.metadata else {})
-                ),
-                from_id=row.from_id,
-                to_id=row.to_id,
-                relation_type=row.relation_type,
-                entity_id=row.entity_id,
-                content_snippet=row.content_snippet,
-                category=row.category,
-                created_at=row.created_at,
-                updated_at=row.updated_at,
-            )
-            for row in rows
-        ]
+        results = [SearchIndexRow.from_mapping(row._asdict()) for row in rows]
 
         logger.trace(f"Found {len(results)} search results")
         for r in results:
@@ -999,6 +982,7 @@ class PostgresSearchRepository(SearchRepositoryBase):
 
         return results
 
+    @override
     async def count(
         self,
         search_text: Optional[str] = None,
@@ -1008,9 +992,11 @@ class PostgresSearchRepository(SearchRepositoryBase):
         note_types: Optional[List[str]] = None,
         after_date: Optional[datetime] = None,
         search_item_types: Optional[List[SearchItemType]] = None,
-        metadata_filters: Optional[dict] = None,
+        categories: Optional[List[str]] = None,
+        metadata_filters: Optional[dict[str, Any]] = None,
         retrieval_mode: SearchRetrievalMode = SearchRetrievalMode.FTS,
         min_similarity: Optional[float] = None,
+        allow_relaxed: bool = False,
     ) -> int:
         """Count indexed content matching the Postgres FTS query."""
         if retrieval_mode != SearchRetrievalMode.FTS:
@@ -1022,6 +1008,7 @@ class PostgresSearchRepository(SearchRepositoryBase):
                 note_types=note_types,
                 after_date=after_date,
                 search_item_types=search_item_types,
+                categories=categories,
                 metadata_filters=metadata_filters,
                 retrieval_mode=retrieval_mode,
                 min_similarity=min_similarity,
@@ -1041,14 +1028,44 @@ class PostgresSearchRepository(SearchRepositoryBase):
             note_types=note_types,
             after_date=after_date,
             search_item_types=search_item_types,
+            categories=categories,
             metadata_filters=metadata_filters,
         )
         sql = f"SELECT COUNT(*) FROM {from_clause} WHERE {where_clause}"
         logger.trace(f"Count {sql} params: {params}")
+
+        async def execute_count(active_session: AsyncSession, query_params: dict[str, Any]) -> int:
+            if allow_relaxed:
+                async with active_session.begin_nested():
+                    result = await active_session.execute(text(sql), query_params)
+                    return int(result.scalar_one())
+            result = await active_session.execute(text(sql), query_params)
+            return int(result.scalar_one())
+
         try:
             async with db.scoped_session(self.session_maker) as session:
-                result = await session.execute(text(sql), params)
-                return int(result.scalar_one())
+                relaxed = self._relaxed_tsquery_text(search_text) if allow_relaxed else None
+                strict_syntax_error = False
+                try:
+                    total = await execute_count(session, params)
+                except Exception as exc:
+                    if not (self._is_tsquery_syntax_error(exc) and relaxed and params.get("text")):
+                        raise
+                    strict_syntax_error = True
+                    total = 0
+
+                if relaxed and total == 0 and params.get("text"):
+                    with logfire.span(
+                        "search.count.relaxed_fts_retry",
+                        backend="postgres",
+                        reason="syntax_error" if strict_syntax_error else "empty_result",
+                        token_count=len(relaxed_query_words(search_text) or ()),
+                    ):
+                        total = await execute_count(
+                            session,
+                            {**params, "text": relaxed},
+                        )
+                return total
         except Exception as e:
             if self._is_tsquery_syntax_error(e):
                 logger.warning(f"tsquery syntax error for search term: {search_text}, error: {e}")

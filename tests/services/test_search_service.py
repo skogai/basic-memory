@@ -9,6 +9,22 @@ from basic_memory import db
 from basic_memory.repository.search_index_row import SearchIndexRow
 from basic_memory.schemas.search import SearchQuery, SearchItemType, SearchRetrievalMode
 from basic_memory.services.search_service import _strip_nul
+from typing import Any
+
+
+async def _create_entity(session_maker, entity_repo, data):
+    async with db.scoped_session(session_maker) as session:
+        return await entity_repo.create(session, data)
+
+
+async def _create_observation(session_maker, obs_repo, data):
+    async with db.scoped_session(session_maker) as session:
+        return await obs_repo.create(session, data)
+
+
+async def _get_entity_by_permalink(session_maker, entity_repo, permalink):
+    async with db.scoped_session(session_maker) as session:
+        return await entity_repo.get_by_permalink(session, permalink)
 
 
 @pytest.mark.asyncio
@@ -278,6 +294,39 @@ async def test_search_entity_type(search_service, test_graph):
 
 
 @pytest.mark.asyncio
+async def test_search_categories_filter(search_service, test_graph):
+    """categories propagates through _prepare_query/has_criteria to scope results.
+
+    The test_graph fixture indexes observations with categories "note" and "tech".
+    A categories filter must return only matching observation categories.
+    """
+    # categories alone is enough criteria to run a query (has_criteria True).
+    note_results = await search_service.search(SearchQuery(categories=["note"]))
+    assert len(note_results) > 0
+    assert all(r.type == SearchItemType.OBSERVATION for r in note_results)
+    assert all(r.category == "note" for r in note_results)
+
+    # A different category yields a disjoint, non-empty result set.
+    tech_results = await search_service.search(SearchQuery(categories=["tech"]))
+    assert len(tech_results) > 0
+    assert all(r.category == "tech" for r in tech_results)
+
+    note_ids = {r.id for r in note_results}
+    tech_ids = {r.id for r in tech_results}
+    assert note_ids.isdisjoint(tech_ids)
+
+    # count() must agree with the filtered search via the same prepared query.
+    assert await search_service.count(SearchQuery(categories=["note"])) == len(note_results)
+
+
+@pytest.mark.asyncio
+async def test_search_categories_only_is_not_no_criteria():
+    """A SearchQuery carrying only categories must not be treated as empty."""
+    assert SearchQuery(categories=["requirement"]).no_criteria() is False
+    assert SearchQuery().no_criteria() is True
+
+
+@pytest.mark.asyncio
 async def test_extract_entity_tags_exception_handling(search_service):
     """Test the _extract_entity_tags method exception handling (lines 147-151)."""
     from basic_memory.models.knowledge import Entity
@@ -509,11 +558,9 @@ async def test_boolean_operators_detection(search_service):
 
 
 @pytest.mark.asyncio
-async def test_plain_multiterm_fts_retries_with_relaxed_or_when_strict_empty(
-    search_service, monkeypatch
-):
-    """Plain multi-term FTS should retry with relaxed OR query after strict no-results."""
-    call_texts: list[str | None] = []
+async def test_plain_multiterm_fts_enables_repository_relaxed_fallback(search_service, monkeypatch):
+    """Plain multi-term FTS should let the repository render relaxed backend syntax."""
+    calls: list[dict[str, Any]] = []
 
     now = datetime.now().astimezone()
     fallback_row = SearchIndexRow(
@@ -530,10 +577,8 @@ async def test_plain_multiterm_fts_retries_with_relaxed_or_when_strict_empty(
     )
 
     async def fake_search(**kwargs):
-        call_texts.append(kwargs.get("search_text"))
-        if len(call_texts) == 1:
-            return []
-        return [fallback_row]
+        calls.append(kwargs)
+        return [fallback_row] if kwargs.get("allow_relaxed") else []
 
     monkeypatch.setattr(search_service.repository, "search", fake_search)
 
@@ -542,16 +587,69 @@ async def test_plain_multiterm_fts_retries_with_relaxed_or_when_strict_empty(
     )
 
     assert len(results) == 1
-    assert call_texts[0] == "fundraising venture capital"
-    assert call_texts[1] == "fundraising OR venture OR capital"
-    assert len(call_texts) == 2
+    assert len(calls) == 1
+    assert calls[0]["search_text"] == "fundraising venture capital"
+    assert calls[0]["allow_relaxed"] is True
 
 
 @pytest.mark.asyncio
-async def test_relaxed_query_prunes_stopwords(search_service):
-    """Relaxed query should remove stopwords and keep high-signal terms."""
-    relaxed = search_service._build_relaxed_fts_query("who are our main competitors and partners?")
-    assert relaxed == "main OR competitors OR partners"
+async def test_plain_cjk_multiterm_fts_enables_repository_relaxed_fallback(
+    search_service, monkeypatch
+):
+    """Whitespace-separated CJK terms need backend prefix relaxed rendering."""
+    calls: list[dict[str, Any]] = []
+
+    now = datetime.now().astimezone()
+    fallback_row = SearchIndexRow(
+        project_id=1,
+        id=1,
+        type=SearchItemType.ENTITY.value,
+        file_path="test/cjk-fallback.md",
+        created_at=now,
+        updated_at=now,
+        permalink="test/cjk-fallback",
+        metadata={"note_type": "note"},
+        title="CJK Fallback Match",
+        score=1.0,
+    )
+
+    async def fake_search(**kwargs):
+        calls.append(kwargs)
+        return [fallback_row] if kwargs.get("allow_relaxed") else []
+
+    monkeypatch.setattr(search_service.repository, "search", fake_search)
+
+    results = await search_service.search(
+        SearchQuery(text="季度 报告", retrieval_mode=SearchRetrievalMode.FTS)
+    )
+
+    assert len(results) == 1
+    assert len(calls) == 1
+    assert calls[0]["search_text"] == "季度 报告"
+    assert calls[0]["allow_relaxed"] is True
+
+
+@pytest.mark.asyncio
+async def test_plain_cjk_multiterm_count_enables_repository_relaxed_fallback(
+    search_service, monkeypatch
+):
+    """Count should use the same backend relaxed fallback as search."""
+    calls: list[dict[str, Any]] = []
+
+    async def fake_count(**kwargs):
+        calls.append(kwargs)
+        return 1 if kwargs.get("allow_relaxed") else 0
+
+    monkeypatch.setattr(search_service.repository, "count", fake_count)
+
+    total = await search_service.count(
+        SearchQuery(text="季度 报告", retrieval_mode=SearchRetrievalMode.FTS)
+    )
+
+    assert total == 1
+    assert len(calls) == 1
+    assert calls[0]["search_text"] == "季度 报告"
+    assert calls[0]["allow_relaxed"] is True
 
 
 @pytest.mark.asyncio
@@ -827,7 +925,7 @@ async def test_search_by_frontmatter_tags(search_service, session_maker, test_pr
     """Test that entities can be found by searching for their frontmatter tags."""
     from basic_memory.repository import EntityRepository
 
-    entity_repo = EntityRepository(session_maker, project_id=test_project.id)
+    entity_repo = EntityRepository(project_id=test_project.id)
 
     # Create entity with tags
     from datetime import datetime
@@ -844,7 +942,7 @@ async def test_search_by_frontmatter_tags(search_service, session_maker, test_pr
         "updated_at": datetime.now(),
     }
 
-    entity = await entity_repo.create(entity_data)
+    entity = await _create_entity(session_maker, entity_repo, entity_data)
 
     await search_service.index_entity(entity, content="")
 
@@ -879,7 +977,7 @@ async def test_search_by_frontmatter_tags_string_format(
     """Test that entities with string format tags can be found in search."""
     from basic_memory.repository import EntityRepository
 
-    entity_repo = EntityRepository(session_maker, project_id=test_project.id)
+    entity_repo = EntityRepository(project_id=test_project.id)
 
     # Create entity with tags in string format
     from datetime import datetime
@@ -896,7 +994,7 @@ async def test_search_by_frontmatter_tags_string_format(
         "updated_at": datetime.now(),
     }
 
-    entity = await entity_repo.create(entity_data)
+    entity = await _create_entity(session_maker, entity_repo, entity_data)
 
     await search_service.index_entity(entity, content="")
 
@@ -918,7 +1016,7 @@ async def test_search_special_characters_in_title(search_service, session_maker,
     """Test that entities with special characters in titles can be searched without FTS5 syntax errors."""
     from basic_memory.repository import EntityRepository
 
-    entity_repo = EntityRepository(session_maker, project_id=test_project.id)
+    entity_repo = EntityRepository(project_id=test_project.id)
 
     # Create entities with special characters that could cause FTS5 syntax errors
     special_titles = [
@@ -949,7 +1047,7 @@ async def test_search_special_characters_in_title(search_service, session_maker,
             "updated_at": datetime.now(),
         }
 
-        entity = await entity_repo.create(entity_data)
+        entity = await _create_entity(session_maker, entity_repo, entity_data)
         entities.append(entity)
 
     # Index all entities
@@ -975,7 +1073,7 @@ async def test_search_title_with_parentheses_specific(search_service, session_ma
     """Test searching specifically for title with parentheses to reproduce FTS5 error."""
     from basic_memory.repository import EntityRepository
 
-    entity_repo = EntityRepository(session_maker, project_id=test_project.id)
+    entity_repo = EntityRepository(project_id=test_project.id)
 
     # Create the problematic entity
     from datetime import datetime
@@ -992,7 +1090,7 @@ async def test_search_title_with_parentheses_specific(search_service, session_ma
         "updated_at": datetime.now(),
     }
 
-    entity = await entity_repo.create(entity_data)
+    entity = await _create_entity(session_maker, entity_repo, entity_data)
 
     # Index the entity
     await search_service.index_entity(entity, content="")
@@ -1011,7 +1109,7 @@ async def test_search_title_via_repository_direct(search_service, session_maker,
     """Test searching via search repository directly to isolate the FTS5 error."""
     from basic_memory.repository import EntityRepository
 
-    entity_repo = EntityRepository(session_maker, project_id=test_project.id)
+    entity_repo = EntityRepository(project_id=test_project.id)
 
     # Create the problematic entity
     from datetime import datetime
@@ -1028,7 +1126,7 @@ async def test_search_title_via_repository_direct(search_service, session_maker,
         "updated_at": datetime.now(),
     }
 
-    entity = await entity_repo.create(entity_data)
+    entity = await _create_entity(session_maker, entity_repo, entity_data)
 
     # Index the entity
     await search_service.index_entity(entity, content="")
@@ -1060,8 +1158,8 @@ async def test_index_entity_with_duplicate_observations(
     from basic_memory.repository import EntityRepository, ObservationRepository
     from datetime import datetime
 
-    entity_repo = EntityRepository(session_maker, project_id=test_project.id)
-    obs_repo = ObservationRepository(session_maker, project_id=test_project.id)
+    entity_repo = EntityRepository(project_id=test_project.id)
+    obs_repo = ObservationRepository(project_id=test_project.id)
 
     # Create entity
     entity_data = {
@@ -1076,19 +1174,23 @@ async def test_index_entity_with_duplicate_observations(
         "updated_at": datetime.now(),
     }
 
-    entity = await entity_repo.create(entity_data)
+    entity = await _create_entity(session_maker, entity_repo, entity_data)
 
     # Create duplicate observations - same category and content
     duplicate_content = "This is a duplicated observation"
-    await obs_repo.create(
-        {"entity_id": entity.id, "category": "note", "content": duplicate_content}
+    await _create_observation(
+        session_maker,
+        obs_repo,
+        {"entity_id": entity.id, "category": "note", "content": duplicate_content},
     )
-    await obs_repo.create(
-        {"entity_id": entity.id, "category": "note", "content": duplicate_content}
+    await _create_observation(
+        session_maker,
+        obs_repo,
+        {"entity_id": entity.id, "category": "note", "content": duplicate_content},
     )
 
     # Reload entity with observations (get_by_permalink eagerly loads observations)
-    entity = await entity_repo.get_by_permalink("test/duplicate-obs")
+    entity = await _get_entity_by_permalink(session_maker, entity_repo, "test/duplicate-obs")
     assert entity is not None
 
     # Verify we have duplicate observations
@@ -1116,8 +1218,8 @@ async def test_index_entity_dedupes_observations_by_permalink(
     from basic_memory.repository import EntityRepository, ObservationRepository
     from datetime import datetime
 
-    entity_repo = EntityRepository(session_maker, project_id=test_project.id)
-    obs_repo = ObservationRepository(session_maker, project_id=test_project.id)
+    entity_repo = EntityRepository(project_id=test_project.id)
+    obs_repo = ObservationRepository(project_id=test_project.id)
 
     # Create entity
     entity_data = {
@@ -1132,22 +1234,30 @@ async def test_index_entity_dedupes_observations_by_permalink(
         "updated_at": datetime.now(),
     }
 
-    entity = await entity_repo.create(entity_data)
+    entity = await _create_entity(session_maker, entity_repo, entity_data)
 
     # Create three observations: two duplicates and one unique
     duplicate_content = "Duplicate observation content"
     unique_content = "Unique observation content"
 
-    await obs_repo.create(
-        {"entity_id": entity.id, "category": "note", "content": duplicate_content}
+    await _create_observation(
+        session_maker,
+        obs_repo,
+        {"entity_id": entity.id, "category": "note", "content": duplicate_content},
     )
-    await obs_repo.create(
-        {"entity_id": entity.id, "category": "note", "content": duplicate_content}
+    await _create_observation(
+        session_maker,
+        obs_repo,
+        {"entity_id": entity.id, "category": "note", "content": duplicate_content},
     )
-    await obs_repo.create({"entity_id": entity.id, "category": "note", "content": unique_content})
+    await _create_observation(
+        session_maker,
+        obs_repo,
+        {"entity_id": entity.id, "category": "note", "content": unique_content},
+    )
 
     # Reload entity with observations (get_by_permalink eagerly loads observations)
-    entity = await entity_repo.get_by_permalink("test/dedupe-test")
+    entity = await _get_entity_by_permalink(session_maker, entity_repo, "test/dedupe-test")
     assert entity is not None
     assert len(entity.observations) == 3
 
@@ -1175,8 +1285,8 @@ async def test_index_entity_multiple_categories_same_content(
     from basic_memory.repository import EntityRepository, ObservationRepository
     from datetime import datetime
 
-    entity_repo = EntityRepository(session_maker, project_id=test_project.id)
-    obs_repo = ObservationRepository(session_maker, project_id=test_project.id)
+    entity_repo = EntityRepository(project_id=test_project.id)
+    obs_repo = ObservationRepository(project_id=test_project.id)
 
     # Create entity
     entity_data = {
@@ -1191,15 +1301,23 @@ async def test_index_entity_multiple_categories_same_content(
         "updated_at": datetime.now(),
     }
 
-    entity = await entity_repo.create(entity_data)
+    entity = await _create_entity(session_maker, entity_repo, entity_data)
 
     # Create observations with same content but different categories
     shared_content = "Shared content across categories"
-    await obs_repo.create({"entity_id": entity.id, "category": "tech", "content": shared_content})
-    await obs_repo.create({"entity_id": entity.id, "category": "design", "content": shared_content})
+    await _create_observation(
+        session_maker,
+        obs_repo,
+        {"entity_id": entity.id, "category": "tech", "content": shared_content},
+    )
+    await _create_observation(
+        session_maker,
+        obs_repo,
+        {"entity_id": entity.id, "category": "design", "content": shared_content},
+    )
 
     # Reload entity with observations (get_by_permalink eagerly loads observations)
-    entity = await entity_repo.get_by_permalink("test/multi-category")
+    entity = await _get_entity_by_permalink(session_maker, entity_repo, "test/multi-category")
     assert entity is not None
     assert len(entity.observations) == 2
 
@@ -1213,6 +1331,82 @@ async def test_index_entity_multiple_categories_same_content(
     # Search for the shared content - should find both observations
     results = await search_service.search(SearchQuery(text="Shared content"))
     assert len(results) >= 2
+
+
+@pytest.mark.asyncio
+async def test_index_entity_long_observations_shared_prefix_both_searchable(
+    search_service, session_maker, test_project
+):
+    """Regression test for issue #909: truncated permalink collisions drop observations.
+
+    Observation permalinks truncate content to 200 chars (PostgreSQL btree limit),
+    so two distinct observations of the same category sharing a 200-char prefix
+    collided on the same synthetic permalink and the second was silently skipped
+    during indexing. Both must be independently searchable.
+    """
+    from basic_memory.repository import EntityRepository, ObservationRepository
+    from datetime import datetime
+
+    entity_repo = EntityRepository(project_id=test_project.id)
+    obs_repo = ObservationRepository(project_id=test_project.id)
+
+    entity_data = {
+        "title": "Long Observation Collision Entity",
+        "note_type": "note",
+        "entity_metadata": {},
+        "content_type": "text/markdown",
+        "file_path": "test/long-obs-collision.md",
+        "permalink": "test/long-obs-collision",
+        "project_id": test_project.id,
+        "created_at": datetime.now(),
+        "updated_at": datetime.now(),
+    }
+    entity = await _create_entity(session_maker, entity_repo, entity_data)
+
+    # Identical for the first 210 chars (beyond the 200-char truncation point),
+    # differing only in the trailing unique marker
+    shared_prefix = "x" * 210
+    await _create_observation(
+        session_maker,
+        obs_repo,
+        {
+            "entity_id": entity.id,
+            "category": "note",
+            "content": f"{shared_prefix} ALPHA_UNIQUE_MARKER",
+        },
+    )
+    await _create_observation(
+        session_maker,
+        obs_repo,
+        {
+            "entity_id": entity.id,
+            "category": "note",
+            "content": f"{shared_prefix} BETA_UNIQUE_MARKER",
+        },
+    )
+
+    # Reload entity with observations (get_by_permalink eagerly loads observations)
+    entity = await _get_entity_by_permalink(session_maker, entity_repo, "test/long-obs-collision")
+    assert entity is not None
+    assert len(entity.observations) == 2
+
+    # Distinct content must produce distinct permalinks despite the shared prefix
+    permalinks = {obs.permalink for obs in entity.observations}
+    assert len(permalinks) == 2
+
+    await search_service.index_entity(entity, content="")
+
+    # The second observation must be findable by its own unique marker
+    results = await search_service.search(
+        SearchQuery(text="BETA_UNIQUE_MARKER", entity_types=[SearchItemType.OBSERVATION])
+    )
+    assert any("BETA_UNIQUE_MARKER" in (r.content_snippet or "") for r in results)
+
+    # The first observation must remain findable as well
+    results = await search_service.search(
+        SearchQuery(text="ALPHA_UNIQUE_MARKER", entity_types=[SearchItemType.OBSERVATION])
+    )
+    assert any("ALPHA_UNIQUE_MARKER" in (r.content_snippet or "") for r in results)
 
 
 # Tests for NUL byte stripping
@@ -1239,7 +1433,7 @@ async def test_index_entity_markdown_strips_nul_bytes(search_service, session_ma
     from basic_memory.repository import EntityRepository
     from basic_memory.repository.search_repository import SearchRepository
 
-    entity_repo = EntityRepository(session_maker, project_id=test_project.id)
+    entity_repo = EntityRepository(project_id=test_project.id)
 
     entity_data = {
         "title": "NUL Test Entity",
@@ -1252,8 +1446,8 @@ async def test_index_entity_markdown_strips_nul_bytes(search_service, session_ma
         "created_at": datetime.now(),
         "updated_at": datetime.now(),
     }
-    entity = await entity_repo.create(entity_data)
-    entity = await entity_repo.get_by_permalink("test/nul-test")
+    entity = await _create_entity(session_maker, entity_repo, entity_data)
+    entity = await _get_entity_by_permalink(session_maker, entity_repo, "test/nul-test")
     assert entity is not None
 
     # Index with NUL-containing content (simulates rclone-preallocated file)
@@ -1271,18 +1465,141 @@ async def test_index_entity_markdown_strips_nul_bytes(search_service, session_ma
 
 
 @pytest.mark.asyncio
+async def test_purge_stale_search_rows_removes_db_orphaned_rows(
+    search_service,
+    session_maker,
+    test_graph,
+    test_project,
+    project_repository,
+    tmp_path,
+):
+    """The reconciliation sweep removes DB-only graph divergence without crossing projects."""
+    from basic_memory.repository.search_repository_base import purge_stale_search_index_rows
+
+    async with db.scoped_session(session_maker) as session:
+        indexed_rows = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT id, type, permalink, entity_id FROM search_index "
+                        "WHERE project_id = :project_id ORDER BY type, id"
+                    ),
+                    {"project_id": test_project.id},
+                )
+            )
+            .mappings()
+            .all()
+        )
+
+        orphaned_observation = next(
+            row for row in indexed_rows if row["type"] == SearchItemType.OBSERVATION.value
+        )
+        orphaned_relation = next(
+            row for row in indexed_rows if row["type"] == SearchItemType.RELATION.value
+        )
+        surviving_rows = [
+            next(row for row in indexed_rows if row["type"] == SearchItemType.ENTITY.value),
+            next(
+                row
+                for row in indexed_rows
+                if row["type"] == SearchItemType.OBSERVATION.value
+                and row["id"] != orphaned_observation["id"]
+            ),
+            next(
+                row
+                for row in indexed_rows
+                if row["type"] == SearchItemType.RELATION.value
+                and row["id"] != orphaned_relation["id"]
+            ),
+        ]
+
+        other_project = await project_repository.create(
+            session,
+            {
+                "name": "search-purge-isolation",
+                "description": "Project isolation for stale search reconciliation",
+                "path": str(tmp_path / "search-purge-isolation"),
+                "is_active": True,
+                "is_default": False,
+            },
+        )
+        other_project_id = other_project.id
+        isolated_search_row_id = 9_000_001
+        await session.execute(
+            text(
+                "INSERT INTO search_index "
+                "(id, title, content_stems, content_snippet, permalink, file_path, "
+                "type, entity_id, project_id) "
+                "VALUES (:id, 'isolation canary', 'isolation canary', 'isolation canary', "
+                "'isolation-canary', 'isolation-canary.md', 'observation', "
+                ":entity_id, :project_id)"
+            ),
+            {
+                "id": isolated_search_row_id,
+                "entity_id": surviving_rows[0]["entity_id"],
+                "project_id": other_project_id,
+            },
+        )
+        await session.execute(
+            text("DELETE FROM observation WHERE project_id = :project_id AND id = :row_id"),
+            {"project_id": test_project.id, "row_id": orphaned_observation["id"]},
+        )
+        await session.execute(
+            text("DELETE FROM relation WHERE project_id = :project_id AND id = :row_id"),
+            {"project_id": test_project.id, "row_id": orphaned_relation["id"]},
+        )
+
+    purged = await purge_stale_search_index_rows(session_maker, test_project.id)
+
+    assert purged == 2
+    assert not await search_service.search(SearchQuery(permalink=orphaned_observation["permalink"]))
+    assert not await search_service.search(SearchQuery(permalink=orphaned_relation["permalink"]))
+    for surviving_row in surviving_rows:
+        results = await search_service.search(SearchQuery(permalink=surviving_row["permalink"]))
+        assert {(result.type, result.id) for result in results} == {
+            (surviving_row["type"], surviving_row["id"])
+        }
+
+    async with db.scoped_session(session_maker) as session:
+        isolated_row_count = await session.scalar(
+            text(
+                "SELECT COUNT(*) FROM search_index WHERE project_id = :project_id AND id = :row_id"
+            ),
+            {"project_id": other_project_id, "row_id": isolated_search_row_id},
+        )
+    assert isolated_row_count == 1
+
+
+@pytest.mark.asyncio
 async def test_reindex_vectors(search_service, session_maker, test_project, monkeypatch):
     """Test that reindex_vectors processes all entities and reports stats."""
     from basic_memory.repository import EntityRepository
-    from basic_memory.repository.search_repository_base import VectorSyncBatchResult
+    from basic_memory.runtime.vector_sync import VectorSyncBatchResult
     from datetime import datetime
 
-    entity_repo = EntityRepository(session_maker, project_id=test_project.id)
+    entity_repo = EntityRepository(project_id=test_project.id)
+
+    # Test fixtures disable semantic search, and delete_stale_vector_rows is the one call
+    # in this flow that requires the semantic stack — stub it so the test exercises the
+    # reindex wiring (id collection, batch call, stats mapping) without embeddings.
+    # raising=False: the method is SQLite-only; the Postgres purge path never calls it,
+    # so on Postgres this just attaches an unused attribute.
+    async def _noop_delete_stale_vector_rows() -> None:
+        return None
+
+    monkeypatch.setattr(
+        search_service.repository,
+        "delete_stale_vector_rows",
+        _noop_delete_stale_vector_rows,
+        raising=False,
+    )
 
     # Create some entities
     created_entity_ids: list[int] = []
     for i in range(3):
-        entity = await entity_repo.create(
+        entity = await _create_entity(
+            session_maker,
+            entity_repo,
             {
                 "title": f"Vector Test Entity {i}",
                 "note_type": "note",
@@ -1293,7 +1610,7 @@ async def test_reindex_vectors(search_service, session_maker, test_project, monk
                 "project_id": test_project.id,
                 "created_at": datetime.now(),
                 "updated_at": datetime.now(),
-            }
+            },
         )
         created_entity_ids.append(entity.id)
         await search_service.index_entity(entity, content=f"Content for entity {i}")
@@ -1307,7 +1624,7 @@ async def test_reindex_vectors(search_service, session_maker, test_project, monk
             entities_total=len(entity_ids),
             entities_synced=len(entity_ids),
             entities_failed=0,
-            failed_entity_ids=[],
+            failed_entity_ids=(),
             embedding_jobs_total=9,
             embed_seconds_total=1.2,
             write_seconds_total=0.4,
@@ -1345,11 +1662,29 @@ async def test_reindex_vectors_no_callback(
 ):
     """Test reindex_vectors works without a progress callback."""
     from basic_memory.repository import EntityRepository
-    from basic_memory.repository.search_repository_base import VectorSyncBatchResult
+    from basic_memory.runtime.vector_sync import VectorSyncBatchResult
     from datetime import datetime
 
-    entity_repo = EntityRepository(session_maker, project_id=test_project.id)
-    entity = await entity_repo.create(
+    entity_repo = EntityRepository(project_id=test_project.id)
+
+    # Test fixtures disable semantic search, and delete_stale_vector_rows is the one call
+    # in this flow that requires the semantic stack — stub it so the test exercises the
+    # reindex wiring without embeddings.
+    # raising=False: the method is SQLite-only; the Postgres purge path never calls it,
+    # so on Postgres this just attaches an unused attribute.
+    async def _noop_delete_stale_vector_rows() -> None:
+        return None
+
+    monkeypatch.setattr(
+        search_service.repository,
+        "delete_stale_vector_rows",
+        _noop_delete_stale_vector_rows,
+        raising=False,
+    )
+
+    entity = await _create_entity(
+        session_maker,
+        entity_repo,
         {
             "title": "No Callback Entity",
             "note_type": "note",
@@ -1360,7 +1695,7 @@ async def test_reindex_vectors_no_callback(
             "project_id": test_project.id,
             "created_at": datetime.now(),
             "updated_at": datetime.now(),
-        }
+        },
     )
     await search_service.index_entity(entity, content="Test content")
 
@@ -1370,7 +1705,7 @@ async def test_reindex_vectors_no_callback(
             entities_total=len(entity_ids),
             entities_synced=len(entity_ids),
             entities_failed=0,
-            failed_entity_ids=[],
+            failed_entity_ids=(),
             embedding_jobs_total=3,
             embed_seconds_total=0.5,
             write_seconds_total=0.1,

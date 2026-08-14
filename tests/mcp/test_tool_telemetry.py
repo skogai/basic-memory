@@ -7,6 +7,7 @@ from contextlib import contextmanager
 
 import logfire
 import pytest
+from typing import Any
 
 build_context_module = importlib.import_module("basic_memory.mcp.tools.build_context")
 edit_note_module = importlib.import_module("basic_memory.mcp.tools.edit_note")
@@ -18,7 +19,7 @@ write_note_module = importlib.import_module("basic_memory.mcp.tools.write_note")
 class _NoopSpan:
     """Minimal stand-in for a live logfire span during tests."""
 
-    def set_attributes(self, attrs: dict) -> None:
+    def set_attributes(self, attrs: dict[str, Any]) -> None:
         pass
 
     def set_attribute(self, key: str, value) -> None:
@@ -26,7 +27,7 @@ class _NoopSpan:
 
 
 def _recording_spans():
-    spans: list[tuple[str, dict]] = []
+    spans: list[tuple[str, dict[str, Any]]] = []
 
     @contextmanager
     def fake_span(name: str, **attrs):
@@ -36,7 +37,9 @@ def _recording_spans():
     return spans, fake_span
 
 
-def _contains_span_attrs(spans: list[tuple[str, dict]], name: str, expected: dict) -> bool:
+def _contains_span_attrs(
+    spans: list[tuple[str, dict[str, Any]]], name: str, expected: dict[str, Any]
+) -> bool:
     return any(
         span_name == name and expected.items() <= attrs.items() for span_name, attrs in spans
     )
@@ -109,14 +112,16 @@ async def test_read_note_emits_root_operation_and_project_context(
             "tool_name": "read_note",
             "requested_project": test_project.name,
             "requested_project_id": None,
+            "page": 1,
+            "page_size": 10,
             "output_format": "json",
             "include_frontmatter": True,
         },
     )
     span_names = [name for name, _ in spans]
     assert "api.request.knowledge.resolve_entity" in span_names
-    assert "api.request.resource.get_content" in span_names
     assert "api.request.knowledge.get_entity" in span_names
+    assert "api.request.resource.get_content" not in span_names
     assert _contains_span_attrs(
         spans,
         "routing.client_session",
@@ -165,6 +170,7 @@ async def test_search_notes_emits_root_operation_and_project_context(
             "has_query": True,
             "note_type_filter_count": 0,
             "entity_type_filter_count": 0,
+            "category_filter_count": 0,
             "has_filters": True,
             "has_tags_filter": True,
             "has_status_filter": False,
@@ -216,6 +222,8 @@ async def test_edit_note_emits_root_operation_and_project_context(
             "has_section": False,
             "has_find_text": False,
             "expected_replacements": 1,
+            "replace_subsections": True,
+            "has_metadata": False,
         },
     )
     span_names = [name for name, _ in spans]

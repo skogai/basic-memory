@@ -1,18 +1,41 @@
 """Tests for `bm reindex` CLI wiring."""
 
 import asyncio
+from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy import text
 from typer.testing import CliRunner
 
+from basic_memory import db
 from basic_memory.cli.app import app
+from basic_memory.config import DatabaseBackend
 import basic_memory.cli.commands.db as db_cmd  # noqa: F401
 
 
 runner = CliRunner()
+
+
+def _vector_stats(
+    *,
+    total_entities: int,
+    embedded: int,
+    skipped: int,
+    errors: int,
+    sample_errors: tuple[str, ...] = (),
+) -> dict[str, object]:
+    return {
+        "total_entities": total_entities,
+        "embedded": embedded,
+        "skipped": skipped,
+        "errors": errors,
+        "sample_errors": sample_errors,
+        "vector_index": "milvus",
+        "embedding_model": "FastEmbedEmbeddingProvider:BAAI/bge-small-en-v1.5",
+    }
 
 
 def _stub_app_config(*, semantic_search_enabled: bool = True) -> SimpleNamespace:
@@ -21,6 +44,8 @@ def _stub_app_config(*, semantic_search_enabled: bool = True) -> SimpleNamespace
         semantic_search_enabled=semantic_search_enabled,
         database_path=Path("/tmp/basic-memory.db"),
         get_project_mode=lambda project_name: None,
+        # app_callback reads this to decide whether to install the uvloop policy.
+        database_backend=DatabaseBackend.SQLITE,
     )
 
 
@@ -39,6 +64,98 @@ def _configure_reindex_cli(monkeypatch, app_config: SimpleNamespace) -> None:
         "ConfigManager",
         lambda: SimpleNamespace(config=app_config),
     )
+
+
+def _configure_embedding_runtime(
+    monkeypatch,
+    session_maker,
+    stats: Mapping[str, object],
+) -> tuple[SimpleNamespace, AsyncMock, list[str]]:
+    """Install the runtime boundaries needed to exercise the real reindex command."""
+    app_config = _stub_app_config()
+    project = SimpleNamespace(id=1, name="foo", path="/tmp/foo")
+    printed_lines: list[str] = []
+    project_index = AsyncMock(
+        return_value=SimpleNamespace(
+            total_files=1,
+            enqueued_files=1,
+            enqueued_batches=1,
+            deleted_files=0,
+        )
+    )
+
+    class StubProjectRepository:
+        async def get_active_projects(self, session):
+            return [project]
+
+    class StubSearchService:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def reindex_vectors(self, *, progress_callback=None, force_full: bool = False):
+            return dict(stats)
+
+    class SilentProgress:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args) -> bool:
+            return False
+
+        def add_task(self, *args, **kwargs) -> int:
+            return 1
+
+        def update(self, *args, **kwargs) -> None:
+            pass
+
+    _configure_reindex_cli(monkeypatch, app_config)
+    monkeypatch.setattr(db_cmd, "run_with_cleanup", lambda coro: asyncio.run(coro))
+    monkeypatch.setattr(
+        "basic_memory.services.initialization.reconcile_projects_with_config",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "basic_memory.services.initialization.recover_project_materializations",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "basic_memory.db.get_or_create_db",
+        AsyncMock(return_value=(None, session_maker)),
+    )
+    monkeypatch.setattr("basic_memory.db.shutdown_db", AsyncMock())
+    monkeypatch.setattr("basic_memory.repository.ProjectRepository", StubProjectRepository)
+    monkeypatch.setattr(
+        "basic_memory.index.local_project.run_local_project_index_for_project",
+        project_index,
+    )
+    monkeypatch.setattr(
+        "basic_memory.repository.search_repository.create_search_repository",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr("basic_memory.repository.EntityRepository", lambda *a, **k: object())
+    monkeypatch.setattr(
+        "basic_memory.markdown.entity_parser.EntityParser",
+        lambda *a, **k: object(),
+    )
+    monkeypatch.setattr(
+        "basic_memory.markdown.markdown_processor.MarkdownProcessor",
+        lambda *a, **k: object(),
+    )
+    monkeypatch.setattr(
+        "basic_memory.services.file_service.FileService",
+        lambda *a, **k: object(),
+    )
+    monkeypatch.setattr("basic_memory.services.search_service.SearchService", StubSearchService)
+    monkeypatch.setattr(db_cmd, "Progress", SilentProgress)
+    monkeypatch.setattr(
+        db_cmd.console,
+        "print",
+        lambda message="", *args, **kwargs: printed_lines.append(str(message)),
+    )
+    return app_config, project_index, printed_lines
 
 
 def test_reindex_defaults_to_incremental_search_and_embeddings(monkeypatch):
@@ -160,48 +277,41 @@ def test_reindex_embeddings_only_preserves_incremental_default(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_reindex_project_full_passes_force_full_to_sync_and_reports_mode(monkeypatch):
+async def test_reindex_project_full_uses_core_project_index_and_reports_summary(
+    monkeypatch,
+    session_maker,
+):
     app_config = _stub_app_config()
     project = SimpleNamespace(id=1, name="foo", path="/tmp/foo")
-    session_maker = object()
-    sync_service = SimpleNamespace(sync=AsyncMock())
+    project_index = AsyncMock(
+        return_value=SimpleNamespace(
+            total_files=3,
+            enqueued_files=2,
+            enqueued_batches=1,
+            deleted_files=1,
+        )
+    )
     printed_lines: list[str] = []
 
     class StubProjectRepository:
-        def __init__(self, _session_maker):
-            self._session_maker = _session_maker
-
-        async def get_active_projects(self):
+        async def get_active_projects(self, session):
             return [project]
 
-    class SilentProgress:
-        def __init__(self, *args, **kwargs):
-            self.tasks: dict[int, SimpleNamespace] = {}
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def add_task(self, description, total=1):
-            self.tasks[1] = SimpleNamespace(total=total, description=description)
-            return 1
-
-        def update(self, task_id, **kwargs):
-            if "total" in kwargs:
-                self.tasks[task_id].total = kwargs["total"]
-
-    monkeypatch.setattr(db_cmd, "reconcile_projects_with_config", AsyncMock())
+    # _reindex imports its database/index dependencies at call time (#886),
+    # so stubs target the source modules instead of db_cmd attributes.
     monkeypatch.setattr(
-        db_cmd.db,
-        "get_or_create_db",
+        "basic_memory.services.initialization.reconcile_projects_with_config", AsyncMock()
+    )
+    monkeypatch.setattr(
+        "basic_memory.db.get_or_create_db",
         AsyncMock(return_value=(None, session_maker)),
     )
-    monkeypatch.setattr(db_cmd.db, "shutdown_db", AsyncMock())
-    monkeypatch.setattr(db_cmd, "ProjectRepository", StubProjectRepository)
-    monkeypatch.setattr(db_cmd, "get_sync_service", AsyncMock(return_value=sync_service))
-    monkeypatch.setattr(db_cmd, "Progress", SilentProgress)
+    monkeypatch.setattr("basic_memory.db.shutdown_db", AsyncMock())
+    monkeypatch.setattr("basic_memory.repository.ProjectRepository", StubProjectRepository)
+    monkeypatch.setattr(
+        "basic_memory.index.local_project.run_local_project_index_for_project",
+        project_index,
+    )
     monkeypatch.setattr(
         db_cmd.console,
         "print",
@@ -216,36 +326,37 @@ async def test_reindex_project_full_passes_force_full_to_sync_and_reports_mode(m
         project="foo",
     )
 
-    sync_service.sync.assert_awaited_once()
-    sync_call = sync_service.sync.await_args
-    assert sync_call.args[0] == Path("/tmp/foo")
-    assert sync_call.kwargs["project_name"] == "foo"
-    assert sync_call.kwargs["force_full"] is True
-    assert sync_call.kwargs["sync_embeddings"] is False
-    assert callable(sync_call.kwargs["progress_callback"])
-    assert any("full scan" in line for line in printed_lines)
+    project_index.assert_awaited_once()
+    index_call = project_index.await_args
+    assert index_call is not None
+    assert index_call.args[0] == project
+    assert index_call.kwargs["force_full"] is True
+    # Search-only reindex must not run the embedding provider via the project index.
+    assert index_call.kwargs["embeddings"] is False
+    assert any("project index" in line for line in printed_lines)
+    assert any("3 observed, 2 indexed, 1 deleted" in line for line in printed_lines)
 
 
 @pytest.mark.asyncio
-async def test_reindex_embeddings_only_full_passes_force_full_to_vector_reindex(monkeypatch):
+async def test_reindex_embeddings_only_full_passes_force_full_to_vector_reindex(
+    monkeypatch,
+    session_maker,
+):
     app_config = _stub_app_config()
     project = SimpleNamespace(id=1, name="foo", path="/tmp/foo")
-    session_maker = object()
     printed_lines: list[str] = []
     vector_reindex_calls: list[dict[str, object]] = []
 
     class StubProjectRepository:
-        def __init__(self, _session_maker):
-            self._session_maker = _session_maker
-
-        async def get_active_projects(self):
+        async def get_active_projects(self, session):
             return [project]
 
     class StubSearchService:
-        def __init__(self, search_repository, entity_repository, file_service):
+        def __init__(self, search_repository, entity_repository, file_service, *, session_maker):
             self.search_repository = search_repository
             self.entity_repository = entity_repository
             self.file_service = file_service
+            self.session_maker = session_maker
 
         async def reindex_vectors(self, *, progress_callback=None, force_full: bool = False):
             vector_reindex_calls.append(
@@ -254,7 +365,7 @@ async def test_reindex_embeddings_only_full_passes_force_full_to_vector_reindex(
                     "force_full": force_full,
                 }
             )
-            return {"total_entities": 2, "embedded": 2, "skipped": 0, "errors": 0}
+            return _vector_stats(total_entities=2, embedded=2, skipped=0, errors=0)
 
     class SilentProgress:
         def __init__(self, *args, **kwargs):
@@ -274,14 +385,17 @@ async def test_reindex_embeddings_only_full_passes_force_full_to_vector_reindex(
             if "total" in kwargs:
                 self.tasks[task_id].total = kwargs["total"]
 
-    monkeypatch.setattr(db_cmd, "reconcile_projects_with_config", AsyncMock())
+    # _reindex imports its database/sync dependencies at call time (#886),
+    # so stubs target the source modules instead of db_cmd attributes.
     monkeypatch.setattr(
-        db_cmd.db,
-        "get_or_create_db",
+        "basic_memory.services.initialization.reconcile_projects_with_config", AsyncMock()
+    )
+    monkeypatch.setattr(
+        "basic_memory.db.get_or_create_db",
         AsyncMock(return_value=(None, session_maker)),
     )
-    monkeypatch.setattr(db_cmd.db, "shutdown_db", AsyncMock())
-    monkeypatch.setattr(db_cmd, "ProjectRepository", StubProjectRepository)
+    monkeypatch.setattr("basic_memory.db.shutdown_db", AsyncMock())
+    monkeypatch.setattr("basic_memory.repository.ProjectRepository", StubProjectRepository)
     monkeypatch.setattr(
         "basic_memory.repository.search_repository.create_search_repository",
         lambda *args, **kwargs: object(),
@@ -320,3 +434,449 @@ async def test_reindex_embeddings_only_full_passes_force_full_to_vector_reindex(
     assert vector_reindex_calls[0]["force_full"] is True
     assert callable(vector_reindex_calls[0]["progress_callback"])
     assert any("full rebuild" in line for line in printed_lines)
+
+
+@pytest.mark.asyncio
+async def test_reindex_embeddings_only_warns_when_project_has_no_indexed_entities(
+    monkeypatch,
+    session_maker,
+):
+    """Embeddings-only mode explains that it cannot discover project files."""
+    app_config = _stub_app_config()
+    project = SimpleNamespace(id=1, name="foo", path="/tmp/foo")
+    printed_lines: list[str] = []
+
+    class StubProjectRepository:
+        async def get_active_projects(self, session):
+            return [project]
+
+    class StubSearchService:
+        def __init__(self, search_repository, entity_repository, file_service, *, session_maker):
+            pass
+
+        async def reindex_vectors(self, *, progress_callback=None, force_full: bool = False):
+            return _vector_stats(total_entities=0, embedded=0, skipped=0, errors=0)
+
+    class SilentProgress:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def add_task(self, description, total=None):
+            return 1
+
+        def update(self, task_id, **kwargs):
+            pass
+
+    monkeypatch.setattr(
+        "basic_memory.services.initialization.reconcile_projects_with_config", AsyncMock()
+    )
+    monkeypatch.setattr(
+        "basic_memory.db.get_or_create_db",
+        AsyncMock(return_value=(None, session_maker)),
+    )
+    monkeypatch.setattr("basic_memory.db.shutdown_db", AsyncMock())
+    monkeypatch.setattr("basic_memory.repository.ProjectRepository", StubProjectRepository)
+    monkeypatch.setattr(
+        "basic_memory.repository.search_repository.create_search_repository",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        "basic_memory.repository.EntityRepository", lambda *args, **kwargs: object()
+    )
+    monkeypatch.setattr(
+        "basic_memory.markdown.entity_parser.EntityParser",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        "basic_memory.markdown.markdown_processor.MarkdownProcessor",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        "basic_memory.services.file_service.FileService", lambda *args, **kwargs: object()
+    )
+    monkeypatch.setattr("basic_memory.services.search_service.SearchService", StubSearchService)
+    monkeypatch.setattr(db_cmd, "Progress", SilentProgress)
+    monkeypatch.setattr(
+        db_cmd.console,
+        "print",
+        lambda message="", *args, **kwargs: printed_lines.append(str(message)),
+    )
+
+    await db_cmd._reindex(
+        app_config,
+        search=False,
+        embeddings=True,
+        full=False,
+        project="foo",
+    )
+
+    output = "\n".join(printed_lines)
+    assert "0 entities embedded" in output
+    assert "No indexed entities found" in output
+    assert "--embeddings" in output
+    assert "bm reindex" in output
+
+
+@pytest.mark.asyncio
+async def test_reindex_recovers_stuck_materializations_before_scan(monkeypatch, session_maker):
+    """The scan reconciles deletes against the filesystem, so a note whose accepted
+    file write a crash left stuck ('writing'/'pending'/'failed') would be destroyed
+    as a missing file. Recovery must re-drive stuck rows before each project scan."""
+    app_config = _stub_app_config()
+    projects = [
+        SimpleNamespace(id=1, name="foo", path="/tmp/foo"),
+        SimpleNamespace(id=2, name="bar", path="/tmp/bar"),
+    ]
+    call_order: list[str] = []
+
+    class StubProjectRepository:
+        async def get_active_projects(self, session):
+            return projects
+
+    async def record_recover(project, session_maker_arg):
+        assert session_maker_arg is session_maker
+        call_order.append(f"recover:{project.name}")
+
+    async def record_project_index(project, *, runtime_factory, force_full, embeddings):
+        call_order.append(f"index:{project.name}")
+        return SimpleNamespace(total_files=0, enqueued_files=0, enqueued_batches=0, deleted_files=0)
+
+    # _reindex imports its database/index dependencies at call time (#886),
+    # so stubs target the source modules instead of db_cmd attributes.
+    monkeypatch.setattr(
+        "basic_memory.services.initialization.reconcile_projects_with_config", AsyncMock()
+    )
+    monkeypatch.setattr(
+        "basic_memory.services.initialization.recover_project_materializations",
+        record_recover,
+    )
+    monkeypatch.setattr(
+        "basic_memory.db.get_or_create_db",
+        AsyncMock(return_value=(None, session_maker)),
+    )
+    monkeypatch.setattr("basic_memory.db.shutdown_db", AsyncMock())
+    monkeypatch.setattr("basic_memory.repository.ProjectRepository", StubProjectRepository)
+    monkeypatch.setattr(
+        "basic_memory.index.local_project.run_local_project_index_for_project",
+        record_project_index,
+    )
+    monkeypatch.setattr(db_cmd.console, "print", lambda *args, **kwargs: None)
+
+    await db_cmd._reindex(app_config, search=True, embeddings=False, full=False, project=None)
+
+    # Recovery runs before the delete-reconciling scan, per project.
+    assert call_order == ["recover:foo", "index:foo", "recover:bar", "index:bar"]
+
+
+@pytest.mark.asyncio
+async def test_reindex_search_converges_seeded_db_fts_divergence(
+    monkeypatch,
+    session_maker,
+    app_config,
+    test_project,
+    test_graph,
+):
+    """An unchanged file's orphaned FTS row converges through reindex --search alone."""
+    printed_lines: list[str] = []
+
+    async with db.scoped_session(session_maker) as session:
+        orphaned_observation_id = await session.scalar(
+            text(
+                "SELECT id FROM search_index "
+                "WHERE project_id = :project_id AND type = 'observation' "
+                "ORDER BY id LIMIT 1"
+            ),
+            {"project_id": test_project.id},
+        )
+        assert orphaned_observation_id is not None
+        await session.execute(
+            text("DELETE FROM observation WHERE project_id = :project_id AND id = :row_id"),
+            {"project_id": test_project.id, "row_id": orphaned_observation_id},
+        )
+
+    class StubProjectRepository:
+        async def get_active_projects(self, session):
+            return [test_project]
+
+    project_index = AsyncMock(
+        return_value=SimpleNamespace(
+            total_files=0,
+            enqueued_files=0,
+            enqueued_batches=0,
+            deleted_files=0,
+        )
+    )
+    monkeypatch.setattr(
+        "basic_memory.services.initialization.reconcile_projects_with_config", AsyncMock()
+    )
+    monkeypatch.setattr(
+        "basic_memory.services.initialization.recover_project_materializations", AsyncMock()
+    )
+    monkeypatch.setattr(
+        "basic_memory.db.get_or_create_db",
+        AsyncMock(return_value=(None, session_maker)),
+    )
+    monkeypatch.setattr("basic_memory.db.shutdown_db", AsyncMock())
+    monkeypatch.setattr("basic_memory.repository.ProjectRepository", StubProjectRepository)
+    monkeypatch.setattr(
+        "basic_memory.index.local_project.run_local_project_index_for_project",
+        project_index,
+    )
+    monkeypatch.setattr(
+        db_cmd.console,
+        "print",
+        lambda message="", *args, **kwargs: printed_lines.append(str(message)),
+    )
+
+    await db_cmd._reindex(
+        app_config,
+        search=True,
+        embeddings=False,
+        full=False,
+        project=test_project.name,
+    )
+
+    project_index.assert_awaited_once()
+    async with db.scoped_session(session_maker) as session:
+        orphaned_search_row_count = await session.scalar(
+            text(
+                "SELECT COUNT(*) FROM search_index "
+                "WHERE project_id = :project_id AND type = 'observation' AND id = :row_id"
+            ),
+            {"project_id": test_project.id, "row_id": orphaned_observation_id},
+        )
+    assert orphaned_search_row_count == 0
+    assert any("1 stale search rows purged" in line for line in printed_lines)
+
+
+@pytest.mark.asyncio
+async def test_reindex_search_wires_stale_row_purge(
+    monkeypatch,
+    session_maker,
+    app_config,
+    test_project,
+):
+    """The search-only CLI path calls the lightweight repository reconciliation seam."""
+    printed_lines: list[str] = []
+
+    class StubProjectRepository:
+        async def get_active_projects(self, session):
+            return [test_project]
+
+    project_index = AsyncMock(
+        return_value=SimpleNamespace(
+            total_files=0,
+            enqueued_files=0,
+            enqueued_batches=0,
+            deleted_files=0,
+        )
+    )
+    purge_stale_rows = AsyncMock(return_value=3)
+    monkeypatch.setattr(
+        "basic_memory.services.initialization.reconcile_projects_with_config", AsyncMock()
+    )
+    monkeypatch.setattr(
+        "basic_memory.services.initialization.recover_project_materializations", AsyncMock()
+    )
+    monkeypatch.setattr(
+        "basic_memory.db.get_or_create_db",
+        AsyncMock(return_value=(None, session_maker)),
+    )
+    monkeypatch.setattr("basic_memory.db.shutdown_db", AsyncMock())
+    monkeypatch.setattr("basic_memory.repository.ProjectRepository", StubProjectRepository)
+    monkeypatch.setattr(
+        "basic_memory.index.local_project.run_local_project_index_for_project",
+        project_index,
+    )
+    monkeypatch.setattr(
+        "basic_memory.repository.search_repository_base.purge_stale_search_index_rows",
+        purge_stale_rows,
+    )
+    monkeypatch.setattr(
+        db_cmd.console,
+        "print",
+        lambda message="", *args, **kwargs: printed_lines.append(str(message)),
+    )
+
+    await db_cmd._reindex(
+        app_config,
+        search=True,
+        embeddings=False,
+        full=False,
+        project=test_project.name,
+    )
+
+    purge_stale_rows.assert_awaited_once_with(session_maker, test_project.id)
+    assert any("3 stale search rows purged" in line for line in printed_lines)
+
+
+@pytest.mark.asyncio
+async def test_reindex_full_does_not_double_embed(monkeypatch, session_maker):
+    """A full reindex (search + embeddings) must embed once: the FTS rebuild runs
+    with embeddings=False so only the explicit vector phase calls the provider."""
+    app_config = _stub_app_config()
+    project = SimpleNamespace(id=1, name="foo", path="/tmp/foo")
+    vector_reindex_calls: list[dict[str, object]] = []
+    project_index = AsyncMock(
+        return_value=SimpleNamespace(
+            total_files=1, enqueued_files=1, enqueued_batches=1, deleted_files=0
+        )
+    )
+
+    class StubProjectRepository:
+        async def get_active_projects(self, session):
+            return [project]
+
+    class StubSearchService:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def reindex_vectors(self, *, progress_callback=None, force_full: bool = False):
+            vector_reindex_calls.append({"force_full": force_full})
+            return _vector_stats(total_entities=1, embedded=1, skipped=0, errors=0)
+
+    class SilentProgress:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args) -> bool:
+            return False
+
+        def add_task(self, *args, **kwargs) -> int:
+            return 1
+
+        def update(self, *args, **kwargs) -> None:
+            pass
+
+    monkeypatch.setattr(
+        "basic_memory.services.initialization.reconcile_projects_with_config", AsyncMock()
+    )
+    monkeypatch.setattr(
+        "basic_memory.db.get_or_create_db", AsyncMock(return_value=(None, session_maker))
+    )
+    monkeypatch.setattr("basic_memory.db.shutdown_db", AsyncMock())
+    monkeypatch.setattr("basic_memory.repository.ProjectRepository", StubProjectRepository)
+    monkeypatch.setattr(
+        "basic_memory.index.local_project.run_local_project_index_for_project", project_index
+    )
+    monkeypatch.setattr(
+        "basic_memory.repository.search_repository.create_search_repository",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr("basic_memory.repository.EntityRepository", lambda *a, **k: object())
+    monkeypatch.setattr(
+        "basic_memory.markdown.entity_parser.EntityParser", lambda *a, **k: object()
+    )
+    monkeypatch.setattr(
+        "basic_memory.markdown.markdown_processor.MarkdownProcessor", lambda *a, **k: object()
+    )
+    monkeypatch.setattr("basic_memory.services.file_service.FileService", lambda *a, **k: object())
+    monkeypatch.setattr("basic_memory.services.search_service.SearchService", StubSearchService)
+    monkeypatch.setattr(db_cmd, "Progress", SilentProgress)
+    monkeypatch.setattr(db_cmd.console, "print", lambda message="", *a, **k: None)
+
+    await db_cmd._reindex(app_config, search=True, embeddings=True, full=True, project="foo")
+
+    # FTS rebuild ran without embeddings; only the explicit phase embedded (once).
+    project_index.assert_awaited_once()
+    index_call = project_index.await_args
+    assert index_call is not None
+    assert index_call.kwargs["embeddings"] is False
+    assert len(vector_reindex_calls) == 1
+    assert vector_reindex_calls[0]["force_full"] is True
+
+
+def test_reindex_total_embedding_failure_surfaces_error_and_exits_one(
+    monkeypatch,
+    session_maker,
+):
+    representative_error = "first line\nsecond line " + ("x" * 300)
+    stats = _vector_stats(
+        total_entities=3,
+        embedded=0,
+        skipped=0,
+        errors=3,
+        sample_errors=(representative_error,),
+    )
+    _app_config, project_index, printed_lines = _configure_embedding_runtime(
+        monkeypatch,
+        session_maker,
+        stats,
+    )
+
+    result = runner.invoke(app, ["reindex"])
+
+    assert result.exit_code == 1
+    project_index.assert_awaited_once()
+    output = "\n".join(printed_lines)
+    assert (
+        "Embeddings complete ([cyan]index=milvus[/cyan], "
+        "[cyan]model=FastEmbedEmbeddingProvider:BAAI/bge-small-en-v1.5[/cyan]): "
+        "0 entities embedded, 0 skipped, 3 errors"
+    ) in output
+    representative_line = next(
+        line for line in printed_lines if "Representative error:" in line
+    )
+    assert "first line second line" in representative_line
+    assert representative_line.endswith("...")
+    assert "Reindex failed: all vector embedding attempts failed." in output
+    assert "Reindex complete!" not in output
+
+
+def test_reindex_partial_embedding_failure_surfaces_error_and_exits_zero(
+    monkeypatch,
+    session_maker,
+):
+    stats = _vector_stats(
+        total_entities=3,
+        embedded=2,
+        skipped=0,
+        errors=1,
+        sample_errors=("Milvus is unavailable",),
+    )
+    _app_config, _project_index, printed_lines = _configure_embedding_runtime(
+        monkeypatch,
+        session_maker,
+        stats,
+    )
+
+    result = runner.invoke(app, ["reindex", "--embeddings"])
+
+    assert result.exit_code == 0
+    output = "\n".join(printed_lines)
+    assert "2 entities embedded, 0 skipped, 1 errors" in output
+    assert "Representative error:[/yellow] Milvus is unavailable" in output
+    assert "Reindex complete!" in output
+
+
+def test_reindex_embedding_success_reports_index_and_model_and_exits_zero(
+    monkeypatch,
+    session_maker,
+):
+    stats = _vector_stats(total_entities=2, embedded=2, skipped=0, errors=0)
+    _app_config, _project_index, printed_lines = _configure_embedding_runtime(
+        monkeypatch,
+        session_maker,
+        stats,
+    )
+
+    result = runner.invoke(app, ["reindex", "--embeddings"])
+
+    assert result.exit_code == 0
+    output = "\n".join(printed_lines)
+    assert (
+        "Embeddings complete ([cyan]index=milvus[/cyan], "
+        "[cyan]model=FastEmbedEmbeddingProvider:BAAI/bge-small-en-v1.5[/cyan]): "
+        "2 entities embedded, 0 skipped, 0 errors"
+    ) in output
+    assert "Representative error:" not in output
+    assert "Reindex complete!" in output

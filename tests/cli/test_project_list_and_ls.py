@@ -15,6 +15,7 @@ from basic_memory.schemas.project_info import ProjectList
 
 # Importing registers project subcommands on the shared app instance.
 import basic_memory.cli.commands.project as project_cmd  # noqa: F401
+from typing import Any
 
 
 @pytest.fixture
@@ -26,7 +27,7 @@ def runner():
 def write_config(tmp_path, monkeypatch):
     """Write config.json under a temporary HOME and return the file path."""
 
-    def _write(config_data: dict) -> Path:
+    def _write(config_data: dict[str, Any]) -> Path:
         from basic_memory import config as config_module
 
         config_module._CONFIG_CACHE = None
@@ -1066,3 +1067,75 @@ def test_project_ls_cloud_route_uses_cloud_listing(
     assert result.exit_code == 0, f"Exit code: {result.exit_code}, output: {result.stdout}"
     assert "Files in alpha (CLOUD)" in result.stdout
     assert "cloud.md" in result.stdout
+
+
+def test_project_list_shows_configured_project_without_cloud_credentials(
+    runner: CliRunner, write_config, mock_client, tmp_path, monkeypatch
+):
+    """A cloud-mode project in config must render even with no cloud credentials (#1003).
+
+    Regression: ``bm project list`` seeded rows only from live query results, so a
+    cloud-mode project was skipped by both the credential-gated cloud branch and the
+    local query — the table came up empty while ``bm project add`` reported the same
+    project already existed. The two commands must agree that the project exists.
+    """
+    write_config(
+        {
+            "env": "dev",
+            "projects": {
+                "main": {
+                    "path": "",
+                    "mode": "cloud",
+                    "workspace_id": None,
+                    "local_sync_path": None,
+                }
+            },
+            "default_project": "main",
+        }
+    )
+
+    # No credentials on this machine: the cloud branch is skipped entirely.
+    monkeypatch.setattr(project_cmd, "_has_cloud_credentials", lambda config: False)
+
+    # The local query does not surface a cloud-mode project, so it returns empty.
+    async def fake_list_projects(self):
+        return ProjectList.model_validate({"projects": [], "default_project": "main"})
+
+    monkeypatch.setattr(ProjectClient, "list_projects", fake_list_projects)
+
+    result = runner.invoke(app, ["project", "list"], env={"COLUMNS": "240"})
+
+    assert result.exit_code == 0, f"Exit code: {result.exit_code}, output: {result.stdout}"
+    # The configured project is now visible instead of an empty table.
+    main_line = next(line for line in result.stdout.splitlines() if "│ main" in line)
+    assert "cloud" in main_line  # cloud-mode projects route to the cloud CLI
+
+
+def test_project_list_local_excludes_cloud_mode_config_fallback(
+    runner: CliRunner, write_config, mock_client, tmp_path, monkeypatch
+):
+    """An explicit local listing must only contain projects returned by the local API."""
+    write_config(
+        {
+            "env": "dev",
+            "projects": {
+                "main": {
+                    "path": "",
+                    "mode": "cloud",
+                    "workspace_id": None,
+                    "local_sync_path": None,
+                }
+            },
+            "default_project": "main",
+        }
+    )
+
+    async def fake_list_projects(self):
+        return ProjectList.model_validate({"projects": [], "default_project": "main"})
+
+    monkeypatch.setattr(ProjectClient, "list_projects", fake_list_projects)
+
+    result = runner.invoke(app, ["project", "list", "--local", "--json"])
+
+    assert result.exit_code == 0, f"Exit code: {result.exit_code}, output: {result.stdout}"
+    assert json.loads(result.stdout) == {"projects": []}

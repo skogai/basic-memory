@@ -15,6 +15,7 @@ from basic_memory.repository.embedding_provider_factory import (
 )
 from basic_memory.repository.fastembed_provider import FastEmbedEmbeddingProvider
 from basic_memory.repository.openai_provider import OpenAIEmbeddingProvider
+from basic_memory.repository.prefixing_provider import PrefixingEmbeddingProvider
 from basic_memory.repository.semantic_errors import SemanticDependenciesMissingError
 
 
@@ -523,7 +524,100 @@ async def test_openai_provider_fails_fast_on_malformed_concurrent_batch(monkeypa
 
 
 def test_embedding_provider_factory_creates_new_provider_for_different_cache_key():
-    """Factory should create distinct providers when cache key fields differ."""
+    """Factory should create distinct providers when model-identity fields differ."""
+    config_a = BasicMemoryConfig(
+        env="test",
+        projects={"test-project": "/tmp/basic-memory-test"},
+        default_project="test-project",
+        semantic_search_enabled=True,
+        semantic_embedding_provider="fastembed",
+        semantic_embedding_model="bge-small-en-v1.5",
+    )
+    config_b = BasicMemoryConfig(
+        env="test",
+        projects={"test-project": "/tmp/basic-memory-test"},
+        default_project="test-project",
+        semantic_search_enabled=True,
+        semantic_embedding_provider="fastembed",
+        semantic_embedding_model="some-other-model",
+    )
+
+    provider_a = create_embedding_provider(config_a)
+    provider_b = create_embedding_provider(config_b)
+
+    assert provider_a is not provider_b
+
+
+def test_embedding_provider_factory_wraps_provider_when_prefixes_are_configured():
+    """Factory should apply literal prefixes independently of provider backend."""
+    config = BasicMemoryConfig(
+        env="test",
+        projects={"test-project": "/tmp/basic-memory-test"},
+        default_project="test-project",
+        semantic_search_enabled=True,
+        semantic_embedding_provider="fastembed",
+        semantic_embedding_document_prefix="title: none | text: ",
+        semantic_embedding_query_prefix="task: search result | query: ",
+    )
+
+    provider = create_embedding_provider(config)
+
+    assert isinstance(provider, PrefixingEmbeddingProvider)
+    assert isinstance(provider.provider, FastEmbedEmbeddingProvider)
+    assert provider.document_prefix == "title: none | text: "
+    assert provider.query_prefix == "task: search result | query: "
+
+
+def test_embedding_provider_factory_reuses_provider_for_same_prefixes():
+    """Prefix fields participate in the process-local provider cache key."""
+    config = BasicMemoryConfig(
+        env="test",
+        projects={"test-project": "/tmp/basic-memory-test"},
+        default_project="test-project",
+        semantic_search_enabled=True,
+        semantic_embedding_provider="fastembed",
+        semantic_embedding_document_prefix="doc: ",
+        semantic_embedding_query_prefix="query: ",
+    )
+
+    provider_a = create_embedding_provider(config)
+    provider_b = create_embedding_provider(config)
+
+    assert provider_a is provider_b
+
+
+def test_embedding_provider_factory_separates_cache_for_different_prefixes():
+    """Changing literal prefixes should not reuse a stale cached provider."""
+    shared_config = {
+        "env": "test",
+        "projects": {"test-project": "/tmp/basic-memory-test"},
+        "default_project": "test-project",
+        "semantic_search_enabled": True,
+        "semantic_embedding_provider": "fastembed",
+        "semantic_embedding_query_prefix": "query: ",
+    }
+    first_config = BasicMemoryConfig(
+        **shared_config,
+        semantic_embedding_document_prefix="doc: ",
+    )
+    second_config = BasicMemoryConfig(
+        **shared_config,
+        semantic_embedding_document_prefix="document: ",
+    )
+
+    first_provider = create_embedding_provider(first_config)
+    second_provider = create_embedding_provider(second_config)
+
+    assert first_provider is not second_provider
+
+
+def test_embedding_provider_factory_reuses_provider_when_only_thread_knobs_differ():
+    """Thread/parallel knobs tune ONNX execution, not model identity (#872).
+
+    A different CPU-derived thread count must not invalidate the process-wide
+    provider cache and reload the model. Two configs that differ only in the
+    FastEmbed thread/parallel knobs must return the exact same provider instance.
+    """
     config_a = BasicMemoryConfig(
         env="test",
         projects={"test-project": "/tmp/basic-memory-test"},
@@ -531,6 +625,7 @@ def test_embedding_provider_factory_creates_new_provider_for_different_cache_key
         semantic_search_enabled=True,
         semantic_embedding_provider="fastembed",
         semantic_embedding_threads=2,
+        semantic_embedding_parallel=1,
     )
     config_b = BasicMemoryConfig(
         env="test",
@@ -539,12 +634,42 @@ def test_embedding_provider_factory_creates_new_provider_for_different_cache_key
         semantic_search_enabled=True,
         semantic_embedding_provider="fastembed",
         semantic_embedding_threads=4,
+        semantic_embedding_parallel=2,
     )
 
     provider_a = create_embedding_provider(config_a)
     provider_b = create_embedding_provider(config_b)
 
-    assert provider_a is not provider_b
+    assert provider_a is provider_b
+
+
+def test_embedding_provider_factory_reuses_provider_when_cpu_budget_drifts(monkeypatch):
+    """A drifting CPU budget between calls must not reload the model (#872).
+
+    Simulates a container/cgroup where the auto-tuned thread count changes between
+    two calls. Before the fix, this produced a fresh cache key and reloaded the
+    ~2.3GB ONNX model; now the cached singleton is reused.
+    """
+    config = BasicMemoryConfig(
+        env="test",
+        projects={"test-project": "/tmp/basic-memory-test"},
+        default_project="test-project",
+        semantic_search_enabled=True,
+        semantic_embedding_provider="fastembed",
+        semantic_embedding_threads=None,
+        semantic_embedding_parallel=None,
+    )
+
+    monkeypatch.setattr(embedding_provider_factory_module.os, "process_cpu_count", lambda: 8)
+    monkeypatch.setattr(embedding_provider_factory_module.os, "cpu_count", lambda: 8)
+    provider_first = create_embedding_provider(config)
+
+    # CPU budget shrinks (e.g. cgroup throttling) → auto-tuned thread count changes.
+    monkeypatch.setattr(embedding_provider_factory_module.os, "process_cpu_count", lambda: 4)
+    monkeypatch.setattr(embedding_provider_factory_module.os, "cpu_count", lambda: 4)
+    provider_second = create_embedding_provider(config)
+
+    assert provider_first is provider_second
 
 
 def test_embedding_provider_factory_forwards_openai_request_concurrency():

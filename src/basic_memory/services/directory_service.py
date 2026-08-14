@@ -3,44 +3,46 @@
 import fnmatch
 import logging
 import os
-from datetime import datetime
 from typing import Dict, List, Optional, Sequence
 
 
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from basic_memory import db
 from basic_memory.models import Entity
 from basic_memory.repository import EntityRepository
-from basic_memory.schemas.directory import DirectoryNode
+from basic_memory.schemas.directory import (
+    DEFAULT_DIRECTORY_PAGE_SIZE,
+    MAX_DIRECTORY_PAGE_SIZE,
+    DirectoryListResponse,
+    DirectoryNode,
+)
 
 logger = logging.getLogger(__name__)
-
-
-def _mtime_to_datetime(entity: Entity) -> datetime:
-    """Convert entity mtime (file modification time) to datetime.
-
-    Returns the file's actual modification time, falling back to updated_at
-    if mtime is not available.
-    """
-    if entity.mtime:  # pragma: no cover
-        return datetime.fromtimestamp(entity.mtime).astimezone()  # pragma: no cover
-    return entity.updated_at
 
 
 class DirectoryService:
     """Service for working with directory trees."""
 
-    def __init__(self, entity_repository: EntityRepository):
+    def __init__(
+        self,
+        entity_repository: EntityRepository,
+        session_maker: async_sessionmaker[AsyncSession],
+    ):
         """Initialize the directory service.
 
         Args:
             entity_repository: Directory repository for data access.
         """
         self.entity_repository = entity_repository
+        self.session_maker = session_maker
 
     async def get_directory_tree(self) -> DirectoryNode:
         """Build a hierarchical directory tree from indexed files."""
 
         # Get all files from DB (flat list)
-        entity_rows = await self.entity_repository.find_all()
+        async with db.scoped_session(self.session_maker) as session:
+            entity_rows = await self.entity_repository.find_all(session)
 
         # Create a root directory node
         root_node = DirectoryNode(name="Root", directory_path="/", type="directory")
@@ -91,7 +93,7 @@ class DirectoryService:
                 entity_id=file.id,
                 note_type=file.note_type,
                 content_type=file.content_type,
-                updated_at=_mtime_to_datetime(file),
+                updated_at=file.updated_at,
             )
 
             # Add to parent directory's children
@@ -114,7 +116,8 @@ class DirectoryService:
             DirectoryNode tree containing only folders (type="directory")
         """
         # Get unique directories without loading entities
-        directories = await self.entity_repository.get_distinct_directories()
+        async with db.scoped_session(self.session_maker) as session:
+            directories = await self.entity_repository.get_distinct_directories(session)
 
         # Create a root directory node
         root_node = DirectoryNode(name="Root", directory_path="/", type="directory")
@@ -152,17 +155,28 @@ class DirectoryService:
         dir_name: str = "/",
         depth: int = 1,
         file_name_glob: Optional[str] = None,
-    ) -> List[DirectoryNode]:
+        page: int = 1,
+        page_size: int = DEFAULT_DIRECTORY_PAGE_SIZE,
+    ) -> DirectoryListResponse:
         """List directory contents with filtering and depth control.
 
         Args:
             dir_name: Directory path to list (default: root "/")
             depth: Recursion depth (1 = immediate children only)
             file_name_glob: Glob pattern for filtering file names
+            page: One-indexed result page
+            page_size: Number of nodes per page
 
         Returns:
-            List of DirectoryNode objects matching the criteria
+            Bounded page of DirectoryNode objects matching the criteria
         """
+        if page < 1:
+            raise ValueError(f"page must be >= 1, got {page}")
+        if page_size < 1:
+            raise ValueError(f"page_size must be >= 1, got {page_size}")
+        if page_size > MAX_DIRECTORY_PAGE_SIZE:
+            raise ValueError(f"page_size must be <= {MAX_DIRECTORY_PAGE_SIZE}, got {page_size}")
+
         # Normalize directory path
         # Strip ./ prefix if present (handles relative path notation)
         if dir_name.startswith("./"):
@@ -179,7 +193,8 @@ class DirectoryService:
         # Optimize: Query only entities in the target directory
         # instead of loading the entire tree
         dir_prefix = dir_name.lstrip("/")
-        entity_rows = await self.entity_repository.find_by_directory_prefix(dir_prefix)
+        async with db.scoped_session(self.session_maker) as session:
+            entity_rows = await self.entity_repository.find_by_directory_prefix(session, dir_prefix)
 
         # Build a partial tree from only the relevant entities
         root_tree = self._build_directory_tree_from_entities(entity_rows, dir_name)
@@ -187,13 +202,42 @@ class DirectoryService:
         # Find the target directory node
         target_node = self._find_directory_node(root_tree, dir_name)
         if not target_node:
-            return []  # pragma: no cover
+            return DirectoryListResponse(  # pragma: no cover
+                nodes=[],
+                page=page,
+                page_size=page_size,
+                total=0,
+                has_more=False,
+            )
 
         # Collect nodes with depth and glob filtering
         result = []
         self._collect_nodes_recursive(target_node, result, depth, file_name_glob, 0)
 
-        return result
+        # Stable ordering is required before slicing so repeated page requests
+        # neither skip nor duplicate nodes when repository row order changes.
+        result.sort(
+            key=lambda node: (
+                0 if node.type == "directory" else 1,
+                node.name.casefold(),
+                node.directory_path.casefold(),
+                node.directory_path,
+            )
+        )
+
+        total = len(result)
+        start = (page - 1) * page_size
+        end = start + page_size
+        # Directory nodes in the collection still reference their complete child trees.
+        # Returning those trees would bypass the page bound when the response is serialized.
+        nodes = [node.model_copy(update={"children": []}) for node in result[start:end]]
+        return DirectoryListResponse(
+            nodes=nodes,
+            page=page,
+            page_size=page_size,
+            total=total,
+            has_more=end < total,
+        )
 
     def _build_directory_tree_from_entities(
         self, entity_rows: Sequence[Entity], root_path: str
@@ -256,7 +300,7 @@ class DirectoryService:
                 entity_id=file.id,
                 note_type=file.note_type,
                 content_type=file.content_type,
-                updated_at=_mtime_to_datetime(file),
+                updated_at=file.updated_at,
             )
 
             # Add to parent directory's children

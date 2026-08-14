@@ -6,8 +6,9 @@ Import endpoints use project_id in the path for consistency with other v2 endpoi
 
 import json
 import logging
+from contextlib import nullcontext
 
-from fastapi import APIRouter, Form, HTTPException, UploadFile, status, Path
+from fastapi import APIRouter, Form, HTTPException, Path, UploadFile, status
 
 from basic_memory.deps import (
     AppConfigDep,
@@ -15,11 +16,14 @@ from basic_memory.deps import (
     ClaudeConversationsImporterV2ExternalDep,
     ClaudeProjectsImporterV2ExternalDep,
     MemoryJsonImporterV2ExternalDep,
+    ReadCacheDep,
 )
 from basic_memory.importers import Importer
+from basic_memory.read_cache import ReadCache, invalidate_cache
 from basic_memory.schemas.importer import (
     ChatImportResult,
     EntityImportResult,
+    ImportResult,
     ProjectImportResult,
 )
 
@@ -44,6 +48,7 @@ async def import_chatgpt(
     importer: ChatGPTImporterV2ExternalDep,
     config: AppConfigDep,
     file: UploadFile,
+    read_cache: ReadCacheDep,
     project_id: str = Path(..., description="Project external UUID"),
     directory: str = Form("conversations"),
 ) -> ChatImportResult:
@@ -62,7 +67,14 @@ async def import_chatgpt(
         HTTPException: If import fails.
     """
     logger.info(f"V2 Importing ChatGPT conversations for project {project_id}")
-    return await import_file(importer, file, directory, config.import_upload_max_bytes)
+    return await import_file(
+        importer,
+        file,
+        directory,
+        config.import_upload_max_bytes,
+        read_cache=read_cache,
+        project_external_id=project_id,
+    )
 
 
 @router.post("/claude/conversations", response_model=ChatImportResult)
@@ -70,6 +82,7 @@ async def import_claude_conversations(
     importer: ClaudeConversationsImporterV2ExternalDep,
     config: AppConfigDep,
     file: UploadFile,
+    read_cache: ReadCacheDep,
     project_id: str = Path(..., description="Project external UUID"),
     directory: str = Form("conversations"),
 ) -> ChatImportResult:
@@ -88,7 +101,14 @@ async def import_claude_conversations(
         HTTPException: If import fails.
     """
     logger.info(f"V2 Importing Claude conversations for project {project_id}")
-    return await import_file(importer, file, directory, config.import_upload_max_bytes)
+    return await import_file(
+        importer,
+        file,
+        directory,
+        config.import_upload_max_bytes,
+        read_cache=read_cache,
+        project_external_id=project_id,
+    )
 
 
 @router.post("/claude/projects", response_model=ProjectImportResult)
@@ -96,6 +116,7 @@ async def import_claude_projects(
     importer: ClaudeProjectsImporterV2ExternalDep,
     config: AppConfigDep,
     file: UploadFile,
+    read_cache: ReadCacheDep,
     project_id: str = Path(..., description="Project external UUID"),
     directory: str = Form("projects"),
 ) -> ProjectImportResult:
@@ -114,7 +135,14 @@ async def import_claude_projects(
         HTTPException: If import fails.
     """
     logger.info(f"V2 Importing Claude projects for project {project_id}")
-    return await import_file(importer, file, directory, config.import_upload_max_bytes)
+    return await import_file(
+        importer,
+        file,
+        directory,
+        config.import_upload_max_bytes,
+        read_cache=read_cache,
+        project_external_id=project_id,
+    )
 
 
 @router.post("/memory-json", response_model=EntityImportResult)
@@ -122,6 +150,7 @@ async def import_memory_json(
     importer: MemoryJsonImporterV2ExternalDep,
     config: AppConfigDep,
     file: UploadFile,
+    read_cache: ReadCacheDep,
     project_id: str = Path(..., description="Project external UUID"),
     directory: str = Form("conversations"),
 ) -> EntityImportResult:
@@ -148,7 +177,13 @@ async def import_memory_json(
             json_data = json.loads(line)
             file_data.append(json_data)
 
-        result = await importer.import_data(file_data, directory)
+        result = await run_import_with_invalidation(
+            importer,
+            file_data,
+            directory,
+            read_cache=read_cache,
+            project_external_id=project_id,
+        )
         if not result.success:  # pragma: no cover
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -165,9 +200,15 @@ async def import_memory_json(
     return result
 
 
-async def import_file(
-    importer: Importer, file: UploadFile, destination_directory: str, max_bytes: int
-):
+async def import_file[ImportResultT: ImportResult](
+    importer: Importer[ImportResultT],
+    file: UploadFile,
+    destination_directory: str,
+    max_bytes: int,
+    *,
+    read_cache: ReadCache | None,
+    project_external_id: str,
+) -> ImportResultT:
     """Helper function to import a file using an importer instance.
 
     Args:
@@ -186,7 +227,13 @@ async def import_file(
         # Process file
         upload_bytes = await read_import_upload(file, max_bytes)
         json_data = json.loads(upload_bytes)
-        result = await importer.import_data(json_data, destination_directory)
+        result = await run_import_with_invalidation(
+            importer,
+            json_data,
+            destination_directory,
+            read_cache=read_cache,
+            project_external_id=project_external_id,
+        )
         if not result.success:  # pragma: no cover
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -203,3 +250,24 @@ async def import_file(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Import failed: {str(e)}",
         )
+
+
+async def run_import_with_invalidation[ImportResultT: ImportResult](
+    importer: Importer[ImportResultT],
+    source_data: object,
+    destination_directory: str,
+    *,
+    read_cache: ReadCache | None,
+    project_external_id: str,
+) -> ImportResultT:
+    """Run one import attempt and invalidate files it may have written."""
+    # Importers write files one at a time and may return a failed result after
+    # earlier writes. Invalidate every attempted import so cached file-first
+    # resources cannot survive either success or partial failure.
+    invalidation_scope = (
+        invalidate_cache(read_cache, project_external_id)
+        if read_cache is not None
+        else nullcontext()
+    )
+    async with invalidation_scope:
+        return await importer.import_data(source_data, destination_directory)

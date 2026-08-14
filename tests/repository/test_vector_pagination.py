@@ -7,7 +7,7 @@ which requires a sufficiently large candidate_limit multiplier.
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import override, Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -41,12 +41,15 @@ class ConcreteSearchRepo(SearchRepositoryBase):
         self.session_maker = None
         self.project_id = 1
 
+    @override
     async def init_search_index(self):
         pass  # pragma: no cover
 
+    @override
     def _prepare_search_term(self, term, is_prefix=True):
         return term  # pragma: no cover
 
+    @override
     async def search(
         self,
         search_text: str | None = None,
@@ -56,32 +59,47 @@ class ConcreteSearchRepo(SearchRepositoryBase):
         note_types: list[str] | None = None,
         after_date: datetime | None = None,
         search_item_types: list[SearchItemType] | None = None,
+        categories: list[str] | None = None,
         metadata_filters: dict[str, Any] | None = None,
         retrieval_mode: SearchRetrievalMode = SearchRetrievalMode.FTS,
         min_similarity: float | None = None,
         limit: int = 10,
         offset: int = 0,
+        allow_relaxed: bool = False,
     ) -> list[SearchIndexRow]:
         return []  # pragma: no cover
 
+    @override
     async def _ensure_vector_tables(self):
         pass  # pragma: no cover
 
+    @override
     async def _run_vector_query(self, session, query_embedding, candidate_limit):
         return []  # pragma: no cover
 
+    @override
     async def _write_embeddings(self, session, jobs, embeddings):
         pass  # pragma: no cover
 
-    async def _delete_entity_chunks(self, session, entity_id):
-        pass  # pragma: no cover
+    @override
+    async def _delete_entity_chunks(self, session, entity_id, *, expected_deletions=None):
+        return []  # pragma: no cover
 
-    async def _delete_stale_chunks(self, session, stale_ids, entity_id):
-        pass  # pragma: no cover
+    @override
+    async def _delete_stale_chunks(
+        self,
+        session,
+        stale_ids,
+        entity_id,
+        *,
+        expected_deletions=None,
+    ):
+        return []  # pragma: no cover
 
     async def _update_timestamp_sql(self):
         return "CURRENT_TIMESTAMP"  # pragma: no cover
 
+    @override
     def _distance_to_similarity(self, distance: float) -> float:
         return 1.0 / (1.0 + max(distance, 0.0))
 
@@ -105,7 +123,7 @@ class _EmbeddingProvider:
         return {}
 
 
-def _make_descending_vector_rows(count: int) -> list[dict]:
+def _make_descending_vector_rows(count: int) -> list[dict[str, Any]]:
     """Build vector rows with scores descending from ~1.0 to ~0.5."""
     rows = []
     for i in range(count):
@@ -132,7 +150,7 @@ async def test_page1_scores_gte_page2_scores():
 
     repo._embedding_provider = _EmbeddingProvider()
 
-    fake_index_rows = {i: FakeRow(id=i) for i in range(20)}
+    fake_index_rows = {("entity", i): FakeRow(id=i) for i in range(20)}
 
     async def run_page(offset, limit):
         with (
@@ -158,6 +176,7 @@ async def test_page1_scores_gte_page2_scores():
                 note_types=None,
                 after_date=None,
                 search_item_types=None,
+                categories=None,
                 metadata_filters=None,
                 limit=limit,
                 offset=offset,

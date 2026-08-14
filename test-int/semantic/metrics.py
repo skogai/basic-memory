@@ -7,6 +7,7 @@ data for performance comparison across backends and providers.
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -14,6 +15,7 @@ from pathlib import Path
 from statistics import mean
 
 from basic_memory.repository.search_index_row import SearchIndexRow
+from typing import Any
 
 
 # --- Relevance helpers ---
@@ -24,6 +26,16 @@ def first_relevant_rank(results: list[SearchIndexRow], expected_topic: str, k: i
     expected_prefix = f"bench/{expected_topic}-"
     for rank, row in enumerate(results[:k], start=1):
         if (row.permalink or "").startswith(expected_prefix):
+            return rank
+    return None
+
+
+def first_permalink_rank(
+    results: list[SearchIndexRow], expected_permalink: str, k: int
+) -> int | None:
+    """Return the 1-based rank of one exact note, or ``None`` when it misses the window."""
+    for rank, row in enumerate(results[:k], start=1):
+        if row.permalink == expected_permalink:
             return rank
     return None
 
@@ -42,7 +54,7 @@ class QualityMetrics:
     hits_at_1: int = 0
     hits_at_5: int = 0
     reciprocal_rank_sum: float = 0.0
-    per_query: list[dict] = field(default_factory=list)
+    per_query: list[dict[str, Any]] = field(default_factory=list)
     # Timing data: per-query latencies in seconds
     latencies: list[float] = field(default_factory=list)
 
@@ -70,6 +82,11 @@ class QualityMetrics:
         return self.hits_at_5 / self.cases if self.cases else 0.0
 
     @property
+    def hit_at_5(self) -> float:
+        """Return hit@5; one gold note per query makes this equivalent to recall@5."""
+        return self.recall_at_5
+
+    @property
     def mrr_at_10(self) -> float:
         return self.reciprocal_rank_sum / self.cases if self.cases else 0.0
 
@@ -81,7 +98,7 @@ class QualityMetrics:
     def avg_latency_ms(self) -> float:
         return mean(self.latencies) * 1000 if self.latencies else 0.0
 
-    def as_dict(self) -> dict:
+    def as_dict(self) -> dict[str, Any]:
         return {
             "combo": self.combo,
             "suite": self.suite,
@@ -93,6 +110,38 @@ class QualityMetrics:
             "avg_latency_ms": round(self.avg_latency_ms, 2),
             "total_time_ms": round(self.total_time_ms, 2),
         }
+
+
+@dataclass
+class LatencyMetrics:
+    """Warm-search latency samples for one retrieval mode and reranker state."""
+
+    configuration: str
+    mode: str
+    latencies: list[float] = field(default_factory=list)
+
+    @property
+    def p50_ms(self) -> float:
+        return _percentile_ms(self.latencies, 0.50)
+
+    @property
+    def p95_ms(self) -> float:
+        return _percentile_ms(self.latencies, 0.95)
+
+
+def _percentile_ms(samples: list[float], quantile: float) -> float:
+    """Return a linearly interpolated percentile in milliseconds."""
+    if not samples:
+        return 0.0
+    ordered = sorted(samples)
+    position = (len(ordered) - 1) * quantile
+    lower_index = math.floor(position)
+    upper_index = math.ceil(position)
+    if lower_index == upper_index:
+        return ordered[lower_index] * 1000
+    fraction = position - lower_index
+    interpolated = ordered[lower_index] + (ordered[upper_index] - ordered[lower_index]) * fraction
+    return interpolated * 1000
 
 
 # --- Comparison table ---
@@ -114,6 +163,43 @@ def format_comparison_table(all_metrics: list[QualityMetrics]) -> str:
             f"{m.avg_latency_ms:>8.1f} {m.total_time_ms:>9.1f}"
         )
 
+    lines.append(separator)
+    return "\n".join(lines)
+
+
+def format_reranker_quality_table(all_metrics: list[QualityMetrics]) -> str:
+    """Format reranker-off/on quality and deltas using exact-note ranking metrics."""
+    header = f"{'Configuration':<16} {'hit@1':>7} {'hit@5':>7} {'MRR':>7}"
+    separator = "-" * len(header)
+    lines = [separator, header, separator]
+    for metrics in all_metrics:
+        lines.append(
+            f"{metrics.combo:<16} {metrics.hit_at_1:>7.3f} "
+            f"{metrics.hit_at_5:>7.3f} {metrics.mrr_at_10:>7.3f}"
+        )
+
+    if len(all_metrics) == 2:
+        baseline, reranked = all_metrics
+        lines.append(separator)
+        lines.append(
+            f"{'delta':<16} {reranked.hit_at_1 - baseline.hit_at_1:>+7.3f} "
+            f"{reranked.hit_at_5 - baseline.hit_at_5:>+7.3f} "
+            f"{reranked.mrr_at_10 - baseline.mrr_at_10:>+7.3f}"
+        )
+    lines.append(separator)
+    return "\n".join(lines)
+
+
+def format_latency_table(all_metrics: list[LatencyMetrics]) -> str:
+    """Format P50/P95 search latency for each mode and reranker state."""
+    header = f"{'Configuration':<16} {'Mode':<8} {'N':>4} {'P50 ms':>10} {'P95 ms':>10}"
+    separator = "-" * len(header)
+    lines = [separator, header, separator]
+    for metrics in all_metrics:
+        lines.append(
+            f"{metrics.configuration:<16} {metrics.mode:<8} {len(metrics.latencies):>4} "
+            f"{metrics.p50_ms:>10.2f} {metrics.p95_ms:>10.2f}"
+        )
     lines.append(separator)
     return "\n".join(lines)
 

@@ -39,7 +39,7 @@ async def search_entity(session_maker, test_project: Project):
 
 
 @pytest_asyncio.fixture
-async def second_project(project_repository):
+async def second_project(project_repository, session_maker):
     """Create a second project for testing project isolation."""
     project_data = {
         "name": "Second Test Project",
@@ -48,7 +48,8 @@ async def second_project(project_repository):
         "is_active": True,
         "is_default": None,
     }
-    return await project_repository.create(project_data)
+    async with db.scoped_session(session_maker) as session:
+        return await project_repository.create(session, project_data)
 
 
 @pytest_asyncio.fixture
@@ -250,6 +251,35 @@ async def test_index_item(search_repository, search_entity):
     assert len(results) == 1
     assert results[0].title == search_entity.title
     assert results[0].project_id == search_repository.project_id
+
+
+@pytest.mark.asyncio
+async def test_sqlite_text_search_matches_full_content_snippet(search_repository, search_entity):
+    """SQLite finds terms beyond the Postgres-sized content_stems prefix (#1065)."""
+    if is_postgres_backend(search_repository):
+        pytest.skip("The full content_snippet FTS column is SQLite-specific")
+
+    marker = "latecontentmarker"
+    search_row = SearchIndexRow(
+        id=search_entity.id,
+        type=SearchItemType.ENTITY.value,
+        title=search_entity.title,
+        content_stems="prefix content only",
+        content_snippet=f"{'x' * 7000} {marker}",
+        permalink=search_entity.permalink,
+        file_path=search_entity.file_path,
+        entity_id=search_entity.id,
+        metadata={"note_type": search_entity.note_type},
+        created_at=search_entity.created_at,
+        updated_at=search_entity.updated_at,
+        project_id=search_repository.project_id,
+    )
+    await search_repository.index_item(search_row)
+
+    results = await search_repository.search(search_text=marker)
+
+    assert [result.id for result in results] == [search_entity.id]
+    assert await search_repository.count(search_text=marker) == 1
 
 
 @pytest.mark.asyncio
@@ -1044,3 +1074,220 @@ async def test_search_item_types_parameterized(search_repository):
     results = await search_repository.search(search_item_types=[SearchItemType.ENTITY])
     # Should not raise — parameterized query handles enum values safely
     assert isinstance(results, list)
+
+
+async def _index_observation(
+    search_repository,
+    *,
+    row_id: int,
+    entity_id: int,
+    category: str,
+    content: str,
+) -> None:
+    """Index a single observation row with an explicit category for filter tests."""
+    now = datetime.now(timezone.utc)
+    search_row = SearchIndexRow(
+        id=row_id,
+        type=SearchItemType.OBSERVATION.value,
+        content_stems=content,
+        content_snippet=content,
+        permalink=f"test/obs/{category}/{row_id}",
+        file_path="test/obs.md",
+        entity_id=entity_id,
+        category=category,
+        metadata={"note_type": "note"},
+        created_at=now,
+        updated_at=now,
+        project_id=search_repository.project_id,
+    )
+    await search_repository.index_item(search_row)
+
+
+@pytest.mark.asyncio
+async def test_search_categories_exact_match(search_repository, search_entity):
+    """categories must match the observation category exactly, not by text.
+
+    Regression for #430: searching observations for "requirement" used to also
+    return a [decision] observation that merely mentions the word. The categories
+    filter scopes results to the exact indexed category.
+    """
+    await _index_observation(
+        search_repository,
+        row_id=70001,
+        entity_id=search_entity.id,
+        category="requirement",
+        content="The auth requirement must be enforced on every call",
+    )
+    # A decision observation whose text mentions "requirement" but whose category
+    # is NOT requirement — it must be excluded by an exact-category filter.
+    await _index_observation(
+        search_repository,
+        row_id=70002,
+        entity_id=search_entity.id,
+        category="decision",
+        content="We deferred the auth requirement to next sprint",
+    )
+
+    # Without the category filter, a text search for "requirement" matches both.
+    text_results = await search_repository.search(
+        search_text="requirement",
+        search_item_types=[SearchItemType.OBSERVATION],
+    )
+    assert {r.id for r in text_results} == {70001, 70002}
+
+    # With categories=["requirement"], only the requirement observation survives.
+    filtered = await search_repository.search(
+        search_text="requirement",
+        search_item_types=[SearchItemType.OBSERVATION],
+        categories=["requirement"],
+    )
+    assert {r.id for r in filtered} == {70001}
+    assert filtered[0].category == "requirement"
+
+    # categories also works as a standalone filter (no text query).
+    filtered_only = await search_repository.search(categories=["requirement"])
+    assert {r.id for r in filtered_only} == {70001}
+
+    # count mirrors the filtered search.
+    assert await search_repository.count(categories=["requirement"]) == 1
+
+    # Multiple categories union: both observations come back.
+    multi = await search_repository.search(categories=["requirement", "decision"])
+    assert {r.id for r in multi} == {70001, 70002}
+
+
+@pytest.mark.asyncio
+async def test_question_punctuation_does_not_phrase_quote(search_repository):
+    """Sentence punctuation must not force exact-phrase matching (#hybrid-fts).
+
+    'When did Melanie paint a sunrise?' previously became the FTS5 phrase
+    '"When did Melanie paint a sunrise?"*' — zero rows for any corpus — which
+    silently disabled the FTS half of hybrid search for question queries.
+    """
+    prepared = search_repository._prepare_single_term("When did Melanie paint a sunrise?")
+    assert '"' not in prepared
+    # Prefix syntax differs by backend: FTS5 uses '*', tsquery uses ':*'.
+    if is_postgres_backend(search_repository):
+        assert "sunrise:*" in prepared
+    else:
+        assert "sunrise*" in prepared
+
+
+@pytest.mark.asyncio
+async def test_relaxed_query_drops_stopwords(search_repository):
+    """Relaxation keys on content-bearing terms in each backend's syntax."""
+    if is_postgres_backend(search_repository):
+        relaxed = search_repository._relaxed_tsquery_text("When did Melanie paint a sunrise?")
+        assert relaxed == "melanie:* | paint:* | sunrise:*"
+    else:
+        relaxed = search_repository._relaxed_fts_text("When did Melanie paint a sunrise?")
+        assert relaxed == "melanie* OR paint* OR sunrise*"
+
+
+@pytest.mark.asyncio
+async def test_relaxed_query_preserves_punctuated_ascii_token_pieces(search_repository):
+    """Hyphenated and slashed ASCII terms should relax using their regex token pieces."""
+    if is_postgres_backend(search_repository):
+        relaxed = search_repository._relaxed_tsquery_text("client-side state management")
+        assert relaxed == "client:* | side:* | state:* | management:*"
+        slashed = search_repository._relaxed_tsquery_text("foo/bar baz qux")
+        assert slashed == "foo:* | bar:* | baz:* | qux:*"
+    else:
+        relaxed = search_repository._relaxed_fts_text("client-side state management")
+        assert relaxed == "client* OR side* OR state* OR management*"
+        slashed = search_repository._relaxed_fts_text("foo/bar baz qux")
+        assert slashed == "foo* OR bar* OR baz* OR qux*"
+
+
+@pytest.mark.asyncio
+async def test_relaxed_query_supports_whitespace_separated_cjk_terms(search_repository):
+    """CJK terms separated by spaces should relax even when ASCII tokenization finds none."""
+    if is_postgres_backend(search_repository):
+        relaxed = search_repository._relaxed_tsquery_text("季度 报告")
+        assert relaxed == "季度:* | 报告:*"
+    else:
+        relaxed = search_repository._relaxed_fts_text("季度 报告")
+        assert relaxed == "季度* OR 报告*"
+
+
+@pytest.mark.asyncio
+async def test_relaxed_query_respects_user_intent(search_repository):
+    # Eligibility matches the service-level relaxation (both backends): quoted,
+    # boolean, short (<3 tokens), and numeric-identifier queries are not relaxed.
+    relaxer = (
+        search_repository._relaxed_tsquery_text
+        if is_postgres_backend(search_repository)
+        else search_repository._relaxed_fts_text
+    )
+    assert relaxer("alpha AND beta") is None
+    assert relaxer('"exact phrase"') is None
+    assert relaxer("single") is None  # < 3 tokens
+    assert relaxer("New Feature") is None  # < 3 tokens (link title)
+    assert relaxer("root note 1") is None  # numeric identifier token
+    assert relaxer("SPEC 16 design") is None  # numeric token
+    assert relaxer(None) is None
+
+
+@pytest.mark.asyncio
+async def test_multiword_query_relaxes_to_or_when_strict_misses(search_repository, search_entity):
+    """A question sharing only SOME words with a doc still surfaces it."""
+    from basic_memory.repository.search_index_row import SearchIndexRow
+    from basic_memory.schemas.search import SearchItemType
+
+    row = SearchIndexRow(
+        project_id=search_repository.project_id,
+        id=search_entity.id,
+        type=SearchItemType.ENTITY.value,
+        title="Trip plans",
+        content_snippet="Melanie painted a sunrise over the lake last year.",
+        content_stems="melanie painted a sunrise over the lake last year",
+        permalink=search_entity.permalink,
+        file_path=search_entity.file_path,
+        entity_id=search_entity.id,
+        metadata={"note_type": search_entity.note_type},
+        created_at=search_entity.created_at,
+        updated_at=search_entity.updated_at,
+    )
+    await search_repository.index_item(row)
+
+    # "hiking" is absent from the doc, so strict all-terms-AND misses on both
+    # backends (Postgres's stopword stripping can't rescue it either).
+    strict = await search_repository.search(search_text="Did Melanie go hiking at sunrise?")
+    assert strict == []
+
+    # The hybrid FTS branch opts in; OR-relaxation surfaces the partial match.
+    results = await search_repository.search(
+        search_text="Did Melanie go hiking at sunrise?", allow_relaxed=True
+    )
+    assert any(r.entity_id == search_entity.id for r in results)
+
+
+@pytest.mark.asyncio
+async def test_cjk_compound_query_relaxes_with_backend_prefix_terms(
+    search_repository, search_entity
+):
+    """Whitespace-separated CJK terms should match indexed CJK compounds when relaxed."""
+    row = SearchIndexRow(
+        project_id=search_repository.project_id,
+        id=search_entity.id,
+        type=SearchItemType.ENTITY.value,
+        title="季度报告总结",
+        content_snippet="季度报告总结已经完成。",
+        content_stems="季度报告总结已经完成",
+        permalink=search_entity.permalink,
+        file_path=search_entity.file_path,
+        entity_id=search_entity.id,
+        metadata={"note_type": search_entity.note_type},
+        created_at=search_entity.created_at,
+        updated_at=search_entity.updated_at,
+    )
+    await search_repository.index_item(row)
+
+    strict = await search_repository.search(search_text="季度 报告")
+    assert strict == []
+
+    results = await search_repository.search(search_text="季度 报告", allow_relaxed=True)
+    assert any(r.entity_id == search_entity.id for r in results)
+
+    total = await search_repository.count(search_text="季度 报告", allow_relaxed=True)
+    assert total == 1

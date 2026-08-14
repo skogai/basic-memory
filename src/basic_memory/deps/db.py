@@ -5,6 +5,7 @@ This module provides database-related dependencies:
 - Session dependencies for request handling
 """
 
+from collections.abc import AsyncGenerator
 from typing import Annotated
 
 from fastapi import Depends, Request
@@ -16,7 +17,6 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from basic_memory import db
-from basic_memory.deps.config import get_app_config
 
 
 async def get_engine_factory(
@@ -35,9 +35,14 @@ async def get_engine_factory(
     ):
         return request.app.state.engine, request.app.state.session_maker
 
-    # Fallback for non-API contexts (CLI)
+    # Fallback for non-API contexts (CLI): config comes from the composition
+    # root rather than a ConfigManager read here.
     logger.debug("Using fallback database connection for non-API context")
-    app_config = get_app_config()
+    # Deferred import: importing basic_memory.api at module scope re-enters this
+    # package via api.app -> routers -> deps and fails as a circular import.
+    from basic_memory.api.container import resolve_container
+
+    app_config = resolve_container().config
     engine, session_maker = await db.get_or_create_db(app_config.database_path)
     return engine, session_maker
 
@@ -53,4 +58,16 @@ async def get_session_maker(engine_factory: EngineFactoryDep) -> async_sessionma
     return session_maker
 
 
-SessionMakerDep = Annotated[async_sessionmaker, Depends(get_session_maker)]
+SessionMakerDep = Annotated[
+    async_sessionmaker[AsyncSession],
+    Depends(get_session_maker),
+]
+
+
+async def get_session(session_maker: SessionMakerDep) -> AsyncGenerator[AsyncSession, None]:
+    """Yield a request-scoped SQLAlchemy session."""
+    async with db.scoped_session(session_maker) as session:
+        yield session
+
+
+SessionDep = Annotated[AsyncSession, Depends(get_session)]

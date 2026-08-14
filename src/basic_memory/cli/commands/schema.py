@@ -9,7 +9,7 @@ with human-friendly formatting.
 """
 
 import json
-from typing import Annotated, Optional
+from typing import Any, Annotated, Optional
 
 import typer
 from loguru import logger
@@ -20,9 +20,10 @@ from basic_memory.cli.app import app
 from basic_memory.cli.commands.command_utils import run_with_cleanup
 from basic_memory.cli.commands.routing import force_routing, validate_routing_flags
 from basic_memory.config import ConfigManager
-from basic_memory.mcp.tools import schema_diff as mcp_schema_diff
-from basic_memory.mcp.tools import schema_infer as mcp_schema_infer
-from basic_memory.mcp.tools import schema_validate as mcp_schema_validate
+
+# MCP tool functions are imported inside each command: importing
+# basic_memory.mcp.tools loads the entire tool stack (fastmcp, mcp SDK,
+# SQLAlchemy), which would slow every CLI invocation, including --help (#886).
 
 console = Console()
 
@@ -45,7 +46,7 @@ def _resolve_project_name(project: Optional[str]) -> Optional[str]:
 # --- Rendering helpers ---
 
 
-def _render_validate_table(data: dict) -> None:
+def _render_validate_table(data: dict[str, Any]) -> None:
     """Render a validation report dict as a Rich table."""
     note_type = data.get("note_type")
     title_label = note_type or "all"
@@ -82,7 +83,7 @@ def _render_validate_table(data: dict) -> None:
     )
 
 
-def _render_infer_table(data: dict) -> None:
+def _render_infer_table(data: dict[str, Any]) -> None:
     """Render an inference report dict as a Rich table."""
     note_type = data.get("note_type", "")
     notes_analyzed = data.get("notes_analyzed", 0)
@@ -124,7 +125,7 @@ def _render_infer_table(data: dict) -> None:
         console.print(json.dumps(suggested_schema, indent=2))
 
 
-def _render_diff_output(data: dict) -> None:
+def _render_diff_output(data: dict[str, Any]) -> None:
     """Render a drift report dict as Rich output."""
     note_type = data.get("note_type", "")
     new_fields = data.get("new_fields", [])
@@ -189,6 +190,9 @@ def validate(
     Use --local to force local routing when cloud mode is enabled.
     Use --cloud to force cloud routing when cloud mode is disabled.
     """
+    # Deferred: loading the MCP tool stack at module import slows CLI startup (#886).
+    from basic_memory.mcp.tools import schema_validate as mcp_schema_validate
+
     try:
         validate_routing_flags(local, cloud)
         project_name = _resolve_project_name(project)
@@ -272,6 +276,9 @@ def infer(
     Use --local to force local routing when cloud mode is enabled.
     Use --cloud to force cloud routing when cloud mode is disabled.
     """
+    # Deferred: loading the MCP tool stack at module import slows CLI startup (#886).
+    from basic_memory.mcp.tools import schema_infer as mcp_schema_infer
+
     try:
         validate_routing_flags(local, cloud)
         project_name = _resolve_project_name(project)
@@ -352,6 +359,9 @@ def diff(
     Use --local to force local routing when cloud mode is enabled.
     Use --cloud to force cloud routing when cloud mode is disabled.
     """
+    # Deferred: loading the MCP tool stack at module import slows CLI startup (#886).
+    from basic_memory.mcp.tools import schema_diff as mcp_schema_diff
+
     try:
         validate_routing_flags(local, cloud)
         project_name = _resolve_project_name(project)

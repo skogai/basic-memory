@@ -4,8 +4,12 @@ Integration tests for edit_note MCP tool.
 Tests the complete edit note workflow: MCP client -> MCP server -> FastAPI -> database
 """
 
+from pathlib import Path
+
 import pytest
 from fastmcp import Client
+
+from basic_memory.file_utils import parse_frontmatter
 
 
 @pytest.mark.asyncio
@@ -788,3 +792,158 @@ async def test_edit_note_append_autocreate_does_not_fuzzy_match(mcp_server, app,
 
         error_text = edit_result2.content[0].text
         assert "Edit Failed" in error_text
+
+
+@pytest.mark.asyncio
+async def test_edit_note_recovers_file_on_disk_not_indexed(mcp_server, app, test_project):
+    """edit_note should index and edit a markdown file written directly to disk (#581).
+
+    Common flow: a file is written straight to the project directory and edit_note is
+    called before the watcher indexes it. The tool must recover by indexing the single
+    file and retrying resolution instead of failing with "Entity not found".
+    """
+    note_path = Path(test_project.path) / "direct" / "disk-note.md"
+    note_path.parent.mkdir(parents=True, exist_ok=True)
+    note_path.write_text("# Disk Note\n\nstatus: draft\n", encoding="utf-8")
+
+    async with Client(mcp_server) as client:
+        edit_result = await client.call_tool(
+            "edit_note",
+            {
+                "project": test_project.name,
+                "identifier": "direct/disk-note",
+                "operation": "find_replace",
+                "content": "status: final",
+                "find_text": "status: draft",
+            },
+        )
+
+        edit_text = edit_result.content[0].text
+        assert "Edited note (find_replace)" in edit_text
+
+        read_result = await client.call_tool(
+            "read_note",
+            {"project": test_project.name, "identifier": "direct/disk-note"},
+        )
+        content = read_result.content[0].text
+        assert "status: final" in content
+
+
+@pytest.mark.asyncio
+async def test_edit_note_metadata_merges_frontmatter(mcp_server, app, test_project):
+    """metadata merges frontmatter fields independent of `operation` (issue #1011)."""
+
+    async with Client(mcp_server) as client:
+        await client.call_tool(
+            "write_note",
+            {
+                "project": test_project.name,
+                "title": "Metadata Merge Ticket",
+                "directory": "tickets",
+                "content": "# Metadata Merge Ticket\n\nTicket body.",
+                "metadata": {"status": "open", "opened_at": "2026-06-18T09:14:00Z"},
+            },
+        )
+
+        edit_result = await client.call_tool(
+            "edit_note",
+            {
+                "project": test_project.name,
+                "identifier": "tickets/metadata-merge-ticket",
+                "operation": "append",
+                "content": "\n\nResolution notes.",
+                "metadata": {"status": "resolved", "closed_at": "2026-06-18T10:42:00Z"},
+            },
+        )
+
+        edit_text = edit_result.content[0].text
+        assert "Edited note (append)" in edit_text
+
+        read_result = await client.call_tool(
+            "read_note",
+            {"project": test_project.name, "identifier": "tickets/metadata-merge-ticket"},
+        )
+        content = read_result.content[0].text
+
+        # New key added, existing key overwritten, unrelated frontmatter and body preserved.
+        frontmatter = parse_frontmatter(content)
+        assert frontmatter["status"] == "resolved"
+        assert frontmatter["closed_at"] == "2026-06-18T10:42:00Z"
+        assert frontmatter["opened_at"] == "2026-06-18T09:14:00Z"
+        assert "Ticket body." in content
+        assert "Resolution notes." in content
+
+
+@pytest.mark.asyncio
+async def test_edit_note_metadata_ignores_identity_fields(mcp_server, app, test_project):
+    """title/type/permalink in `metadata` are ignored rather than hijacking the note's identity."""
+
+    async with Client(mcp_server) as client:
+        await client.call_tool(
+            "write_note",
+            {
+                "project": test_project.name,
+                "title": "Identity Guard Note",
+                "directory": "tickets",
+                "content": "# Identity Guard Note\n\nBody.",
+            },
+        )
+
+        await client.call_tool(
+            "edit_note",
+            {
+                "project": test_project.name,
+                "identifier": "tickets/identity-guard-note",
+                "operation": "append",
+                "content": "",
+                "metadata": {
+                    "title": "Hijacked Title",
+                    "type": "hijacked",
+                    "permalink": "hijacked/permalink",
+                    "status": "resolved",
+                },
+            },
+        )
+
+        read_result = await client.call_tool(
+            "read_note",
+            {"project": test_project.name, "identifier": "tickets/identity-guard-note"},
+        )
+        content = read_result.content[0].text
+        frontmatter = parse_frontmatter(content)
+
+        assert frontmatter["status"] == "resolved"
+        assert frontmatter["title"] == "Identity Guard Note"
+        # permalink is preserved, not hijacked to the metadata value. Assert on the note's
+        # own slug rather than the exact string, since the harness prefixes the project name.
+        assert frontmatter["permalink"] != "hijacked/permalink"
+        assert frontmatter["permalink"].endswith("tickets/identity-guard-note")
+        assert frontmatter["type"] == "note"
+        assert "status: draft" not in content
+
+
+@pytest.mark.asyncio
+async def test_edit_note_metadata_null_values_rejected_before_auto_create(
+    mcp_server, app, test_project
+):
+    """Null metadata values fail up front — including on the append auto-create path.
+
+    Without the tool-level guard an auto-created note would be written with a
+    YAML null that indexing silently filters out of entity_metadata.
+    """
+    async with Client(mcp_server) as client:
+        with pytest.raises(Exception) as exc_info:
+            await client.call_tool(
+                "edit_note",
+                {
+                    "project": test_project.name,
+                    "identifier": "conversations/never-created",
+                    "operation": "append",
+                    "content": "",
+                    "metadata": {"status": None},
+                },
+            )
+
+        error_message = str(exc_info.value)
+        assert "key deletion is not supported" in error_message
+        assert "status" in error_message

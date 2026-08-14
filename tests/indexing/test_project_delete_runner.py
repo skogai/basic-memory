@@ -1,0 +1,602 @@
+"""Tests for portable project-delete cleanup orchestration."""
+
+from collections.abc import AsyncGenerator
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock
+
+import pytest
+import pytest_asyncio
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import StaticPool
+
+import basic_memory.indexing.project_delete_runner as project_delete_runner_module
+from basic_memory.indexing.project_delete_runner import (
+    ProjectDeletePreflightResult,
+    ProjectHardDeleteOutcome,
+    RepositoryProjectDeletePreflight,
+    RepositoryProjectHardDeleter,
+    run_project_delete,
+)
+from basic_memory.models import Base as BasicMemoryBase
+from basic_memory.models import Entity, NoteContent, Project
+from basic_memory.repository.semantic_errors import SemanticVectorIndexExtensionError
+from basic_memory.runtime.cleanup import (
+    RuntimeDeleteStatus,
+    RuntimeFileDeleteResult,
+    RuntimeNoteFileDeleteJobRequest,
+    RuntimeProjectDeleteResult,
+    RuntimeProjectFileSnapshot,
+)
+from basic_memory.runtime.jobs import RuntimeProjectDeleteJobRequest
+
+
+@pytest_asyncio.fixture
+async def project_delete_session_maker() -> AsyncGenerator[
+    async_sessionmaker[AsyncSession],
+    None,
+]:
+    """Create an isolated Basic Memory tenant database."""
+    engine = create_async_engine(
+        "sqlite+aiosqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    async with engine.begin() as connection:
+        await connection.run_sync(BasicMemoryBase.metadata.create_all)
+
+    try:
+        yield async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    finally:
+        await engine.dispose()
+
+
+class FakeProjectDeletePreflight:
+    def __init__(self, result: ProjectDeletePreflightResult) -> None:
+        self.result = result
+        self.requests: list[RuntimeProjectDeleteJobRequest] = []
+
+    async def prepare_project_delete(
+        self,
+        request: RuntimeProjectDeleteJobRequest,
+    ) -> ProjectDeletePreflightResult:
+        self.requests.append(request)
+        return self.result
+
+
+class FakeProjectFileDeleter:
+    def __init__(self, results: list[RuntimeFileDeleteResult]) -> None:
+        self.results = results
+        self.requests: list[RuntimeNoteFileDeleteJobRequest] = []
+
+    async def delete_project_file(
+        self,
+        request: RuntimeNoteFileDeleteJobRequest,
+    ) -> RuntimeFileDeleteResult:
+        self.requests.append(request)
+        return self.results.pop(0)
+
+
+class FakeProjectHardDeleter:
+    def __init__(self, *, outcome: ProjectHardDeleteOutcome) -> None:
+        self.outcome = outcome
+        self.requests: list[RuntimeProjectDeleteJobRequest] = []
+
+    async def hard_delete_project(
+        self,
+        request: RuntimeProjectDeleteJobRequest,
+    ) -> ProjectHardDeleteOutcome:
+        self.requests.append(request)
+        return self.outcome
+
+
+class FakeProjectDeleteRepository:
+    def __init__(self, *, deleted: bool, events: list[str] | None = None) -> None:
+        self.deleted = deleted
+        self.entity_ids: list[int] = []
+        self.events = events
+
+    async def delete(self, session: AsyncSession, entity_id: int) -> bool:
+        if self.events is not None:
+            self.events.append("project_delete")
+        self.entity_ids.append(entity_id)
+        return self.deleted
+
+
+class FakeProjectVectorCleaner:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.calls: list[tuple[bool, AsyncSession | None]] = []
+
+    async def delete_project_vector_rows(
+        self,
+        *,
+        strict_adapter_cleanup: bool = True,
+        session: AsyncSession | None = None,
+    ) -> None:
+        self.events.append("vector_cleanup")
+        self.calls.append((strict_adapter_cleanup, session))
+
+
+def project_delete_request(
+    *,
+    project_id: int = 101,
+    delete_notes: bool = True,
+) -> RuntimeProjectDeleteJobRequest:
+    return RuntimeProjectDeleteJobRequest(
+        project_id=project_id,
+        project_external_id="project-main",
+        project_name="Main",
+        project_path="basic-memory",
+        delete_notes=delete_notes,
+    )
+
+
+def project_file_snapshot(
+    *,
+    entity_id: int,
+    file_path: str,
+    file_checksum: str | None,
+) -> RuntimeProjectFileSnapshot:
+    return RuntimeProjectFileSnapshot(
+        entity_id=entity_id,
+        file_path=file_path,
+        file_checksum=file_checksum,
+    )
+
+
+async def create_project_with_note(
+    session_maker: async_sessionmaker[AsyncSession],
+    *,
+    is_active: bool,
+) -> Project:
+    async with session_maker() as session:
+        project = Project(
+            name="Main",
+            path="basic-memory",
+            permalink="main",
+            external_id="project-main",
+            is_active=is_active,
+            is_default=False,
+        )
+        session.add(project)
+        await session.flush()
+        entity = Entity(
+            title="Alpha",
+            note_type="note",
+            entity_metadata={"title": "Alpha"},
+            content_type="text/markdown",
+            project_id=project.id,
+            permalink="alpha",
+            file_path="notes/a.md",
+            checksum="entity-sum",
+            mtime=datetime(2026, 5, 22, 12, 0, tzinfo=UTC).timestamp(),
+            size=42,
+        )
+        session.add(entity)
+        await session.flush()
+        session.add(
+            NoteContent(
+                entity_id=entity.id,
+                project_id=project.id,
+                external_id=entity.external_id,
+                file_path=entity.file_path,
+                markdown_content="# Alpha\n",
+                db_version=1,
+                db_checksum="db-sum",
+                file_version=1,
+                file_checksum="file-sum",
+                file_write_status="synced",
+                file_updated_at=datetime(2026, 5, 22, 12, 0, tzinfo=UTC),
+            )
+        )
+        await session.commit()
+        return project
+
+
+@pytest.mark.asyncio
+async def test_repository_project_delete_preflight_snapshots_inactive_project_files(
+    project_delete_session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    project = await create_project_with_note(project_delete_session_maker, is_active=False)
+    request = project_delete_request(project_id=project.id)
+
+    result = await RepositoryProjectDeletePreflight(
+        session_maker=project_delete_session_maker
+    ).prepare_project_delete(request)
+
+    assert result == ProjectDeletePreflightResult.ready(
+        [
+            RuntimeProjectFileSnapshot(
+                entity_id=1,
+                file_path="notes/a.md",
+                file_checksum="file-sum",
+            )
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_repository_project_delete_preflight_guards_non_note_files_with_entity_checksum(
+    project_delete_session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """Non-markdown entities have no note_content row; their snapshot must fall
+    back to Entity.checksum or the guarded per-file delete skips them and the
+    hard-deleted project strands the objects in storage."""
+    project = await create_project_with_note(project_delete_session_maker, is_active=False)
+    async with project_delete_session_maker() as session:
+        session.add(
+            Entity(
+                title="diagram.png",
+                note_type="file",
+                entity_metadata={},
+                content_type="image/png",
+                project_id=project.id,
+                permalink=None,
+                file_path="assets/diagram.png",
+                checksum="binary-sum",
+                mtime=datetime(2026, 5, 22, 12, 0, tzinfo=UTC).timestamp(),
+                size=1024,
+            )
+        )
+        # A row with neither checksum still snapshots None (nothing safe to guard on).
+        session.add(
+            Entity(
+                title="unindexed.bin",
+                note_type="file",
+                entity_metadata={},
+                content_type="application/octet-stream",
+                project_id=project.id,
+                permalink=None,
+                file_path="assets/unindexed.bin",
+                checksum=None,
+                mtime=datetime(2026, 5, 22, 12, 0, tzinfo=UTC).timestamp(),
+                size=8,
+            )
+        )
+        await session.commit()
+
+    result = await RepositoryProjectDeletePreflight(
+        session_maker=project_delete_session_maker
+    ).prepare_project_delete(project_delete_request(project_id=project.id))
+
+    snapshots = {snapshot.file_path: snapshot for snapshot in result.file_snapshots}
+    assert snapshots["assets/diagram.png"].file_checksum == "binary-sum"
+    assert snapshots["assets/unindexed.bin"].file_checksum is None
+    # The markdown note keeps its accepted note_content checksum.
+    assert snapshots["notes/a.md"].file_checksum == "file-sum"
+
+
+@pytest.mark.asyncio
+async def test_repository_project_delete_preflight_skips_active_project(
+    project_delete_session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    project = await create_project_with_note(project_delete_session_maker, is_active=True)
+    request = project_delete_request(project_id=project.id)
+
+    result = await RepositoryProjectDeletePreflight(
+        session_maker=project_delete_session_maker
+    ).prepare_project_delete(request)
+
+    assert result == ProjectDeletePreflightResult.terminal(
+        RuntimeProjectDeleteResult(
+            project_id=project.id,
+            project_external_id="project-main",
+            status=RuntimeDeleteStatus.skipped,
+            deleted_project=False,
+            deleted_files=0,
+            skipped_files=0,
+            missing_files=0,
+            reason=f"project is active: {project.id}",
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_repository_project_hard_deleter_deletes_project(
+    project_delete_session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    project = await create_project_with_note(project_delete_session_maker, is_active=False)
+    request = project_delete_request(project_id=project.id)
+
+    outcome = await RepositoryProjectHardDeleter(
+        session_maker=project_delete_session_maker
+    ).hard_delete_project(request)
+
+    async with project_delete_session_maker() as session:
+        stored_project = await session.get(Project, project.id)
+
+    assert outcome is ProjectHardDeleteOutcome.deleted
+    assert stored_project is None
+
+
+@pytest.mark.asyncio
+async def test_repository_project_hard_deleter_reports_missing_project(
+    project_delete_session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    request = project_delete_request(project_id=42)
+
+    outcome = await RepositoryProjectHardDeleter(
+        session_maker=project_delete_session_maker
+    ).hard_delete_project(request)
+
+    assert outcome is ProjectHardDeleteOutcome.missing
+
+
+@pytest.mark.asyncio
+async def test_repository_project_hard_deleter_aborts_when_project_reactivated(
+    project_delete_session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """A project reactivated between preflight and hard delete must survive.
+
+    Preflight checks is_active once, and the guarded per-file loop can run long;
+    without a re-check inside the hard-delete transaction a concurrent
+    reactivation is destroyed.
+    """
+    project = await create_project_with_note(project_delete_session_maker, is_active=False)
+    request = project_delete_request(project_id=project.id)
+
+    preflight = await RepositoryProjectDeletePreflight(
+        session_maker=project_delete_session_maker
+    ).prepare_project_delete(request)
+    assert preflight.terminal_result is None
+
+    # The user reactivates the project while file cleanup is still running.
+    async with project_delete_session_maker() as session:
+        stored_project = await session.get(Project, project.id)
+        assert stored_project is not None
+        stored_project.is_active = True
+        await session.commit()
+
+    outcome = await RepositoryProjectHardDeleter(
+        session_maker=project_delete_session_maker
+    ).hard_delete_project(request)
+
+    async with project_delete_session_maker() as session:
+        surviving_project = await session.get(Project, project.id)
+
+    assert outcome is ProjectHardDeleteOutcome.reactivated
+    assert surviving_project is not None
+    assert surviving_project.is_active is True
+
+
+@pytest.mark.asyncio
+async def test_repository_project_hard_deleter_uses_injected_project_repository(
+    project_delete_session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    project = await create_project_with_note(project_delete_session_maker, is_active=False)
+    request = project_delete_request(project_id=project.id)
+    repository = FakeProjectDeleteRepository(deleted=False)
+
+    outcome = await RepositoryProjectHardDeleter(
+        session_maker=project_delete_session_maker,
+        project_repository=repository,
+    ).hard_delete_project(request)
+
+    assert outcome is ProjectHardDeleteOutcome.missing
+    assert repository.entity_ids == [project.id]
+
+
+@pytest.mark.asyncio
+async def test_repository_project_hard_deleter_cleans_vectors_in_delete_transaction(
+    project_delete_session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    project = await create_project_with_note(project_delete_session_maker, is_active=False)
+    events: list[str] = []
+    repository = FakeProjectDeleteRepository(deleted=True, events=events)
+    cleaner = FakeProjectVectorCleaner(events)
+
+    outcome = await RepositoryProjectHardDeleter(
+        session_maker=project_delete_session_maker,
+        project_repository=repository,
+        project_vector_cleaner_factory=lambda _project_id: cleaner,
+    ).hard_delete_project(project_delete_request(project_id=project.id))
+
+    assert outcome is ProjectHardDeleteOutcome.deleted
+    assert events == ["vector_cleanup", "project_delete"]
+    assert len(cleaner.calls) == 1
+    strict_cleanup, cleanup_session = cleaner.calls[0]
+    assert strict_cleanup is True
+    assert cleanup_session is not None
+
+
+@pytest.mark.asyncio
+async def test_repository_project_hard_deleter_rejects_unowned_external_cleanup(
+    project_delete_session_maker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = await create_project_with_note(project_delete_session_maker, is_active=False)
+    monkeypatch.setattr(
+        project_delete_runner_module,
+        "project_external_vector_index_names",
+        AsyncMock(return_value=frozenset({"milvus"})),
+    )
+
+    with pytest.raises(SemanticVectorIndexExtensionError, match="project vector cleaner"):
+        await RepositoryProjectHardDeleter(
+            session_maker=project_delete_session_maker
+        ).hard_delete_project(project_delete_request(project_id=project.id))
+
+    async with project_delete_session_maker() as session:
+        surviving_project = await session.get(Project, project.id)
+    assert surviving_project is not None
+
+
+@pytest.mark.asyncio
+async def test_repository_project_hard_deleter_defaults_to_core_project_repository(
+    project_delete_session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    hard_deleter = RepositoryProjectHardDeleter(session_maker=project_delete_session_maker)
+
+    assert hard_deleter.project_repository.__class__.__name__ == "ProjectRepository"
+
+
+@pytest.mark.asyncio
+async def test_run_project_delete_deletes_files_then_hard_deletes_project() -> None:
+    request = project_delete_request()
+    file_deleter = FakeProjectFileDeleter(
+        [
+            RuntimeFileDeleteResult.deleted(entity_id=42, file_path="notes/a.md"),
+            RuntimeFileDeleteResult.changed_before_delete(
+                entity_id=43,
+                file_path="notes/b.md",
+            ),
+        ]
+    )
+    hard_deleter = FakeProjectHardDeleter(outcome=ProjectHardDeleteOutcome.deleted)
+
+    result = await run_project_delete(
+        request,
+        preflight=FakeProjectDeletePreflight(
+            ProjectDeletePreflightResult.ready(
+                [
+                    project_file_snapshot(
+                        entity_id=42,
+                        file_path="notes/a.md",
+                        file_checksum="file-sum-a",
+                    ),
+                    project_file_snapshot(
+                        entity_id=43,
+                        file_path="notes/b.md",
+                        file_checksum="file-sum-b",
+                    ),
+                ]
+            )
+        ),
+        file_deleter=file_deleter,
+        hard_deleter=hard_deleter,
+    )
+
+    assert result == RuntimeProjectDeleteResult(
+        project_id=101,
+        project_external_id="project-main",
+        status=RuntimeDeleteStatus.deleted,
+        deleted_project=True,
+        deleted_files=1,
+        skipped_files=1,
+        missing_files=0,
+        reason="project deleted: 101",
+    )
+    assert file_deleter.requests == [
+        RuntimeNoteFileDeleteJobRequest(
+            project_id=101,
+            entity_id=42,
+            file_path="notes/a.md",
+            file_checksum="file-sum-a",
+        ),
+        RuntimeNoteFileDeleteJobRequest(
+            project_id=101,
+            entity_id=43,
+            file_path="notes/b.md",
+            file_checksum="file-sum-b",
+        ),
+    ]
+    assert hard_deleter.requests == [request]
+
+
+@pytest.mark.asyncio
+async def test_run_project_delete_returns_terminal_preflight_result() -> None:
+    request = project_delete_request()
+    terminal_result = RuntimeProjectDeleteResult(
+        project_id=101,
+        project_external_id="project-main",
+        status=RuntimeDeleteStatus.skipped,
+        deleted_project=False,
+        deleted_files=0,
+        skipped_files=0,
+        missing_files=0,
+        reason="project is active: 101",
+    )
+    file_deleter = FakeProjectFileDeleter([])
+    hard_deleter = FakeProjectHardDeleter(outcome=ProjectHardDeleteOutcome.deleted)
+
+    result = await run_project_delete(
+        request,
+        preflight=FakeProjectDeletePreflight(
+            ProjectDeletePreflightResult.terminal(terminal_result)
+        ),
+        file_deleter=file_deleter,
+        hard_deleter=hard_deleter,
+    )
+
+    assert result == terminal_result
+    assert file_deleter.requests == []
+    assert hard_deleter.requests == []
+
+
+@pytest.mark.asyncio
+async def test_run_project_delete_preserves_file_counts_when_project_disappears() -> None:
+    request = project_delete_request()
+    file_deleter = FakeProjectFileDeleter(
+        [
+            RuntimeFileDeleteResult.already_absent(
+                entity_id=42,
+                file_path="notes/a.md",
+            )
+        ]
+    )
+
+    result = await run_project_delete(
+        request,
+        preflight=FakeProjectDeletePreflight(
+            ProjectDeletePreflightResult.ready(
+                [
+                    project_file_snapshot(
+                        entity_id=42,
+                        file_path="notes/a.md",
+                        file_checksum="file-sum",
+                    )
+                ]
+            )
+        ),
+        file_deleter=file_deleter,
+        hard_deleter=FakeProjectHardDeleter(outcome=ProjectHardDeleteOutcome.missing),
+    )
+
+    assert result == RuntimeProjectDeleteResult(
+        project_id=101,
+        project_external_id="project-main",
+        status=RuntimeDeleteStatus.missing,
+        deleted_project=False,
+        deleted_files=0,
+        skipped_files=0,
+        missing_files=1,
+        reason="project already absent: 101",
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_project_delete_reports_skipped_when_project_reactivated() -> None:
+    """A hard delete aborted by reactivation must report skipped, not the
+    misleading 'project already absent' outcome."""
+    request = project_delete_request()
+    file_deleter = FakeProjectFileDeleter(
+        [RuntimeFileDeleteResult.deleted(entity_id=42, file_path="notes/a.md")]
+    )
+
+    result = await run_project_delete(
+        request,
+        preflight=FakeProjectDeletePreflight(
+            ProjectDeletePreflightResult.ready(
+                [
+                    project_file_snapshot(
+                        entity_id=42,
+                        file_path="notes/a.md",
+                        file_checksum="file-sum",
+                    )
+                ]
+            )
+        ),
+        file_deleter=file_deleter,
+        hard_deleter=FakeProjectHardDeleter(outcome=ProjectHardDeleteOutcome.reactivated),
+    )
+
+    assert result == RuntimeProjectDeleteResult(
+        project_id=101,
+        project_external_id="project-main",
+        status=RuntimeDeleteStatus.skipped,
+        deleted_project=False,
+        deleted_files=1,
+        skipped_files=0,
+        missing_files=0,
+        reason="project reactivated before hard delete: 101",
+    )

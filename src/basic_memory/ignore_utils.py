@@ -7,6 +7,15 @@ from typing import Set
 from basic_memory.config import resolve_data_dir
 
 
+# Marker shared by the API ignored-path rejection detail and MCP-side error handling.
+# The index-file endpoint embeds it in its 400 detail and edit_note's disk recovery
+# matches on it, so "exists but ignored" stays distinguishable from generic rejections
+# without duplicating message text across layers.
+IGNORED_PATH_REJECTION_DETAIL = (
+    "matches Basic Memory ignore rules (.bmignore or project .gitignore)"
+)
+
+
 # Common directories and patterns to ignore by default
 # These are used as fallback if .bmignore doesn't exist
 DEFAULT_IGNORE_PATTERNS = {
@@ -82,7 +91,7 @@ def create_default_bmignore() -> None:
 
     bmignore_path.parent.mkdir(parents=True, exist_ok=True)
     bmignore_path.write_text("""# Basic Memory Ignore Patterns
-# This file is used by both 'bm cloud upload', 'bm cloud bisync', and file sync
+# This file is used by 'bm cloud upload', 'bm cloud bisync', and file indexing
 # Patterns use standard gitignore-style syntax
 
 # Hidden files (files starting with dot)

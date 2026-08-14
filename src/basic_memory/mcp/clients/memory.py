@@ -3,12 +3,15 @@
 Encapsulates all /v2/projects/{project_id}/memory/* endpoints.
 """
 
-from typing import Optional
+from typing import Any, Optional
 
 from httpx import AsyncClient
 
 import logfire
-from basic_memory.mcp.tools.utils import call_get
+
+# call_* helpers live in basic_memory.mcp.tools.utils; importing that at module
+# level executes the whole tools package (fastmcp + mcp SDK) during CLI startup,
+# so each method defers the import to call time instead (#886).
 from basic_memory.schemas.memory import GraphContext
 
 
@@ -63,7 +66,9 @@ class MemoryClient:
         Raises:
             ToolError: If the request fails
         """
-        params: dict = {
+        from basic_memory.mcp.tools.utils import call_get
+
+        params: dict[str, Any] = {
             "depth": depth,
             "page": page,
             "page_size": page_size,
@@ -113,7 +118,9 @@ class MemoryClient:
         Raises:
             ToolError: If the request fails
         """
-        params: dict = {
+        from basic_memory.mcp.tools.utils import call_get
+
+        params: dict[str, Any] = {
             "timeframe": timeframe,
             "depth": depth,
             "page": page,

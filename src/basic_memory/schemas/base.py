@@ -11,7 +11,6 @@ Key Concepts:
 4. Everything is stored in both SQLite and markdown files
 """
 
-import os
 import mimetypes
 import re
 from datetime import datetime, timedelta
@@ -19,7 +18,6 @@ from pathlib import Path
 from typing import List, Optional, Annotated, Dict
 
 from annotated_types import MinLen, MaxLen
-from dateparser import parse
 
 from pydantic import BaseModel, BeforeValidator, Field, model_validator, computed_field
 
@@ -74,6 +72,11 @@ def to_snake_case(name: str) -> str:
     return s2.lower()
 
 
+def normalize_note_type(note_type: str) -> str:
+    """Return the canonical identity used for note types across all boundaries."""
+    return to_snake_case(note_type)
+
+
 def parse_timeframe(timeframe: str) -> datetime:
     """Parse timeframe with special handling for 'today' and other natural language expressions.
 
@@ -92,6 +95,10 @@ def parse_timeframe(timeframe: str) -> datetime:
         parse_timeframe('1d') -> 2025-06-04 14:50:00-07:00 (24 hours ago with local timezone)
         parse_timeframe('1 week ago') -> 2025-05-29 14:50:00-07:00 (1 week ago with local timezone)
     """
+    # Deferred: dateparser costs ~0.13s to import; schemas load on every CLI
+    # start, but timeframe parsing only happens per request (#886).
+    from dateparser import parse
+
     if timeframe.lower() == "today":
         # For "today", return 1 day ago to ensure we capture recent activity across timezones
         # This handles the case where client and server are in different timezones
@@ -158,7 +165,7 @@ Permalink = Annotated[str, MinLen(1)]
 """Unique identifier in format '{path}/{normalized_name}'."""
 
 
-NoteType = Annotated[str, BeforeValidator(to_snake_case), MinLen(1), MaxLen(200)]
+NoteType = Annotated[str, BeforeValidator(normalize_note_type), MinLen(1), MaxLen(200)]
 """Classification of note (e.g., 'note', 'person', 'spec', 'schema'). """
 
 ALLOWED_CONTENT_TYPES = {
@@ -278,13 +285,10 @@ class Entity(BaseModel):
         """Get the file path for this entity based on its permalink."""
         safe_title = self.safe_title
         if self.content_type == "text/markdown":
-            return (
-                os.path.join(self.directory, f"{safe_title}.md")
-                if self.directory
-                else f"{safe_title}.md"
-            )
+            filename = f"{safe_title}.md"
         else:
-            return os.path.join(self.directory, safe_title) if self.directory else safe_title
+            filename = safe_title
+        return f"{self.directory}/{filename}" if self.directory else filename
 
     @property
     def permalink(self) -> Optional[Permalink]:

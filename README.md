@@ -1,4 +1,6 @@
 <!-- mcp-name: io.github.basicmachines-co/basic-memory -->
+[![MCP Toplist](https://mcptoplist.com/badge/io.github.basicmachines-co%2Fbasic-memory.svg)](https://mcptoplist.com/server/io.github.basicmachines-co%2Fbasic-memory)
+
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![PyPI version](https://badge.fury.io/py/basic-memory.svg)](https://badge.fury.io/py/basic-memory)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
@@ -6,6 +8,7 @@
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 ![](https://badge.mcpx.dev?type=server 'MCP Server')
 ![](https://badge.mcpx.dev?type=dev 'MCP Dev')
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/basicmachines-co/basic-memory)
 
 ## Skip the install — try Basic Memory in the cloud
 
@@ -36,7 +39,8 @@ search.
 - **Local-first.** Plain text on your disk. Forever.
 - **Two-way.** AI and humans write to the same files; sync keeps them in step.
 - **A real knowledge graph.** Observations and wikilinks compound into context.
-- **Semantic search.** Find notes by meaning, not just keywords.
+- **Semantic search.** Find notes by meaning, not just keywords, with optional
+  cross-encoder reranking for higher-quality vector and hybrid results.
 - **MCP-native.** Works with every major AI client and IDE.
 - **Progressive tool discovery.** Every tool is tagged with behavior hints
   (read-only, destructive, idempotent) so agents pick the right tool on
@@ -78,6 +82,13 @@ Pick the path that fits you. Both run the same product on the same Markdown.
 
 ```bash
 uv tool install basic-memory
+```
+
+For Postgres deployments that store semantic vectors in Milvus, install the
+first-party optional extra instead:
+
+```bash
+uv tool install "basic-memory[milvus]"
 ```
 
 [**Configure your client ↓**](#connect-your-ai-client)
@@ -197,7 +208,13 @@ just package-check-openclaw
 
 ### Claude Code plugin
 
-The Claude Code plugin bundles Basic Memory-aware skills, hooks, and an agent:
+The Claude Code plugin is the bridge between Claude's working memory and Basic
+Memory — session-start briefings, pre-compaction checkpoints, an opt-in capture
+output style, and `/basic-memory:bm-setup` · `:remember` · `:share` · `:status`.
+
+**Connect the Basic Memory MCP server first** — see [Connect your AI
+client](#connect-your-ai-client). The plugin's hooks and skills call it, so it's a
+hard prerequisite. Then add the marketplace and install:
 
 ```bash
 claude plugin marketplace add basicmachines-co/basic-memory \
@@ -210,14 +227,14 @@ Source: [`plugins/claude-code`](plugins/claude-code).
 ### Shared skills
 
 Framework-agnostic `SKILL.md` files live in [`skills/`](skills). If your
-Skills CLI supports subpath installs:
+Skills CLI supports repository subdirectory sources:
 
 ```bash
-npx skills add basicmachines-co/basic-memory --path skills
+npx skills add basicmachines-co/basic-memory/skills
 ```
 
-If it does not, copy the `memory-*` directories from `skills/` into your
-agent's skills directory as a temporary Phase 1 install path.
+If your installed Skills CLI cannot load that source, update the CLI or copy
+the `memory-*` directories from `skills/` into your agent's skills directory.
 
 ### Hermes
 
@@ -275,6 +292,10 @@ Restart Claude Desktop. Notes live in `~/basic-memory` by default.
 claude mcp add basic-memory -- uvx basic-memory mcp
 ```
 
+For the full memory bridge — session briefings, pre-compaction checkpoints, and
+the `/basic-memory:*` commands — also install the [Claude Code
+plugin](#claude-code-plugin) on top of this.
+
 ### Codex CLI
 
 Add to `~/.codex/config.toml`:
@@ -284,6 +305,22 @@ Add to `~/.codex/config.toml`:
 command = "uvx"
 args = ["basic-memory", "mcp"]
 ```
+
+Codex can keep its default MCP approval behavior, or you can pre-approve eligible
+Basic Memory tools by adding this server-scoped setting to the same table:
+
+```toml
+[mcp_servers.basic-memory]
+command = "uvx"
+args = ["basic-memory", "mcp"]
+default_tools_approval_mode = "approve"
+```
+
+This does not disable Codex approvals globally or expand which Basic Memory
+projects the server can access. Codex still requires approval for tools that
+advertise a destructive annotation, including Basic Memory's writes, edits, and
+deletes. If you installed the Basic Memory Codex plugin, use its
+[plugin-scoped configuration](plugins/codex/README.md#mcp-approvals) instead.
 
 ### Cursor
 
@@ -346,6 +383,8 @@ Try a prompt:
 - **Semantic vector search.** Find notes by meaning, not just keywords.
   Hybrid full-text + vector ranking with FastEmbed embeddings, on SQLite or
   Postgres.
+- **Optional search reranking.** Rescore the strongest vector and hybrid
+  candidates with a local FastEmbed cross-encoder or a LiteLLM-backed provider.
 - **Schema system.** Infer, validate, and diff the structure of your
   knowledge base with `schema_infer`, `schema_validate`, `schema_diff`.
 - **Per-project cloud routing.** Route individual projects through the cloud
@@ -362,6 +401,36 @@ Try a prompt:
   and an htop-inspired project dashboard.
 
 Full [CHANGELOG](CHANGELOG.md) for v0.18 → v0.20.
+
+## Optional cross-encoder reranking
+
+Reranking adds a second relevance pass after vector or hybrid retrieval. It is
+disabled by default because it adds inference latency and, for the local
+provider, a first-run model download. Text, title, and permalink searches keep
+their existing ranking.
+
+Enable the default local FastEmbed reranker:
+
+```bash
+export BASIC_MEMORY_SEMANTIC_SEARCH_ENABLED=true
+export BASIC_MEMORY_RERANKER_ENABLED=true
+```
+
+The default model is `jinaai/jina-reranker-v1-tiny-en`. To use a hosted
+reranker through LiteLLM instead:
+
+```bash
+export BASIC_MEMORY_SEMANTIC_SEARCH_ENABLED=true
+export BASIC_MEMORY_RERANKER_ENABLED=true
+export BASIC_MEMORY_RERANKER_PROVIDER=litellm
+export BASIC_MEMORY_RERANKER_MODEL=cohere/rerank-v3.5
+export COHERE_API_KEY=...
+```
+
+The feature fails fast on invalid configuration and does not silently fall
+back to retrieval order when an enabled provider fails. See the
+[semantic search guide](docs/semantic-search.md#cross-encoder-reranking) for
+provider setup, all settings, tuning, pagination, and failure behavior.
 
 ## Why Basic Memory
 
@@ -468,7 +537,7 @@ multi-word ones.
 
 Bare `- [[Target]]` and prose `- Worth checking out [[Target]]` index as
 `links_to`. Full reference in the
-[docs](https://docs.basicmemory.com/getting-started/note-formatting/?utm_source=github&utm_medium=referral&utm_campaign=readme).
+[docs](https://docs.basicmemory.com/concepts/knowledge-format?utm_source=github&utm_medium=referral&utm_campaign=readme).
 
 ## MCP tools
 
@@ -478,14 +547,13 @@ agents can pick the right one without trial-and-error:
 
 - **Content:** `write_note`, `read_note`, `edit_note`, `move_note`,
   `delete_note`, `read_content`, `view_note`
-- **Search & discovery:** `search`, `search_notes`, `recent_activity`,
-  `list_directory`
-- **Knowledge graph:** `build_context` (navigates `memory://` URLs),
-  `canvas` (Obsidian canvas generation)
-- **Projects:** `list_memory_projects`, `create_memory_project`,
-  `get_current_project`, `sync_status`
+- **Search & discovery:** `search_notes`, `recent_activity`, `list_directory`
+- **Knowledge graph:** `build_context` (navigates `memory://` URLs)
+- **Projects:** `list_memory_projects`, `list_workspaces`,
+  `create_memory_project`, `delete_project`
 - **Schema:** `schema_infer`, `schema_validate`, `schema_diff`
-- **Cloud:** `cloud_info`, `release_notes`
+- **Compatibility & diagnostics:** `search`, `fetch`,
+  `basic_memory_diagnostics`
 
 All MCP tools default to text output; pass `output_format="json"` for
 structured responses. Full tool reference in the
@@ -499,6 +567,11 @@ basic-memory project list
 basic-memory project add research ~/research
 basic-memory project set-cloud research   # route through cloud
 basic-memory project set-local research   # revert
+
+# Config
+basic-memory config list                        # all settings, effective values, env overrides
+basic-memory config set cli_output_style plain  # validated through the config model
+basic-memory config unset cli_output_style      # revert to default
 
 # Health & maintenance
 basic-memory status
@@ -514,7 +587,7 @@ basic-memory import memory-json
 
 Routing flags (`--local` / `--cloud`) force a target when you're in mixed
 mode. Full CLI reference in the
-[docs](https://docs.basicmemory.com/guides/cli-reference/?utm_source=github&utm_medium=referral&utm_campaign=readme).
+[docs](https://docs.basicmemory.com/reference/cli-reference?utm_source=github&utm_medium=referral&utm_campaign=readme).
 
 ## Auto-updates
 
@@ -580,7 +653,7 @@ retention).
 | `BASIC_MEMORY_IMPORT_UPLOAD_MAX_BYTES` | `104857600` | Max uploaded import size |
 
 ```bash
-BASIC_MEMORY_LOG_LEVEL=DEBUG basic-memory sync
+BASIC_MEMORY_LOG_LEVEL=DEBUG basic-memory reindex
 tail -f ~/.basic-memory/basic-memory.log
 ```
 

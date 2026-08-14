@@ -6,10 +6,13 @@ import pytest
 from httpx import AsyncClient
 from pathlib import Path
 
+from basic_memory import db
 from basic_memory.deps.services import get_search_service_v2_external
 from basic_memory.models import Project
 from basic_memory.repository.search_index_row import SearchIndexRow
 from basic_memory.repository.semantic_errors import (
+    RerankProviderContractError,
+    RerankTransientError,
     SemanticDependenciesMissingError,
     SemanticSearchDisabledError,
 )
@@ -26,7 +29,8 @@ async def create_test_entity(
     await file_service.write_file(file_path, test_content)
 
     # Create entity
-    entity = await entity_repository.create(entity_data)
+    async with db.scoped_session(search_service.session_maker) as session:
+        entity = await entity_repository.create(session, entity_data)
 
     # Index for search
     await search_service.index_entity(entity)
@@ -69,6 +73,25 @@ async def test_search_entities(
 
 
 @pytest.mark.asyncio
+async def test_query_search_uses_same_contract_and_advertises_media_type(
+    client: AsyncClient,
+    app,
+    v2_project_url: str,
+):
+    """QUERY is canonical while POST remains the documented compatibility route."""
+    response = await client.request(
+        "QUERY",
+        f"{v2_project_url}/search/",
+        json={"text": "safe search"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["Accept-Query"] == "application/json"
+    search_path = app.openapi()["paths"]["/v2/projects/{project_id}/search/"]
+    assert set(search_path) == {"post"}
+
+
+@pytest.mark.asyncio
 async def test_search_with_pagination(
     client: AsyncClient,
     test_project: Project,
@@ -103,6 +126,7 @@ async def test_search_with_pagination(
     assert data["current_page"] == 1
     assert data["page_size"] == 3
     assert data["total"] == 5
+    assert data["total_is_exact"] is True
     assert data["has_more"] is True
 
     response = await client.post(
@@ -116,6 +140,7 @@ async def test_search_with_pagination(
     assert data["current_page"] == 2
     assert data["page_size"] == 3
     assert data["total"] == 5
+    assert data["total_is_exact"] is True
     assert data["has_more"] is False
     assert len(data["results"]) == 2
 
@@ -151,6 +176,7 @@ async def test_search_with_item_type_filter_returns_total(
     assert response.status_code == 200
     data = response.json()
     assert data["total"] == 5
+    assert data["total_is_exact"] is True
     assert data["has_more"] is True
     assert len(data["results"]) == 3
 
@@ -323,6 +349,7 @@ async def test_search_whitespace_text_is_treated_as_empty(
     assert response.status_code == 200
     data = response.json()
     assert data["total"] == 0
+    assert data["total_is_exact"] is True
     assert data["has_more"] is False
     assert data["results"] == []
 
@@ -431,6 +458,58 @@ async def test_search_router_returns_400_for_semantic_missing_deps(
 
 
 @pytest.mark.asyncio
+async def test_search_router_returns_503_for_transient_reranker_failure(
+    client: AsyncClient, app, v2_project_url
+):
+    """A transient reranker outage should be retryable, not silently reorder results."""
+
+    class RaisingSearchService:
+        async def search(self, *args, **kwargs):
+            raise RerankTransientError("Reranker is temporarily unavailable.")
+
+        async def count(self, *args, **kwargs):
+            raise RerankTransientError("Reranker is temporarily unavailable.")
+
+    app.dependency_overrides[get_search_service_v2_external] = lambda: RaisingSearchService()
+    try:
+        response = await client.post(
+            f"{v2_project_url}/search/",
+            json={"text": "semantic query", "retrieval_mode": "hybrid"},
+        )
+    finally:
+        app.dependency_overrides.pop(get_search_service_v2_external, None)
+
+    assert response.status_code == 503
+    assert "temporarily unavailable" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_search_router_returns_502_for_reranker_contract_failure(
+    client: AsyncClient, app, v2_project_url
+):
+    """A malformed upstream reranker response should map to a provider 502."""
+
+    class RaisingSearchService:
+        async def search(self, *args, **kwargs):
+            raise RerankProviderContractError("Reranker returned malformed scores.")
+
+        async def count(self, *args, **kwargs):
+            raise RerankProviderContractError("Reranker returned malformed scores.")
+
+    app.dependency_overrides[get_search_service_v2_external] = lambda: RaisingSearchService()
+    try:
+        response = await client.post(
+            f"{v2_project_url}/search/",
+            json={"text": "semantic query", "retrieval_mode": "hybrid"},
+        )
+    finally:
+        app.dependency_overrides.pop(get_search_service_v2_external, None)
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "Reranker returned malformed scores."
+
+
+@pytest.mark.asyncio
 async def test_search_router_returns_400_for_invalid_vector_query(
     client: AsyncClient, app, v2_project_url
 ):
@@ -457,10 +536,12 @@ async def test_search_router_returns_400_for_invalid_vector_query(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("retrieval_mode", ["vector", "hybrid"])
 async def test_semantic_search_uses_probe_pagination_without_count(
     client: AsyncClient,
     app,
     v2_project_url: str,
+    retrieval_mode: str,
 ):
     """Semantic searches should not run an extra count query."""
     now = datetime.now(timezone.utc)
@@ -481,7 +562,7 @@ async def test_semantic_search_uses_probe_pagination_without_count(
 
     class FakeSearchService:
         async def search(self, query, *, limit, offset):
-            assert query.retrieval_mode.value == "vector"
+            assert query.retrieval_mode.value == retrieval_mode
             assert limit == 3
             assert offset == 0
             return fake_rows
@@ -493,7 +574,7 @@ async def test_semantic_search_uses_probe_pagination_without_count(
     try:
         response = await client.post(
             f"{v2_project_url}/search/",
-            json={"text": "semantic query", "retrieval_mode": "vector"},
+            json={"text": "semantic query", "retrieval_mode": retrieval_mode},
             params={"page": 1, "page_size": 2},
         )
     finally:
@@ -502,6 +583,7 @@ async def test_semantic_search_uses_probe_pagination_without_count(
     assert response.status_code == 200
     data = response.json()
     assert data["total"] == 0
+    assert data["total_is_exact"] is False
     assert data["has_more"] is True
     assert len(data["results"]) == 2
 

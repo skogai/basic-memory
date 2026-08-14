@@ -8,6 +8,7 @@ import pytest
 
 import pytest_asyncio
 
+from basic_memory import db
 from basic_memory.models.knowledge import Entity as EntityModel
 from basic_memory.repository import EntityRepository
 from basic_memory.schemas.base import Entity as EntitySchema
@@ -78,18 +79,20 @@ async def test_entities(entity_service, file_service):
     )
 
     # non markdown entity
-    e7 = await entity_service.repository.add(
-        EntityModel(
-            title="Image.png",
-            note_type="file",
-            content_type="image/png",
-            file_path="Image.png",
-            permalink="image",  # Required for Postgres NOT NULL constraint
-            created_at=datetime.now(timezone.utc),
-            updated_at=datetime.now(timezone.utc),
-            project_id=entity_service.repository.project_id,
+    async with db.scoped_session(entity_service.session_maker) as session:
+        e7 = await entity_service.repository.add(
+            session,
+            EntityModel(
+                title="Image.png",
+                note_type="file",
+                content_type="image/png",
+                file_path="Image.png",
+                permalink="image",  # Required for Postgres NOT NULL constraint
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc),
+                project_id=entity_service.repository.project_id,
+            ),
         )
-    )
 
     e8 = await entity_service.create_entity(  # duplicate title
         EntitySchema(
@@ -104,13 +107,15 @@ async def test_entities(entity_service, file_service):
 
 
 @pytest_asyncio.fixture
-async def link_resolver(entity_repository, search_service, test_entities):
+async def link_resolver(
+    entity_repository, search_service, test_entities, session_maker, app_config
+):
     """Create LinkResolver instance with indexed test data."""
     # Index all test entities
     for entity in test_entities:
         await search_service.index_entity(entity)
 
-    return LinkResolver(entity_repository, search_service)
+    return LinkResolver(entity_repository, search_service, session_maker, app_config)
 
 
 @pytest.fixture
@@ -481,10 +486,11 @@ async def test_exact_match_types_in_strict_mode(link_resolver, test_entities, pr
     assert result is not None
     assert result.permalink == f"{project_prefix}/components/core-service"
 
-    # 2. Exact title match
-    result = await link_resolver.resolve_link("Core Service", strict=True)
+    # 2. Exact title match (unique title — an ambiguous title is covered separately by
+    #    test_duplicate_title_raises_ambiguous_in_strict_mode).
+    result = await link_resolver.resolve_link("Auth Service", strict=True)
     assert result is not None
-    assert result.permalink == f"{project_prefix}/components/core-service"
+    assert result.permalink == f"{project_prefix}/components/auth-service"
 
     # 3. Exact file path match
     result = await link_resolver.resolve_link("components/Core Service.md", strict=True)
@@ -525,11 +531,13 @@ async def test_fuzzy_matching_blocked_in_strict_mode(link_resolver, test_entitie
 async def test_link_normalization_with_strict_mode(link_resolver, test_entities, project_prefix):
     """Test that link normalization still works in strict mode."""
 
-    # Test bracket removal and alias handling in strict mode
+    # Test bracket removal and alias handling in strict mode. Use a unique title so this
+    # exercises normalization, not duplicate-title resolution (ambiguity is covered by
+    # test_duplicate_title_raises_ambiguous_in_strict_mode).
     queries_and_expected = [
-        ("[[Core Service]]", f"{project_prefix}/components/core-service"),
-        ("[[Core Service|Main]]", f"{project_prefix}/components/core-service"),
-        ("  [[  Core Service  ]]  ", f"{project_prefix}/components/core-service"),
+        ("[[Auth Service]]", f"{project_prefix}/components/auth-service"),
+        ("[[Auth Service|Main]]", f"{project_prefix}/components/auth-service"),
+        ("  [[  Auth Service  ]]  ", f"{project_prefix}/components/auth-service"),
     ]
 
     for query, expected_permalink in queries_and_expected:
@@ -539,55 +547,226 @@ async def test_link_normalization_with_strict_mode(link_resolver, test_entities,
 
 
 @pytest.mark.asyncio
-async def test_duplicate_title_handling_in_strict_mode(
+async def test_duplicate_title_raises_ambiguous_in_strict_mode(
     link_resolver, test_entities, project_prefix
 ):
-    """Test how duplicate titles are handled in strict mode."""
+    """Strict resolution refuses to guess between same-title notes (#1148).
 
-    # "Core Service" appears twice in test data (components/core-service and components2/core-service)
-    # In strict mode, if there are multiple exact title matches, it should still return the first one
-    # (same behavior as normal mode for exact matches)
+    "Core Service" appears twice (components/core-service and components2/core-service). A
+    destructive (strict) resolve — edit_note / move_note — must fail loud instead of silently
+    picking the shortest path, which is how those tools landed on the wrong entity when an
+    original and a `-1` duplicate coexisted.
+    """
+    from basic_memory.services.exceptions import AmbiguousIdentifierError
 
-    result = await link_resolver.resolve_link("Core Service", strict=True)
+    with pytest.raises(AmbiguousIdentifierError) as exc_info:
+        await link_resolver.resolve_link("Core Service", strict=True)
+
+    message = str(exc_info.value)
+    assert "Core Service" in message
+    assert f"{project_prefix}/components/core-service" in message
+    assert f"{project_prefix}/components2/core-service" in message
+    assert "exact permalink or external_id" in message
+    # Both candidates are exposed for programmatic handling.
+    assert len(exc_info.value.candidates) == 2
+
+
+@pytest.mark.asyncio
+async def test_duplicate_title_non_strict_keeps_shortest_path(link_resolver, project_prefix):
+    """Non-strict resolution (wiki links, reads) still picks shortest path and never raises."""
+    result = await link_resolver.resolve_link("Core Service", strict=False)
     assert result is not None
-    # Should return the first match (components/core-service based on test fixture order)
     assert result.permalink == f"{project_prefix}/components/core-service"
 
 
 @pytest.mark.asyncio
+async def test_unique_title_still_resolves_in_strict_mode(link_resolver, project_prefix):
+    """A title with a single match is unaffected — strict resolution returns it, no error."""
+    result = await link_resolver.resolve_link("Auth Service", strict=True)
+    assert result is not None
+    assert result.permalink == f"{project_prefix}/components/auth-service"
+
+
+@pytest.mark.asyncio
+async def test_exact_file_path_wins_over_ambiguous_title_in_strict_mode(
+    entity_repository, session_maker, link_resolver
+):
+    """An exact, unique file path disambiguates even when the title is shared (#1148, P2).
+
+    Two notes share the title "Diagram.png"; only one has file_path equal to the identifier.
+    File paths are part of the resolver contract and more precise than a title, so strict
+    resolution must return the exact-path match rather than raising AmbiguousIdentifierError.
+    Permalinks here are non-derived so the permalink step does not short-circuit first.
+    """
+    now = datetime.now(timezone.utc)
+    async with db.scoped_session(session_maker) as session:
+        await entity_repository.add(
+            session,
+            EntityModel(
+                title="Diagram.png",
+                note_type="file",
+                content_type="image/png",
+                file_path="Diagram.png",
+                permalink="diagram-root",
+                created_at=now,
+                updated_at=now,
+                project_id=entity_repository.project_id,
+            ),
+        )
+        await entity_repository.add(
+            session,
+            EntityModel(
+                title="Diagram.png",
+                note_type="file",
+                content_type="image/png",
+                file_path="archive/old-diagram.png",
+                permalink="diagram-archive",
+                created_at=now,
+                updated_at=now,
+                project_id=entity_repository.project_id,
+            ),
+        )
+
+    result = await link_resolver.resolve_link("Diagram.png", strict=True)
+    assert result is not None
+    assert result.file_path == "Diagram.png"
+    assert result.permalink == "diagram-root"
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_title_not_bypassed_via_title_derived_permalink_in_strict_mode(
+    entity_repository, session_maker, link_resolver
+):
+    """A duplicated title must not resolve via its own slug under a strict op (#1148, P1 follow-up).
+
+    The original owns the title-derived permalink ("widget"); a duplicate got "widget-1".
+    build_permalink_resolution_candidates slugifies "Widget" to "widget", so without the guard the
+    permalink step would silently return the original for edit/move. A strict resolve of the bare
+    (ambiguous) title must raise; an exact permalink still resolves precisely.
+    """
+    from basic_memory.services.exceptions import AmbiguousIdentifierError
+
+    now = datetime.now(timezone.utc)
+    async with db.scoped_session(session_maker) as session:
+        await entity_repository.add(
+            session,
+            EntityModel(
+                title="Widget",
+                note_type="note",
+                content_type="text/markdown",
+                file_path="Widget.md",
+                permalink="widget",
+                created_at=now,
+                updated_at=now,
+                project_id=entity_repository.project_id,
+            ),
+        )
+        await entity_repository.add(
+            session,
+            EntityModel(
+                title="Widget",
+                note_type="note",
+                content_type="text/markdown",
+                file_path="archive/Widget.md",
+                permalink="widget-1",
+                created_at=now,
+                updated_at=now,
+                project_id=entity_repository.project_id,
+            ),
+        )
+
+    # Bare, ambiguous title raises even though a title-derived permalink ("widget") exists.
+    with pytest.raises(AmbiguousIdentifierError):
+        await link_resolver.resolve_link("Widget", strict=True)
+
+    # An exact permalink is a precise pointer and still resolves.
+    result = await link_resolver.resolve_link("widget", strict=True)
+    assert result is not None
+    assert result.permalink == "widget"
+
+
+@pytest.mark.asyncio
+async def test_exact_custom_permalink_resolves_despite_ambiguous_title_in_strict_mode(
+    entity_repository, session_maker, link_resolver
+):
+    """An explicit non-slug permalink is accepted verbatim even when the title is shared (#1148).
+
+    Custom frontmatter permalinks (e.g. "API_V2") are not slug-shaped, so exactness must come from
+    the raw candidate that matched, not from slug shape. A caller passing that exact permalink must
+    resolve to its entity — otherwise the ambiguity error would name a permalink the resolver then
+    refuses to accept.
+    """
+    now = datetime.now(timezone.utc)
+    async with db.scoped_session(session_maker) as session:
+        await entity_repository.add(
+            session,
+            EntityModel(
+                title="API_V2",
+                note_type="note",
+                content_type="text/markdown",
+                file_path="API_V2.md",
+                permalink="API_V2",
+                created_at=now,
+                updated_at=now,
+                project_id=entity_repository.project_id,
+            ),
+        )
+        await entity_repository.add(
+            session,
+            EntityModel(
+                title="API_V2",
+                note_type="note",
+                content_type="text/markdown",
+                file_path="archive/API_V2.md",
+                permalink="api-v2-1",
+                created_at=now,
+                updated_at=now,
+                project_id=entity_repository.project_id,
+            ),
+        )
+
+    result = await link_resolver.resolve_link("API_V2", strict=True)
+    assert result is not None
+    assert result.permalink == "API_V2"
+
+
+@pytest.mark.asyncio
 async def test_cross_project_link_resolution(
-    session_maker, entity_repository, search_service, tmp_path
+    session_maker, entity_repository, search_service, tmp_path, app_config
 ):
     """Test resolving explicit cross-project links."""
     from basic_memory.repository.project_repository import ProjectRepository
 
-    project_repo = ProjectRepository(session_maker)
-    other_project = await project_repo.create(
-        {
-            "name": "other-project",
-            "description": "Secondary project",
-            "path": str(tmp_path / "other-project"),
-            "is_active": True,
-            "is_default": False,
-        }
-    )
-
-    now = datetime.now(timezone.utc)
-    other_entity_repo = EntityRepository(session_maker, project_id=other_project.id)
-    target = await other_entity_repo.add(
-        EntityModel(
-            title="Cross Project Note",
-            note_type="note",
-            content_type="text/markdown",
-            file_path="docs/Cross Project Note.md",
-            permalink=f"{other_project.permalink}/docs/cross-project-note",
-            created_at=now,
-            updated_at=now,
-            project_id=other_project.id,
+    project_repo = ProjectRepository()
+    async with db.scoped_session(session_maker) as session:
+        other_project = await project_repo.create(
+            session,
+            {
+                "name": "other-project",
+                "description": "Secondary project",
+                "path": str(tmp_path / "other-project"),
+                "is_active": True,
+                "is_default": False,
+            },
         )
-    )
 
-    resolver = LinkResolver(entity_repository, search_service)
+        now = datetime.now(timezone.utc)
+        other_entity_repo = EntityRepository(project_id=other_project.id)
+        target = await other_entity_repo.add(
+            session,
+            EntityModel(
+                title="Cross Project Note",
+                note_type="note",
+                content_type="text/markdown",
+                file_path="docs/Cross Project Note.md",
+                permalink=f"{other_project.permalink}/docs/cross-project-note",
+                created_at=now,
+                updated_at=now,
+                project_id=other_project.id,
+            ),
+        )
+
+    resolver = LinkResolver(entity_repository, search_service, session_maker, app_config)
     resolved = await resolver.resolve_link("other-project::Cross Project Note", strict=True)
 
     assert resolved is not None
@@ -601,7 +780,7 @@ async def test_cross_project_link_resolution(
 
 
 @pytest_asyncio.fixture
-async def context_aware_entities(entity_repository):
+async def context_aware_entities(entity_repository, session_maker):
     """Create entities for testing context-aware resolution.
 
     Structure:
@@ -621,123 +800,133 @@ async def context_aware_entities(entity_repository):
     now = datetime.now(timezone.utc)
     project_id = entity_repository.project_id
 
-    # Root level testing.md
-    e1 = await entity_repository.add(
-        EntityModel(
-            title="testing",
-            note_type="note",
-            content_type="text/markdown",
-            file_path="testing.md",
-            permalink="testing",
-            created_at=now,
-            updated_at=now,
-            project_id=project_id,
+    async with db.scoped_session(session_maker) as session:
+        # Root level testing.md
+        e1 = await entity_repository.add(
+            session,
+            EntityModel(
+                title="testing",
+                note_type="note",
+                content_type="text/markdown",
+                file_path="testing.md",
+                permalink="testing",
+                created_at=now,
+                updated_at=now,
+                project_id=project_id,
+            ),
         )
-    )
-    entities.append(e1)
+        entities.append(e1)
 
-    # main/testing/testing.md
-    e2 = await entity_repository.add(
-        EntityModel(
-            title="testing",
-            note_type="note",
-            content_type="text/markdown",
-            file_path="main/testing/testing.md",
-            permalink="main/testing/testing",
-            created_at=now,
-            updated_at=now,
-            project_id=project_id,
+        # main/testing/testing.md
+        e2 = await entity_repository.add(
+            session,
+            EntityModel(
+                title="testing",
+                note_type="note",
+                content_type="text/markdown",
+                file_path="main/testing/testing.md",
+                permalink="main/testing/testing",
+                created_at=now,
+                updated_at=now,
+                project_id=project_id,
+            ),
         )
-    )
-    entities.append(e2)
+        entities.append(e2)
 
-    # main/testing/another-test.md
-    e3 = await entity_repository.add(
-        EntityModel(
-            title="another-test",
-            note_type="note",
-            content_type="text/markdown",
-            file_path="main/testing/another-test.md",
-            permalink="main/testing/another-test",
-            created_at=now,
-            updated_at=now,
-            project_id=project_id,
+        # main/testing/another-test.md
+        e3 = await entity_repository.add(
+            session,
+            EntityModel(
+                title="another-test",
+                note_type="note",
+                content_type="text/markdown",
+                file_path="main/testing/another-test.md",
+                permalink="main/testing/another-test",
+                created_at=now,
+                updated_at=now,
+                project_id=project_id,
+            ),
         )
-    )
-    entities.append(e3)
+        entities.append(e3)
 
-    # other/testing.md
-    e4 = await entity_repository.add(
-        EntityModel(
-            title="testing",
-            note_type="note",
-            content_type="text/markdown",
-            file_path="other/testing.md",
-            permalink="other/testing",
-            created_at=now,
-            updated_at=now,
-            project_id=project_id,
+        # other/testing.md
+        e4 = await entity_repository.add(
+            session,
+            EntityModel(
+                title="testing",
+                note_type="note",
+                content_type="text/markdown",
+                file_path="other/testing.md",
+                permalink="other/testing",
+                created_at=now,
+                updated_at=now,
+                project_id=project_id,
+            ),
         )
-    )
-    entities.append(e4)
+        entities.append(e4)
 
-    # deep/nested/folder/note.md
-    e5 = await entity_repository.add(
-        EntityModel(
-            title="note",
-            note_type="note",
-            content_type="text/markdown",
-            file_path="deep/nested/folder/note.md",
-            permalink="deep/nested/folder/note",
-            created_at=now,
-            updated_at=now,
-            project_id=project_id,
+        # deep/nested/folder/note.md
+        e5 = await entity_repository.add(
+            session,
+            EntityModel(
+                title="note",
+                note_type="note",
+                content_type="text/markdown",
+                file_path="deep/nested/folder/note.md",
+                permalink="deep/nested/folder/note",
+                created_at=now,
+                updated_at=now,
+                project_id=project_id,
+            ),
         )
-    )
-    entities.append(e5)
+        entities.append(e5)
 
-    # deep/note.md (for ancestor testing)
-    e6 = await entity_repository.add(
-        EntityModel(
-            title="note",
-            note_type="note",
-            content_type="text/markdown",
-            file_path="deep/note.md",
-            permalink="deep/note",
-            created_at=now,
-            updated_at=now,
-            project_id=project_id,
+        # deep/note.md (for ancestor testing)
+        e6 = await entity_repository.add(
+            session,
+            EntityModel(
+                title="note",
+                note_type="note",
+                content_type="text/markdown",
+                file_path="deep/note.md",
+                permalink="deep/note",
+                created_at=now,
+                updated_at=now,
+                project_id=project_id,
+            ),
         )
-    )
-    entities.append(e6)
+        entities.append(e6)
 
-    # note.md at root (for ancestor testing)
-    e7 = await entity_repository.add(
-        EntityModel(
-            title="note",
-            note_type="note",
-            content_type="text/markdown",
-            file_path="note.md",
-            permalink="note",
-            created_at=now,
-            updated_at=now,
-            project_id=project_id,
+        # note.md at root (for ancestor testing)
+        e7 = await entity_repository.add(
+            session,
+            EntityModel(
+                title="note",
+                note_type="note",
+                content_type="text/markdown",
+                file_path="note.md",
+                permalink="note",
+                created_at=now,
+                updated_at=now,
+                project_id=project_id,
+            ),
         )
-    )
-    entities.append(e7)
+        entities.append(e7)
 
     return entities
 
 
 @pytest_asyncio.fixture
-async def context_link_resolver(entity_repository, search_service, context_aware_entities):
+async def context_link_resolver(
+    entity_repository, search_service, context_aware_entities, session_maker, app_config
+):
     """Create LinkResolver instance with context-aware test data.
 
     Note: We don't index entities for search because these tests focus on
     exact title/permalink matching, not fuzzy search. The entities are
     database-only records (no files on disk).
     """
-    return LinkResolver(entity_repository, search_service)
+    return LinkResolver(entity_repository, search_service, session_maker, app_config)
 
 
 @pytest.mark.asyncio
@@ -903,7 +1092,7 @@ async def test_nonexistent_link_with_source_path(context_link_resolver):
 
 
 @pytest_asyncio.fixture
-async def relative_path_entities(entity_repository):
+async def relative_path_entities(entity_repository, session_maker):
     """Create entities for testing relative path resolution.
 
     Structure:
@@ -920,73 +1109,80 @@ async def relative_path_entities(entity_repository):
     now = datetime.now(timezone.utc)
     project_id = entity_repository.project_id
 
-    # testing/link-test.md (source file)
-    e1 = await entity_repository.add(
-        EntityModel(
-            title="link-test",
-            note_type="note",
-            content_type="text/markdown",
-            file_path="testing/link-test.md",
-            permalink="testing/link-test",
-            created_at=now,
-            updated_at=now,
-            project_id=project_id,
+    async with db.scoped_session(session_maker) as session:
+        # testing/link-test.md (source file)
+        e1 = await entity_repository.add(
+            session,
+            EntityModel(
+                title="link-test",
+                note_type="note",
+                content_type="text/markdown",
+                file_path="testing/link-test.md",
+                permalink="testing/link-test",
+                created_at=now,
+                updated_at=now,
+                project_id=project_id,
+            ),
         )
-    )
-    entities.append(e1)
+        entities.append(e1)
 
-    # testing/nested/deep-note.md (relative target)
-    e2 = await entity_repository.add(
-        EntityModel(
-            title="deep-note",
-            note_type="note",
-            content_type="text/markdown",
-            file_path="testing/nested/deep-note.md",
-            permalink="testing/nested/deep-note",
-            created_at=now,
-            updated_at=now,
-            project_id=project_id,
+        # testing/nested/deep-note.md (relative target)
+        e2 = await entity_repository.add(
+            session,
+            EntityModel(
+                title="deep-note",
+                note_type="note",
+                content_type="text/markdown",
+                file_path="testing/nested/deep-note.md",
+                permalink="testing/nested/deep-note",
+                created_at=now,
+                updated_at=now,
+                project_id=project_id,
+            ),
         )
-    )
-    entities.append(e2)
+        entities.append(e2)
 
-    # nested/deep-note.md (absolute path target)
-    e3 = await entity_repository.add(
-        EntityModel(
-            title="deep-note",
-            note_type="note",
-            content_type="text/markdown",
-            file_path="nested/deep-note.md",
-            permalink="nested/deep-note",
-            created_at=now,
-            updated_at=now,
-            project_id=project_id,
+        # nested/deep-note.md (absolute path target)
+        e3 = await entity_repository.add(
+            session,
+            EntityModel(
+                title="deep-note",
+                note_type="note",
+                content_type="text/markdown",
+                file_path="nested/deep-note.md",
+                permalink="nested/deep-note",
+                created_at=now,
+                updated_at=now,
+                project_id=project_id,
+            ),
         )
-    )
-    entities.append(e3)
+        entities.append(e3)
 
-    # other/file.md
-    e4 = await entity_repository.add(
-        EntityModel(
-            title="file",
-            note_type="note",
-            content_type="text/markdown",
-            file_path="other/file.md",
-            permalink="other/file",
-            created_at=now,
-            updated_at=now,
-            project_id=project_id,
+        # other/file.md
+        e4 = await entity_repository.add(
+            session,
+            EntityModel(
+                title="file",
+                note_type="note",
+                content_type="text/markdown",
+                file_path="other/file.md",
+                permalink="other/file",
+                created_at=now,
+                updated_at=now,
+                project_id=project_id,
+            ),
         )
-    )
-    entities.append(e4)
+        entities.append(e4)
 
     return entities
 
 
 @pytest_asyncio.fixture
-async def relative_path_resolver(entity_repository, search_service, relative_path_entities):
+async def relative_path_resolver(
+    entity_repository, search_service, relative_path_entities, session_maker, app_config
+):
     """Create LinkResolver instance with relative path test data."""
-    return LinkResolver(entity_repository, search_service)
+    return LinkResolver(entity_repository, search_service, session_maker, app_config)
 
 
 @pytest.mark.asyncio

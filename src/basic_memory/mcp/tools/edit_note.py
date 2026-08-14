@@ -1,14 +1,21 @@
 """Edit note tool for Basic Memory MCP server."""
 
-from typing import Annotated, Optional, Literal
+from typing import Any, TYPE_CHECKING, Annotated, Literal, Optional
 
 import logfire
+from httpx import HTTPStatusError
 from loguru import logger
 from fastmcp import Context
-from pydantic import AliasChoices, Field
+from fastmcp.exceptions import ToolError
+from pydantic import AliasChoices, BeforeValidator, Field
+
+if TYPE_CHECKING:  # pragma: no cover
+    from basic_memory.mcp.clients import KnowledgeClient
 
 from basic_memory.config import ConfigManager
+from basic_memory.ignore_utils import IGNORED_PATH_REJECTION_DETAIL
 from basic_memory.mcp.project_context import (
+    UnresolvedProjectRouteError,
     _workspace_identifier_discovery_available,
     detect_project_from_memory_url_prefix,
     get_project_client,
@@ -16,13 +23,23 @@ from basic_memory.mcp.project_context import (
     resolve_project_and_path,
 )
 from basic_memory.mcp.server import mcp
+from basic_memory.mcp.tools.utils import _extract_response_data, _response_detail_text
 from basic_memory.schemas.base import Entity
 from basic_memory.schemas.response import EntityResponse
 from basic_memory.services.link_resolver import (
     detect_project_from_workspace_identifier_prefix,
     is_workspace_qualified_plain_identifier,
 )
-from basic_memory.utils import normalize_project_reference, validate_project_path
+from basic_memory.utils import coerce_dict, normalize_project_reference, validate_project_path
+
+EDIT_OPERATIONS = (
+    "append",
+    "prepend",
+    "find_replace",
+    "replace_section",
+    "insert_before_section",
+    "insert_after_section",
+)
 
 
 def _parse_identifier_to_title_and_directory(identifier: str) -> tuple[str, str]:
@@ -50,6 +67,79 @@ def _parse_identifier_to_title_and_directory(identifier: str) -> tuple[str, str]
         title = cleaned
 
     return title, directory
+
+
+# Suffixes mimetypes maps to text/markdown (extension matching is case-insensitive),
+# mirroring FileService.is_markdown which gates the index-file endpoint server-side.
+_MARKDOWN_SUFFIXES = (".md", ".markdown")
+
+
+async def _resolve_after_disk_recovery(
+    knowledge_client: "KnowledgeClient",
+    identifier: str,
+) -> Optional[str]:
+    """Recover from a resolution miss when the note exists on disk but is not indexed.
+
+    Trigger: identifier resolution failed with "not found", but the identifier may map
+        to a markdown file written directly to disk before the watcher indexed it (#581).
+    Why: editing an on-disk note should not require a manual full reindex or watcher restart.
+    Outcome: the single file is indexed server-side and resolution is retried exactly
+        once. Returns None when the identifier does not map to an indexable file on
+        disk, so the caller keeps its existing not-found handling.
+    """
+    # Try the identifier as-is first so existing .markdown/.MD files are found; only
+    # fall back to appending markdown suffixes (".md" first, then ".markdown") when
+    # the identifier does not already carry one, so 'notes/foo.markdown' never becomes
+    # 'notes/foo.markdown.md' and a stem identifier still reaches 'notes/foo.markdown'.
+    candidates = [identifier]
+    if not identifier.lower().endswith(_MARKDOWN_SUFFIXES):
+        candidates.extend(f"{identifier}{suffix}" for suffix in _MARKDOWN_SUFFIXES)
+
+    for candidate in candidates:
+        try:
+            indexed = await knowledge_client.index_file(candidate)
+        except ToolError as index_error:
+            # Trigger: the index-file request failed
+            # Why: 400/404 are the expected "nothing to recover" rejections (missing
+            #      file, traversal, non-markdown) — except the ignored-path 400, which
+            #      means the file exists on disk but the ignore rules forbid indexing
+            #      it, so falling through to auto-create would silently shadow the
+            #      file. Anything else — auth, server, transport-level failures — is a
+            #      real error that must not be masked as a not-found miss.
+            # Outcome: ignored-path rejections raise a clear ToolError; other expected
+            #      rejections try the next candidate or fall through to the caller's
+            #      existing not-found behavior; unexpected failures propagate.
+            cause = index_error.__cause__
+            candidate_rejected = isinstance(
+                cause, HTTPStatusError
+            ) and cause.response.status_code in (400, 404)
+            if not candidate_rejected:
+                raise
+            detail = _response_detail_text(_extract_response_data(cause.response)) or ""
+            if IGNORED_PATH_REJECTION_DETAIL in detail:
+                raise ToolError(
+                    f"Note file '{candidate}' exists on disk but {IGNORED_PATH_REJECTION_DETAIL} "
+                    "and will not be edited"
+                ) from index_error
+            logger.debug(f"edit_note disk recovery skipped for '{candidate}': {index_error}")
+            continue
+
+        # Trigger: index-file succeeded and returned the indexed entity.
+        # Why: the server may have canonicalized the path casing (notes/Disk-Note ->
+        #      notes/disk-note.md), so strictly re-resolving the raw identifier can
+        #      still miss the entity we just indexed.
+        # Outcome: use the entity identity from the index-file response directly; only
+        #      fall back to a strict re-resolve when an older server omits external_id,
+        #      and let that re-resolve fail loudly instead of guessing.
+        if indexed.external_id:
+            logger.info(
+                f"edit_note indexed unindexed file '{candidate}' as entity {indexed.external_id}"
+            )
+            return indexed.external_id
+        logger.info(f"edit_note indexed unindexed file '{candidate}'; retrying resolution")
+        return await knowledge_client.resolve_entity(identifier, strict=True)
+
+    return None
 
 
 def _compose_workspace_project_route(
@@ -104,6 +194,38 @@ Retry with one of these explicit routes:
 - `edit_note(identifier="{note_identifier}", project_id="<project external_id>", operation=..., content=...)`"""
 
 
+def _format_unresolved_project_route_response(
+    *,
+    error: UnresolvedProjectRouteError,
+    active_project: str,
+) -> str:
+    """Format a safe stop when a mutating memory URL cannot be routed."""
+    return f"""# Edit Failed - Unresolved Project Route
+
+The memory URL `{error.identifier}` starts with the project route `{error.project_prefix}`, but that project could not be resolved.
+
+No note was edited or created. Basic Memory did not fall back to the active project `{active_project}`.
+
+## How to retry
+1. Use `list_memory_projects()` to confirm the workspace, project, and project ID.
+2. Correct the `memory://` URL so its project route exists, or pass the note path with an explicit `project` or `project_id`.
+3. If `{error.project_prefix}` is a directory in `{active_project}`, remove the `memory://` prefix and retry with `project="{active_project}"`."""
+
+
+def _format_cross_project_entity_response(
+    *,
+    identifier: str,
+    active_project: str,
+    target_project_id: str,
+) -> str:
+    """Format a safe stop when resolution finds a note in another project."""
+    return f"""# Edit Failed - Note Not Found In This Project
+
+The identifier `{identifier}` resolved to a note outside the selected project `{active_project}`, so no changes were made.
+
+Retry with `project_id="{target_project_id}"`, or use `list_memory_projects()` to confirm the intended project before editing."""
+
+
 def _format_error_response(
     error_message: str,
     operation: str,
@@ -126,7 +248,8 @@ The note with identifier '{identifier}' could not be found. The `find_replace` a
 ## Suggestions to try:
 1. **Use append/prepend instead**: These operations will create the note automatically if it doesn't exist
 2. **Search for the note first**: Use `search_notes("{project or "project-name"}", "{identifier.split("/")[-1]}")` to find similar notes with exact identifiers
-3. **Try different exact identifier formats**:
+3. **File exists on disk but is not indexed yet?**: edit_note indexes the file automatically when the identifier matches its path (e.g. 'folder/note' for 'folder/note.md'). If your identifier is a title or differs from the file path, run `basic-memory db reindex --search` or wait for the file watcher, then retry
+4. **Try different exact identifier formats**:
    - If you used a permalink like "folder/note-title", try the exact title: "{identifier.split("/")[-1].replace("-", " ").title()}"
    - If you used a title, try the exact permalink format: "{identifier.lower().replace(" ", "-")}"
    - Use `read_note("{project or "project-name"}", "{identifier}")` first to verify the note exists and get the exact identifier
@@ -223,12 +346,21 @@ Error editing note '{identifier}': {error_message}
 
 
 @mcp.tool(
-    description="Edit an existing markdown note using various operations like append, prepend, find_replace, replace_section, insert_before_section, or insert_after_section.",
-    annotations={"destructiveHint": False, "openWorldHint": False},
+    title="Edit Note",
+    description="Edit an existing markdown note using various operations like append, prepend, find_replace, replace_section, insert_before_section, or insert_after_section. Pass metadata to merge YAML frontmatter fields independent of the operation.",
+    tags={"notes"},
+    annotations={
+        "title": "Edit Note",
+        "readOnlyHint": False,
+        # find_replace and replace_section overwrite existing content, so the tool
+        # as a whole is not purely additive even though append/prepend are.
+        "destructiveHint": True,
+        "openWorldHint": False,
+    },
 )
 async def edit_note(
     identifier: str,
-    operation: str,
+    operation: Annotated[str, Field(json_schema_extra={"enum": list(EDIT_OPERATIONS)})],
     # Accept common replacement-content aliases. Models trained on diff/patch
     # APIs reach for new_content/replacement/replace_with on first try.
     content: Annotated[
@@ -258,9 +390,11 @@ async def edit_note(
         ),
     ] = None,
     expected_replacements: Optional[int] = None,
+    replace_subsections: Optional[bool] = None,
+    metadata: Annotated[Optional[dict[str, Any]], BeforeValidator(coerce_dict)] = None,
     output_format: Literal["text", "json"] = "text",
     context: Context | None = None,
-) -> str | dict:
+) -> str | dict[str, Any]:
     """Edit an existing markdown note in the knowledge base.
 
     Makes targeted changes to existing notes without rewriting the entire content.
@@ -277,7 +411,9 @@ async def edit_note(
                   - "append": Add content to the end of the note (creates the note if it doesn't exist)
                   - "prepend": Add content to the beginning of the note (creates the note if it doesn't exist)
                   - "find_replace": Replace occurrences of find_text with content (note must exist)
-                  - "replace_section": Replace content under a specific markdown header (note must exist)
+                  - "replace_section": Replace a markdown section identified by its header (note must exist).
+                    By default the section spans through the next heading of the same or higher
+                    level, so its subsections are replaced too; see replace_subsections.
                   - "insert_before_section": Insert content before a section heading without consuming it (note must exist)
                   - "insert_after_section": Insert content after a section heading without consuming it (note must exist)
         content: The content to add or use for replacement
@@ -292,6 +428,18 @@ async def edit_note(
         section: For replace_section operation - the markdown header to replace content under (e.g., "## Notes", "### Implementation")
         find_text: For find_replace operation - the text to find and replace
         expected_replacements: For find_replace operation - the expected number of replacements (validation will fail if actual doesn't match)
+        replace_subsections: For replace_section operation. Default (true): the section
+            spans everything through the next heading of the same or higher level in the
+            original note, so replacing "## Section" also replaces its "###" subsections —
+            the replacement content may freely introduce new headings. Set to false to
+            replace only the immediate content under the header, stopping at the next
+            heading of any level and preserving subsections.
+        metadata: Optional dict of frontmatter fields to merge, independent of `operation`.
+            Provided keys overwrite existing frontmatter values (or are added if new);
+            unrelated frontmatter keys and the note body are left untouched. Can be
+            combined with any operation in the same call. `title`, `type`, and `permalink`
+            are ignored since those have their own dedicated handling. Key deletion is
+            not supported.
         output_format: "text" returns the existing markdown summary. "json" returns
             machine-readable edit metadata.
         context: Optional FastMCP context for performance caching.
@@ -316,8 +464,11 @@ async def edit_note(
         # Replace text that appears multiple times - validate count first
         edit_note("team-docs", "docs/guide", "find_replace", "new-api", find_text="old-api", expected_replacements=5)
 
-        # Replace implementation section
+        # Replace implementation section (subsections under it are replaced too)
         edit_note("specs", "api-spec", "replace_section", "New implementation approach...\\n", section="## Implementation")
+
+        # Replace only the intro text under a header, keeping its subsections
+        edit_note("specs", "api-spec", "replace_section", "New intro...\\n", section="## Implementation", replace_subsections=False)
 
         # Replace subsection with more specific header
         edit_note("docs", "docs/setup", "replace_section", "Updated install steps\\n", section="### Installation")
@@ -336,6 +487,11 @@ async def edit_note(
         # Update status across document (expecting exactly 2 occurrences)
         edit_note("reports", "status-report", "find_replace", "In Progress", find_text="Not Started", expected_replacements=2)
 
+        # Update frontmatter fields without touching the body (any operation works;
+        # append with empty content is a no-op on the body itself)
+        edit_note("support", "tickets/2026-06-18-printer-offline", "append", "",
+                   metadata={"status": "resolved", "closed_at": "2026-06-18T10:42:00Z"})
+
     Raises:
         HTTPError: If project doesn't exist or is inaccessible
         ValueError: If operation is invalid or required parameters are missing
@@ -343,11 +499,14 @@ async def edit_note(
 
     Note:
         Edit operations require exact identifier matches. If unsure, use read_note() or
-        search_notes() first to find the correct identifier. The tool provides detailed
+        search_notes() first to find the correct identifier. When the identifier looks
+        like a file path and the file exists on disk but is not indexed yet, edit_note
+        indexes that file automatically and retries the edit. The tool provides detailed
         error messages with suggestions if operations fail.
     """
-    # Resolve effective default: allow MCP clients to send null for optional int field
+    # Resolve effective defaults: allow MCP clients to send null for optional scalar fields
     effective_replacements = expected_replacements if expected_replacements is not None else 1
+    effective_replace_subsections = replace_subsections if replace_subsections is not None else True
     project = _compose_workspace_project_route(
         workspace=workspace,
         project=project,
@@ -409,6 +568,8 @@ async def edit_note(
         has_section=bool(section),
         has_find_text=bool(find_text),
         expected_replacements=effective_replacements,
+        replace_subsections=effective_replace_subsections,
+        has_metadata=bool(metadata),
     ):
         async with get_project_client(project, context=context, project_id=project_id) as (
             client,
@@ -420,17 +581,9 @@ async def edit_note(
             )
 
             # Validate operation
-            valid_operations = [
-                "append",
-                "prepend",
-                "find_replace",
-                "replace_section",
-                "insert_before_section",
-                "insert_after_section",
-            ]
-            if operation not in valid_operations:
+            if operation not in EDIT_OPERATIONS:
                 raise ValueError(
-                    f"Invalid operation '{operation}'. Must be one of: {', '.join(valid_operations)}"
+                    f"Invalid operation '{operation}'. Must be one of: {', '.join(EDIT_OPERATIONS)}"
                 )
 
             # Validate required parameters for specific operations
@@ -439,6 +592,17 @@ async def edit_note(
             section_ops = ("replace_section", "insert_before_section", "insert_after_section")
             if operation in section_ops and not section:
                 raise ValueError("section parameter is required for section-based operations")
+            # Reject null metadata values before dispatch so both the edit path and the
+            # append/prepend auto-create fallback behave identically — the service-side
+            # guard only covers existing notes, and an auto-created note would otherwise
+            # be written with a YAML null that indexing silently filters out.
+            if metadata:
+                null_keys = sorted(k for k, v in metadata.items() if v is None)
+                if null_keys:
+                    raise ValueError(
+                        "metadata values cannot be null (key deletion is not supported): "
+                        + ", ".join(null_keys)
+                    )
 
             # Use the PATCH endpoint to edit the entity
             try:
@@ -447,12 +611,30 @@ async def edit_note(
 
                 # Use typed KnowledgeClient for API calls
                 knowledge_client = KnowledgeClient(client, active_project.external_id)
-                _, entity_identifier, _ = await resolve_project_and_path(
-                    client,
-                    identifier,
-                    active_project.name,
-                    context,
-                )
+                unresolved_project_route: UnresolvedProjectRouteError | None = None
+                try:
+                    _, entity_identifier, _ = await resolve_project_and_path(
+                        client,
+                        identifier,
+                        active_project.name,
+                        context,
+                        strict_project_routing=True,
+                    )
+                except UnresolvedProjectRouteError as route_error:
+                    # Trigger: a memory URL's first segment is not a project, which
+                    #   can also describe a valid active-project path such as
+                    #   memory://src/existing-note.
+                    # Why: existing indexed notes must remain editable, but a miss
+                    #   must never reach append/prepend auto-create.
+                    # Outcome: resolve once with the read-compatible fallback, then
+                    #   raise the saved route error if normal recovery still misses.
+                    unresolved_project_route = route_error
+                    _, entity_identifier, _ = await resolve_project_and_path(
+                        client,
+                        identifier,
+                        active_project.name,
+                        context,
+                    )
 
                 file_created = False
                 entity_id = ""
@@ -460,19 +642,57 @@ async def edit_note(
 
                 # Try to resolve the entity; for append/prepend, create it if not found
                 try:
-                    entity_id = await knowledge_client.resolve_entity(
+                    resolved_entity = await knowledge_client.resolve_entity_response(
                         entity_identifier,
                         strict=True,
                     )
+                    if resolved_entity.project_external_id != active_project.external_id:
+                        # Trigger: the link resolver found a note owned by another project.
+                        # Why: patching through the active project's endpoint would leak
+                        #   an internal entity ID in a misleading 404 and cannot succeed.
+                        # Outcome: stop before mutation and provide the owning project ID.
+                        if output_format == "json":
+                            return {
+                                "title": None,
+                                "permalink": None,
+                                "file_path": None,
+                                "checksum": None,
+                                "operation": operation,
+                                "fileCreated": False,
+                                "error": "CROSS_PROJECT_ENTITY",
+                                "project": active_project.name,
+                                "targetProjectId": resolved_entity.project_external_id,
+                            }
+                        return _format_cross_project_entity_response(
+                            identifier=identifier,
+                            active_project=active_project.name,
+                            target_project_id=resolved_entity.project_external_id,
+                        )
+                    entity_id = resolved_entity.external_id
                 except Exception as resolve_error:
-                    # Trigger: entity does not exist yet
-                    # Why: append/prepend can meaningfully create a new note from the content,
-                    #      while find_replace/replace_section require existing content to modify
-                    # Outcome: note is created via the same path as write_note
                     error_msg = str(resolve_error).lower()
                     is_not_found = "entity not found" in error_msg or "not found" in error_msg
 
-                    if is_not_found and operation in ("append", "prepend"):
+                    # Trigger: resolution missed but the file may already exist on disk
+                    # Why: files written directly to disk are invisible to identifier
+                    #      resolution until indexed; editing them should just work (#581)
+                    # Outcome: the single file is indexed and resolution retried once
+                    recovered_entity_id: str | None = None
+                    if is_not_found:
+                        recovered_entity_id = await _resolve_after_disk_recovery(
+                            knowledge_client, entity_identifier
+                        )
+
+                    if recovered_entity_id is not None:
+                        entity_id = recovered_entity_id
+                    elif is_not_found and unresolved_project_route is not None:
+                        raise unresolved_project_route
+                    elif is_not_found and operation in ("append", "prepend"):
+                        # Trigger: entity does not exist yet (on disk or in the index)
+                        # Why: append/prepend can meaningfully create a new note from the
+                        #      content, while find_replace/replace_section require existing
+                        #      content to modify
+                        # Outcome: note is created via the same path as write_note
                         title, directory = _parse_identifier_to_title_and_directory(identifier)
 
                         # Validate directory path (same security check as write_note)
@@ -500,6 +720,7 @@ async def edit_note(
                             directory=directory,
                             content_type="text/markdown",
                             content=content,
+                            entity_metadata=metadata,
                         )
 
                         logger.info(
@@ -529,6 +750,10 @@ async def edit_note(
                         edit_data["find_text"] = find_text
                     if effective_replacements != 1:  # Only send if different from default
                         edit_data["expected_replacements"] = str(effective_replacements)
+                    if not effective_replace_subsections:  # Only send if different from default
+                        edit_data["replace_subsections"] = False
+                    if metadata:
+                        edit_data["metadata"] = metadata
 
                     # Call the PATCH endpoint
                     result = await knowledge_client.patch_entity(entity_id, edit_data)
@@ -619,6 +844,23 @@ async def edit_note(
 
             except Exception as e:
                 logger.error(f"Error editing note: {e}")
+                if isinstance(e, UnresolvedProjectRouteError):
+                    if output_format == "json":
+                        return {
+                            "title": None,
+                            "permalink": None,
+                            "file_path": None,
+                            "checksum": None,
+                            "operation": operation,
+                            "fileCreated": False,
+                            "error": "UNRESOLVED_PROJECT_ROUTE",
+                            "project": active_project.name,
+                            "projectRoute": e.project_prefix,
+                        }
+                    return _format_unresolved_project_route_response(
+                        error=e,
+                        active_project=active_project.name,
+                    )
                 if output_format == "json":
                     return {
                         "title": None,

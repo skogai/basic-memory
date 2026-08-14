@@ -4,7 +4,7 @@ Provides tools for schema validation, inference, and drift detection through the
 These tools call the schema API endpoints via the typed SchemaClient.
 """
 
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from loguru import logger
 from fastmcp import Context
@@ -31,6 +31,19 @@ def _format_validation_report(report: ValidationReport) -> str:
         f"| Warnings: {report.warning_count} | Errors: {report.error_count}"
     )
     lines.append("")
+
+    # --- Per-type breakdown (all-types mode) ---
+    if report.type_summaries:
+        lines.append("## By Type")
+        lines.append("")
+        for summary in report.type_summaries:
+            if summary.total_entities == 0:
+                lines.append(f"- **{summary.note_type}**: no notes")
+            else:
+                lines.append(
+                    f"- **{summary.note_type}**: {summary.valid_count}/{summary.total_notes} valid"
+                )
+        lines.append("")
 
     # --- Per-note results ---
     for r in report.results:
@@ -167,6 +180,26 @@ def _no_notes_guidance(note_type: str, tool_name: str) -> str:
     )
 
 
+def _no_schemas_defined_guidance(tool_name: str) -> str:
+    """Build guidance string when validating all types but no schemas exist.
+
+    Used by schema_validate when called without arguments in a project that
+    has no schema notes — there is nothing to validate yet.
+    """
+    return (
+        f"# No Schemas Defined\n\n"
+        f"`{tool_name}` was called without `note_type` or `identifier`, which "
+        f"validates every note type that has a schema — but this project has "
+        f"no schema notes yet, so there is nothing to validate.\n\n"
+        f"## Next Steps\n\n"
+        f'1. **Infer a schema** — run `schema_infer("<note_type>")` to analyze '
+        f"existing notes and get a suggested schema\n"
+        f"2. **Create a schema note** — write a note with `type: schema` and an "
+        f"`entity` field naming the note type it validates\n"
+        f"3. **Re-run** — call `{tool_name}()` again once a schema exists\n"
+    )
+
+
 def _no_schema_guidance(note_type: str, tool_name: str) -> str:
     """Build guidance string when no schema exists for a note type.
 
@@ -197,15 +230,22 @@ def _no_schema_guidance(note_type: str, tool_name: str) -> str:
         f"- `field_name: type, description` — required field\n"
         f"- `field_name?: type, description` — optional field\n"
         f"- Supported types: `string`, `number`, `boolean`, `string[]`\n\n"
-        f"3. **Sync** — run `basic-memory sync` or wait for auto-sync to pick up "
-        f"the new schema note\n"
+        f"3. **Index** — run `basic-memory db reindex --search` or wait for the "
+        f"file watcher to pick up the new schema note\n"
         f'4. **Re-run** — call `{tool_name}("{note_type}")` again\n'
     )
 
 
 @mcp.tool(
+    title="Validate Schema",
     description="Validate notes against their Picoschema definitions.",
-    annotations={"readOnlyHint": True, "openWorldHint": False},
+    tags={"schema"},
+    annotations={
+        "title": "Validate Schema",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": False,
+    },
 )
 async def schema_validate(
     note_type: Optional[str] = None,
@@ -214,10 +254,12 @@ async def schema_validate(
     project_id: Optional[str] = None,
     output_format: Literal["text", "json"] = "text",
     context: Context | None = None,
-) -> ValidationReport | str | dict:
+) -> ValidationReport | str | dict[str, Any]:
     """Validate notes against their resolved schema.
 
-    Validates a specific note (by identifier) or all notes of a given type.
+    Validates a specific note (by identifier), all notes of a given type, or —
+    when called with neither — all notes of every type that has a schema
+    defined, with a per-type breakdown.
     Returns warnings/errors based on the schema's validation mode.
 
     Schemas are resolved in priority order:
@@ -251,6 +293,9 @@ async def schema_validate(
         # Validate a specific note
         schema_validate(identifier="people/paul-graham")
 
+        # Validate every type that has a schema defined
+        schema_validate()
+
         # Validate in a specific project
         schema_validate(note_type="person", project="my-research")
     """
@@ -277,6 +322,20 @@ async def schema_validate(
                 f"total={result.total_notes} valid={result.valid_count} "
                 f"warnings={result.warning_count} errors={result.error_count}"
             )
+
+            # --- All-types mode ---
+            # Trigger: called with neither identifier nor note_type (#1013)
+            # Why: an empty report here means "no schemas defined", not
+            #   "no notes of type 'unknown'" — the guards below would mislead
+            # Outcome: per-type summary, or guidance for defining a first schema
+            if note_type is None and identifier is None:
+                if not result.type_summaries:
+                    if output_format == "json":
+                        return {"error": "No schemas defined in this project"}
+                    return _no_schemas_defined_guidance("schema_validate")
+                if output_format == "json":
+                    return result.model_dump(mode="json", exclude_none=True)
+                return _format_validation_report(result)
 
             # --- No notes guard ---
             # Trigger: no entities of this type exist in the project
@@ -312,13 +371,20 @@ async def schema_validate(
                 f"## Troubleshooting\n"
                 f"1. Ensure schema notes exist (type: schema) for the target note type\n"
                 f"2. Check that notes have the correct type in frontmatter\n"
-                f"3. Verify the project has been synced: `basic-memory status`\n"
+                f"3. Verify the project has been indexed: `basic-memory status`\n"
             )
 
 
 @mcp.tool(
+    title="Infer Schema",
     description="Analyze existing notes and suggest a Picoschema definition.",
-    annotations={"readOnlyHint": True, "openWorldHint": False},
+    tags={"schema"},
+    annotations={
+        "title": "Infer Schema",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": False,
+    },
 )
 async def schema_infer(
     note_type: str,
@@ -327,7 +393,7 @@ async def schema_infer(
     project_id: Optional[str] = None,
     output_format: Literal["text", "json"] = "text",
     context: Context | None = None,
-) -> str | dict:
+) -> str | dict[str, Any]:
     """Analyze existing notes and suggest a schema definition.
 
     Examines observation categories and relation types across all notes
@@ -433,13 +499,20 @@ async def schema_infer(
                 f"## Troubleshooting\n"
                 f"1. Ensure notes of type '{note_type}' exist in the project\n"
                 f'2. Try searching: `search_notes("{note_type}", note_types=["{note_type}"])`\n'
-                f"3. Verify the project has been synced: `basic-memory status`\n"
+                f"3. Verify the project has been indexed: `basic-memory status`\n"
             )
 
 
 @mcp.tool(
+    title="Schema Diff",
     description="Detect drift between a schema definition and actual note usage.",
-    annotations={"readOnlyHint": True, "openWorldHint": False},
+    tags={"schema"},
+    annotations={
+        "title": "Schema Diff",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": False,
+    },
 )
 async def schema_diff(
     note_type: str,
@@ -447,7 +520,7 @@ async def schema_diff(
     project_id: Optional[str] = None,
     output_format: Literal["text", "json"] = "text",
     context: Context | None = None,
-) -> str | dict:
+) -> str | dict[str, Any]:
     """Detect drift between a schema definition and actual note usage.
 
     Compares the existing schema for a note type against how notes of
@@ -527,5 +600,5 @@ async def schema_diff(
                 f"## Troubleshooting\n"
                 f"1. Ensure a schema note exists for type '{note_type}'\n"
                 f"2. Ensure notes of type '{note_type}' exist in the project\n"
-                f"3. Verify the project has been synced: `basic-memory status`\n"
+                f"3. Verify the project has been indexed: `basic-memory status`\n"
             )

@@ -1,11 +1,13 @@
 """SQLite FTS5-based search repository implementation."""
 
 import asyncio
-import json
 import re
+from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, override, List, Optional
+
+import logfire
 from loguru import logger
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError as SAOperationalError
@@ -18,14 +20,20 @@ from basic_memory.models.search import (
     CREATE_SQLITE_SEARCH_VECTOR_CHUNKS,
     CREATE_SQLITE_SEARCH_VECTOR_CHUNKS_PROJECT_ENTITY,
     CREATE_SQLITE_SEARCH_VECTOR_CHUNKS_UNIQUE,
-    create_sqlite_search_vector_embeddings,
 )
 from basic_memory.repository.embedding_provider import EmbeddingProvider
 from basic_memory.repository.embedding_provider_factory import create_embedding_provider
+from basic_memory.repository.rerank_provider import RerankProvider
+from basic_memory.repository.rerank_provider_factory import create_rerank_provider
 from basic_memory.repository.search_index_row import SearchIndexRow
+from basic_memory.repository.search_query import relaxed_query_words
 from basic_memory.repository.search_repository_base import SearchRepositoryBase
 from basic_memory.repository.metadata_filters import parse_metadata_filters, build_sqlite_json_path
 from basic_memory.repository.semantic_errors import SemanticDependenciesMissingError
+from basic_memory.repository.semantic_vector_index import SemanticVectorIndex
+from basic_memory.repository.semantic_vector_sync import StagedVectorDeletion
+from basic_memory.repository.semantic_vector_index_factory import build_vector_index_scope
+from basic_memory.repository.sqlite_vec_index import SQLiteVecIndex
 from basic_memory.schemas.search import SearchItemType, SearchRetrievalMode
 
 
@@ -45,6 +53,9 @@ class SQLiteSearchRepository(SearchRepositoryBase):
         project_id: int,
         app_config: BasicMemoryConfig | None = None,
         embedding_provider: EmbeddingProvider | None = None,
+        vector_index_name: str | None = None,
+        vector_index: SemanticVectorIndex | None = None,
+        rerank_provider: RerankProvider | None = None,
     ):
         super().__init__(session_maker, project_id)
         self._entity_columns: set[str] | None = None
@@ -56,6 +67,10 @@ class SQLiteSearchRepository(SearchRepositoryBase):
             self._app_config.semantic_embedding_sync_batch_size
         )
         self._embedding_provider = embedding_provider
+        self._semantic_vector_index_name = vector_index_name or "sqlite-vec"
+        self._rerank_provider = rerank_provider
+        self._reranker_candidates = self._app_config.reranker_candidates
+        self._reranker_max_document_chars = self._app_config.reranker_max_document_chars
         self._sqlite_vec_load_lock = asyncio.Lock()
         self._sqlite_prepare_write_lock = asyncio.Lock()
         self._vector_tables_initialized = False
@@ -66,8 +81,19 @@ class SQLiteSearchRepository(SearchRepositoryBase):
             # This conversion is correct only for unit-normalized embeddings.
             # Provider implementations must return normalized vectors.
             self._embedding_provider = create_embedding_provider(self._app_config)
+        # create_rerank_provider returns None unless reranking is enabled.
+        if self._semantic_enabled and self._rerank_provider is None:
+            self._rerank_provider = create_rerank_provider(self._app_config)
         if self._embedding_provider is not None:
             self._vector_dimensions = self._embedding_provider.dimensions
+            self._semantic_vector_index = vector_index or SQLiteVecIndex(
+                session_maker,
+                build_vector_index_scope(
+                    self._app_config,
+                    self._embedding_provider,
+                    project_id,
+                ),
+            )
 
     async def _get_entity_columns(self) -> set[str]:
         if self._entity_columns is None:
@@ -76,6 +102,7 @@ class SQLiteSearchRepository(SearchRepositoryBase):
                 self._entity_columns = {row[1] for row in result.fetchall()}
         return self._entity_columns
 
+    @override
     async def init_search_index(self):
         """Create FTS5 virtual table for search if it doesn't exist.
 
@@ -255,6 +282,19 @@ class SQLiteSearchRepository(SearchRepositoryBase):
         if "*" in term and all(c.isalnum() or c in "*_-" for c in term):
             return term
 
+        # Natural-language queries arrive with sentence punctuation that FTS5
+        # treats as syntax ("When did Melanie paint a sunrise?"). The tokenizer
+        # ignores this punctuation in the INDEX, so stripping it from word
+        # edges loses nothing — but leaving it forces the whole question into
+        # an exact-phrase match that returns zero rows, silently disabling the
+        # FTS half of hybrid search. Interior characters (hyphens, slashes —
+        # permalinks and paths) are untouched.
+        if " " in term:
+            words = [word.strip("?!.,;:") for word in term.split()]
+            term = " ".join(word for word in words if word)
+            if not term:
+                return ""
+
         # Characters that can cause FTS5 syntax errors when used as operators
         # We're more conservative here - only quote when we detect problematic patterns
         problematic_chars = [
@@ -331,6 +371,7 @@ class SQLiteSearchRepository(SearchRepositoryBase):
 
         return term
 
+    @override
     def _prepare_search_term(self, term: str, is_prefix: bool = True) -> str:
         """Prepare a search term for FTS5 query.
 
@@ -350,6 +391,14 @@ class SQLiteSearchRepository(SearchRepositoryBase):
 
         # For non-Boolean queries, use the single term preparation logic
         return self._prepare_single_term(term, is_prefix)
+
+    @staticmethod
+    def _relaxed_fts_text(search_text: Optional[str]) -> Optional[str]:
+        """OR-relaxed FTS5 expression for a failed strict query, or None."""
+        words = relaxed_query_words(search_text)
+        if not words:
+            return None
+        return " OR ".join(f"{word}*" for word in words)
 
     # ------------------------------------------------------------------
     # sqlite-vec extension loading (SQLite-specific)
@@ -415,8 +464,19 @@ class SQLiteSearchRepository(SearchRepositoryBase):
     # Abstract hook implementations (vector/semantic, SQLite-specific)
     # ------------------------------------------------------------------
 
+    @override
     async def _ensure_vector_tables(self) -> None:
         self._assert_semantic_available()
+        if not hasattr(self, "_semantic_vector_index"):
+            assert self._embedding_provider is not None
+            self._semantic_vector_index = SQLiteVecIndex(
+                self.session_maker,
+                build_vector_index_scope(
+                    self._app_config,
+                    self._embedding_provider,
+                    self.project_id,
+                ),
+            )
         if self._vector_tables_initialized:
             return
 
@@ -439,6 +499,8 @@ class SQLiteSearchRepository(SearchRepositoryBase):
                 "source_hash",
                 "entity_fingerprint",
                 "embedding_model",
+                "vector_index",
+                "embedding_status",
                 "updated_at",
             }
             schema_mismatch = bool(chunks_columns) and set(chunks_columns) != expected_columns
@@ -450,6 +512,8 @@ class SQLiteSearchRepository(SearchRepositoryBase):
                 logger.warning("search_vector_chunks schema mismatch, recreating vector tables")
                 await session.execute(text("DROP TABLE IF EXISTS search_vector_embeddings"))
                 await session.execute(text("DROP TABLE IF EXISTS search_vector_chunks"))
+                if isinstance(self._semantic_vector_index, SQLiteVecIndex):
+                    self._semantic_vector_index.invalidate_initialization()
 
             await session.execute(CREATE_SQLITE_SEARCH_VECTOR_CHUNKS)
             await session.execute(CREATE_SQLITE_SEARCH_VECTOR_CHUNKS_PROJECT_ENTITY)
@@ -460,28 +524,14 @@ class SQLiteSearchRepository(SearchRepositoryBase):
             # Outcome: remove disposable derived data so chunk/vector schema is deterministic.
             await session.execute(text("DROP TABLE IF EXISTS search_vector_index"))
 
-            vector_sql_result = await session.execute(
-                text(
-                    "SELECT sql FROM sqlite_master "
-                    "WHERE type = 'table' AND name = 'search_vector_embeddings'"
-                )
-            )
-            vector_sql = vector_sql_result.scalar()
-            expected_dimension_sql = f"float[{self._vector_dimensions}]"
-
-            if vector_sql and expected_dimension_sql not in vector_sql:
-                logger.warning(
-                    f"Embedding dimension mismatch (expected {self._vector_dimensions}), "
-                    "recreating search_vector_embeddings"
-                )
-                await session.execute(text("DROP TABLE IF EXISTS search_vector_embeddings"))
-
-            await session.execute(create_sqlite_search_vector_embeddings(self._vector_dimensions))
             await session.commit()
+
+        await self._semantic_vector_index.initialize()
 
         logger.debug(f"SQLite vector tables ready (dimensions={self._vector_dimensions})")
         self._vector_tables_initialized = True
 
+    @override
     async def _prepare_vector_session(self, session: AsyncSession) -> None:
         """Load sqlite-vec extension for the session."""
         await self._ensure_sqlite_vec_loaded(session)
@@ -489,136 +539,68 @@ class SQLiteSearchRepository(SearchRepositoryBase):
     # sqlite-vec hard limit for knn k parameter
     SQLITE_VEC_MAX_K = 4096
 
+    @override
     async def _run_vector_query(
         self,
         session: AsyncSession,
         query_embedding: list[float],
         candidate_limit: int,
-    ) -> list[dict]:
-        # Constraint: sqlite-vec enforces k <= 4096 for knn queries
-        vector_k = min(candidate_limit, self.SQLITE_VEC_MAX_K)
-        query_embedding_json = json.dumps(query_embedding)
-        vector_result = await session.execute(
-            text(
-                "WITH vector_matches AS ("
-                "  SELECT rowid, distance "
-                "  FROM search_vector_embeddings "
-                "  WHERE embedding MATCH :query_embedding "
-                "    AND k = :vector_k"
-                ") "
-                "SELECT c.entity_id, c.chunk_key, c.chunk_text, vector_matches.distance AS best_distance "
-                "FROM vector_matches "
-                "JOIN search_vector_chunks c ON c.id = vector_matches.rowid "
-                "WHERE c.project_id = :project_id "
-                "ORDER BY best_distance ASC "
-                "LIMIT :candidate_limit"
-            ),
-            {
-                "query_embedding": query_embedding_json,
-                "project_id": self.project_id,
-                "vector_k": vector_k,
-                "candidate_limit": candidate_limit,
-            },
-        )
-        return [dict(row) for row in vector_result.mappings().all()]
+    ) -> list[dict[str, Any]]:
+        return await super()._run_vector_query(session, query_embedding, candidate_limit)
 
-    async def _write_embeddings(
-        self,
-        session: AsyncSession,
-        jobs: list[tuple[int, str]],
-        embeddings: list[list[float]],
-    ) -> None:
-        rowids = [row_id for row_id, _ in jobs]
-        delete_params = {f"rowid_{idx}": rowid for idx, rowid in enumerate(rowids)}
-        delete_placeholders = ", ".join(f":rowid_{idx}" for idx in range(len(rowids)))
-        await session.execute(
-            text(f"DELETE FROM search_vector_embeddings WHERE rowid IN ({delete_placeholders})"),
-            delete_params,
-        )
-
-        insert_rows = [
-            {"rowid": row_id, "embedding": json.dumps(embedding)}
-            for (row_id, _), embedding in zip(jobs, embeddings, strict=True)
-        ]
-        await session.execute(
-            text(
-                "INSERT INTO search_vector_embeddings (rowid, embedding) "
-                "VALUES (:rowid, :embedding)"
-            ),
-            insert_rows,
-        )
-
+    @override
     async def _delete_entity_chunks(
         self,
         session: AsyncSession,
         entity_id: int,
-    ) -> None:
-        # sqlite-vec has no CASCADE — must delete embeddings before chunks
-        await session.execute(
-            text(
-                "DELETE FROM search_vector_embeddings "
-                "WHERE rowid IN ("
-                "SELECT id FROM search_vector_chunks "
-                "WHERE project_id = :project_id AND entity_id = :entity_id"
-                ")"
-            ),
-            {"project_id": self.project_id, "entity_id": entity_id},
-        )
-        await session.execute(
-            text(
-                "DELETE FROM search_vector_chunks "
-                "WHERE project_id = :project_id AND entity_id = :entity_id"
-            ),
-            {"project_id": self.project_id, "entity_id": entity_id},
+        *,
+        expected_deletions: Sequence[StagedVectorDeletion] | None = None,
+    ) -> list[StagedVectorDeletion]:
+        return await super()._delete_entity_chunks(
+            session,
+            entity_id,
+            expected_deletions=expected_deletions,
         )
 
+    @override
     async def _delete_stale_chunks(
         self,
         session: AsyncSession,
         stale_ids: list[int],
         entity_id: int,
-    ) -> None:
-        stale_params = {
-            "project_id": self.project_id,
-            "entity_id": entity_id,
-            **{f"row_{idx}": row_id for idx, row_id in enumerate(stale_ids)},
-        }
-        stale_placeholders = ", ".join(f":row_{idx}" for idx in range(len(stale_ids)))
-        await session.execute(
-            text(f"DELETE FROM search_vector_embeddings WHERE rowid IN ({stale_placeholders})"),
-            stale_params,
+        *,
+        expected_deletions: Sequence[StagedVectorDeletion] | None = None,
+    ) -> list[StagedVectorDeletion]:
+        return await super()._delete_stale_chunks(
+            session,
+            stale_ids,
+            entity_id,
+            expected_deletions=expected_deletions,
         )
+
+    @override
+    async def _delete_project_builtin_vector_rows(self, session: AsyncSession) -> None:
+        """Delete sqlite-vec rows atomically with their project manifest."""
+        table_result = await session.execute(
+            text(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'table' "
+                "AND name IN ('search_vector_chunks', 'search_vector_embeddings')"
+            )
+        )
+        table_sql = {str(name): str(sql or "") for name, sql in table_result.all()}
+        if not {"search_vector_chunks", "search_vector_embeddings"}.issubset(table_sql):
+            return
+
+        vector_sql = table_sql["search_vector_embeddings"]
+        if "using vec0" in vector_sql.lower():
+            await self._ensure_sqlite_vec_loaded(session)
         await session.execute(
             text(
-                "DELETE FROM search_vector_chunks "
-                f"WHERE id IN ({stale_placeholders}) "
-                "AND project_id = :project_id AND entity_id = :entity_id"
+                "DELETE FROM search_vector_embeddings WHERE rowid IN ("
+                "SELECT id FROM search_vector_chunks WHERE project_id = :project_id)"
             ),
-            stale_params,
+            {"project_id": self.project_id},
         )
-
-    async def delete_project_vector_rows(self) -> None:
-        """Delete all vector rows for this project on a sqlite-vec-enabled connection."""
-        await self._ensure_vector_tables()
-
-        async with db.scoped_session(self.session_maker) as session:
-            await self._ensure_sqlite_vec_loaded(session)
-
-            # Constraint: sqlite-vec stores embeddings separately with no cascade delete.
-            # Why: full rebuild must clear embeddings before chunk rows or stale vectors remain.
-            # Outcome: the next sync recreates the project's derived vectors from scratch.
-            await session.execute(
-                text(
-                    "DELETE FROM search_vector_embeddings WHERE rowid IN ("
-                    "SELECT id FROM search_vector_chunks WHERE project_id = :project_id)"
-                ),
-                {"project_id": self.project_id},
-            )
-            await session.execute(
-                text("DELETE FROM search_vector_chunks WHERE project_id = :project_id"),
-                {"project_id": self.project_id},
-            )
-            await session.commit()
 
     async def drop_vector_tables(self) -> None:
         """Drop SQLite vector tables on a sqlite-vec-enabled connection."""
@@ -639,38 +621,7 @@ class SQLiteSearchRepository(SearchRepositoryBase):
             await session.commit()
         self._vector_tables_initialized = False
 
-    async def delete_stale_vector_rows(self) -> None:
-        """Delete vector rows whose source entities no longer exist."""
-        await self._ensure_vector_tables()
-
-        async with db.scoped_session(self.session_maker) as session:
-            await self._ensure_sqlite_vec_loaded(session)
-
-            stale_entity_filter = (
-                "entity_id NOT IN (SELECT id FROM entity WHERE project_id = :project_id)"
-            )
-            params = {"project_id": self.project_id}
-
-            # Trigger: deleted entities left behind derived vector rows.
-            # Why: sqlite-vec does not provide cascade cleanup from our chunk table.
-            # Outcome: stale vector state disappears before coverage stats or reindex runs.
-            await session.execute(
-                text(
-                    "DELETE FROM search_vector_embeddings WHERE rowid IN ("
-                    "SELECT id FROM search_vector_chunks "
-                    f"WHERE project_id = :project_id AND {stale_entity_filter})"
-                ),
-                params,
-            )
-            await session.execute(
-                text(
-                    "DELETE FROM search_vector_chunks "
-                    f"WHERE project_id = :project_id AND {stale_entity_filter}"
-                ),
-                params,
-            )
-            await session.commit()
-
+    @override
     def _distance_to_similarity(self, distance: float) -> float:
         """Convert L2 distance to cosine similarity for normalized embeddings.
 
@@ -680,6 +631,7 @@ class SQLiteSearchRepository(SearchRepositoryBase):
         return max(0.0, 1.0 - (distance * distance) / 2.0)
 
     @asynccontextmanager
+    @override
     async def _prepare_entity_write_scope(self):
         """SQLite keeps the shared read window, but funnels prepare writes through one lock."""
         # Trigger: the shared prepare window fans out per entity after batched reads.
@@ -690,21 +642,16 @@ class SQLiteSearchRepository(SearchRepositoryBase):
         async with self._sqlite_prepare_write_lock:
             yield
 
+    @override
     def _prepare_window_existing_rows_sql(self, placeholders: str) -> str:
-        """SQLite sqlite-vec stores embeddings by rowid rather than chunk_id."""
-        return (
-            "SELECT c.entity_id, c.id, c.chunk_key, c.source_hash, c.entity_fingerprint, "
-            "c.embedding_model, (e.rowid IS NOT NULL) AS has_embedding "
-            "FROM search_vector_chunks c "
-            "LEFT JOIN search_vector_embeddings e ON e.rowid = c.id "
-            f"WHERE c.project_id = :project_id AND c.entity_id IN ({placeholders}) "
-            "ORDER BY c.entity_id ASC, c.chunk_key ASC"
-        )
+        """Use the authoritative SQL manifest for adapter-independent readiness."""
+        return super()._prepare_window_existing_rows_sql(placeholders)
 
     # ------------------------------------------------------------------
     # Index / bulk index overrides (FTS-only, no vector side-effects)
     # ------------------------------------------------------------------
 
+    @override
     async def index_item(self, search_index_row: SearchIndexRow) -> None:
         """Index a single row in FTS only.
 
@@ -712,6 +659,7 @@ class SQLiteSearchRepository(SearchRepositoryBase):
         """
         await super().index_item(search_index_row)
 
+    @override
     async def bulk_index_items(self, search_index_rows: List[SearchIndexRow]) -> None:
         """Index multiple rows in FTS only."""
         await super().bulk_index_items(search_index_rows)
@@ -733,8 +681,9 @@ class SQLiteSearchRepository(SearchRepositoryBase):
         note_types: Optional[List[str]] = None,
         after_date: Optional[datetime] = None,
         search_item_types: Optional[List[SearchItemType]] = None,
-        metadata_filters: Optional[dict] = None,
-    ) -> tuple[str, str, dict, str]:
+        categories: Optional[List[str]] = None,
+        metadata_filters: Optional[dict[str, Any]] = None,
+    ) -> tuple[str, str, dict[str, Any], str]:
         """Build SQLite FTS FROM/WHERE params shared by search and count."""
         conditions = []
         match_conditions = []
@@ -752,8 +701,11 @@ class SQLiteSearchRepository(SearchRepositoryBase):
                 # Use _prepare_search_term to handle both Boolean and non-Boolean queries
                 processed_text = self._prepare_search_term(search_text.strip())
                 params["text"] = processed_text
+                # content_stems is capped for Postgres index-row compatibility, while
+                # SQLite stores the complete note body in its FTS5 content_snippet column.
                 match_conditions.append(
-                    "(search_index.title MATCH :text OR search_index.content_stems MATCH :text)"
+                    "(search_index.title MATCH :text OR search_index.content_stems MATCH :text "
+                    "OR search_index.content_snippet MATCH :text)"
                 )
 
         # Handle title match search
@@ -794,15 +746,36 @@ class SQLiteSearchRepository(SearchRepositoryBase):
                 type_placeholders.append(f":{param_name}")
             conditions.append(f"search_index.type IN ({', '.join(type_placeholders)})")
 
-        # Handle note type filter (frontmatter type field, parameterized)
+        # Handle observation category filter (parameterized for defense-in-depth).
+        # Trigger: caller passed `categories` to scope observation results.
+        # Why: `entity_types=["observation"]` only narrows to the observation row type;
+        #      callers expect exact-category matching, not incidental text matches.
+        # Outcome: only rows whose indexed category exactly equals a requested value
+        #          survive (entities/relations have NULL category and are excluded).
+        if categories:
+            category_placeholders = []
+            for idx, category in enumerate(categories):
+                param_name = f"category_{idx}"
+                params[param_name] = category
+                category_placeholders.append(f":{param_name}")
+            conditions.append(f"search_index.category IN ({', '.join(category_placeholders)})")
+
+        # Handle note type filter (frontmatter type field, parameterized).
+        # Trigger: caller passed `note_types` to scope by the frontmatter `type` field.
+        # Why: the stored note_type preserves the frontmatter casing (e.g. `Chapter`),
+        #      but the filter is documented case-insensitive; comparing raw values
+        #      would miss capitalized types.
+        # Outcome: fold both sides to lowercase so `note_types=["Chapter"]` matches a
+        #          stored `Chapter`, `chapter`, etc.
         if note_types:
             type_placeholders = []
             for idx, t in enumerate(note_types):
                 param_name = f"note_type_{idx}"
-                params[param_name] = t
+                params[param_name] = t.lower()
                 type_placeholders.append(f":{param_name}")
             conditions.append(
-                f"json_extract(search_index.metadata, '$.note_type') IN ({', '.join(type_placeholders)})"
+                "LOWER(json_extract(search_index.metadata, '$.note_type')) "
+                f"IN ({', '.join(type_placeholders)})"
             )
 
         # Handle date filter using datetime() for proper comparison
@@ -916,6 +889,7 @@ class SQLiteSearchRepository(SearchRepositoryBase):
         where_clause = " AND ".join(conditions) if conditions else "1=1"
         return from_clause, where_clause, params, order_by_clause
 
+    @override
     async def search(
         self,
         search_text: Optional[str] = None,
@@ -925,13 +899,22 @@ class SQLiteSearchRepository(SearchRepositoryBase):
         note_types: Optional[List[str]] = None,
         after_date: Optional[datetime] = None,
         search_item_types: Optional[List[SearchItemType]] = None,
-        metadata_filters: Optional[dict] = None,
+        categories: Optional[List[str]] = None,
+        metadata_filters: Optional[dict[str, Any]] = None,
         retrieval_mode: SearchRetrievalMode = SearchRetrievalMode.FTS,
         min_similarity: Optional[float] = None,
         limit: int = 10,
         offset: int = 0,
+        allow_relaxed: bool = False,
+        session: AsyncSession | None = None,
     ) -> List[SearchIndexRow]:
-        """Search across all indexed content using SQLite FTS5."""
+        """Search across all indexed content using SQLite FTS5.
+
+        ``allow_relaxed=True`` retries a zero-result strict multi-word query
+        with OR-joined content terms. Only the hybrid path opts in: its FTS
+        branch otherwise contributes nothing for question-form queries.
+        Service-level FTS searches keep their own conservative fallback.
+        """
         # --- Dispatch vector / hybrid modes (shared logic) ---
         dispatched = await self._dispatch_retrieval_mode(
             search_text=search_text,
@@ -941,6 +924,7 @@ class SQLiteSearchRepository(SearchRepositoryBase):
             note_types=note_types,
             after_date=after_date,
             search_item_types=search_item_types,
+            categories=categories,
             metadata_filters=metadata_filters,
             retrieval_mode=retrieval_mode,
             min_similarity=min_similarity,
@@ -959,6 +943,7 @@ class SQLiteSearchRepository(SearchRepositoryBase):
             note_types=note_types,
             after_date=after_date,
             search_item_types=search_item_types,
+            categories=categories,
             metadata_filters=metadata_filters,
         )
 
@@ -992,10 +977,42 @@ class SQLiteSearchRepository(SearchRepositoryBase):
         """
 
         logger.trace(f"Search {sql} params: {params}")
+
+        async def run_search(active_session: AsyncSession):
+            result = await active_session.execute(text(sql), params)
+            rows = result.fetchall()
+            # Trigger: multi-word natural-language query matched nothing
+            # under the default all-terms-AND semantics.
+            # Why: questions ("when did X do Y") rarely have every word in
+            # one document; without relaxation the FTS half of hybrid
+            # search contributes zero candidates and ranking degrades to
+            # vector-only.
+            # Outcome: one retry with OR-joined prefix terms; bm25 still
+            # ranks multi-term matches first.
+            relaxed = self._relaxed_fts_text(search_text) if allow_relaxed and not rows else None
+            if relaxed and params.get("text"):
+                params["text"] = relaxed
+                logger.debug(
+                    "Strict SQLite FTS returned 0 results; retrying relaxed FTS query "
+                    f"strict='{search_text}' relaxed='{relaxed}'"
+                )
+                with logfire.span(
+                    "search.relaxed_fts_retry",
+                    backend="sqlite",
+                    token_count=len(relaxed_query_words(search_text) or ()),
+                    limit=limit,
+                    offset=offset,
+                ):
+                    result = await active_session.execute(text(sql), params)
+                    rows = result.fetchall()
+            return rows
+
         try:
-            async with db.scoped_session(self.session_maker) as session:
-                result = await session.execute(text(sql), params)
-                rows = result.fetchall()
+            if session is not None:
+                rows = await run_search(session)
+            else:
+                async with db.scoped_session(self.session_maker) as owned_session:
+                    rows = await run_search(owned_session)
         except Exception as e:
             # Handle FTS5 syntax errors and provide user-friendly feedback
             if self._is_fts5_syntax_error(e):  # pragma: no cover
@@ -1007,27 +1024,7 @@ class SQLiteSearchRepository(SearchRepositoryBase):
                 logger.error(f"Database error during search: {e}")
                 raise
 
-        results = [
-            SearchIndexRow(
-                project_id=self.project_id,
-                id=row.id,
-                title=row.title,
-                permalink=row.permalink,
-                file_path=row.file_path,
-                type=row.type,
-                score=row.score,
-                metadata=json.loads(row.metadata) if row.metadata else {},
-                from_id=row.from_id,
-                to_id=row.to_id,
-                relation_type=row.relation_type,
-                entity_id=row.entity_id,
-                content_snippet=row.content_snippet,
-                category=row.category,
-                created_at=row.created_at,
-                updated_at=row.updated_at,
-            )
-            for row in rows
-        ]
+        results = [SearchIndexRow.from_mapping(row._asdict()) for row in rows]
 
         logger.trace(f"Found {len(results)} search results")
         for r in results:
@@ -1037,6 +1034,7 @@ class SQLiteSearchRepository(SearchRepositoryBase):
 
         return results
 
+    @override
     async def count(
         self,
         search_text: Optional[str] = None,
@@ -1046,9 +1044,11 @@ class SQLiteSearchRepository(SearchRepositoryBase):
         note_types: Optional[List[str]] = None,
         after_date: Optional[datetime] = None,
         search_item_types: Optional[List[SearchItemType]] = None,
-        metadata_filters: Optional[dict] = None,
+        categories: Optional[List[str]] = None,
+        metadata_filters: Optional[dict[str, Any]] = None,
         retrieval_mode: SearchRetrievalMode = SearchRetrievalMode.FTS,
         min_similarity: Optional[float] = None,
+        allow_relaxed: bool = False,
     ) -> int:
         """Count indexed content matching the SQLite FTS query."""
         if retrieval_mode != SearchRetrievalMode.FTS:
@@ -1060,6 +1060,7 @@ class SQLiteSearchRepository(SearchRepositoryBase):
                 note_types=note_types,
                 after_date=after_date,
                 search_item_types=search_item_types,
+                categories=categories,
                 metadata_filters=metadata_filters,
                 retrieval_mode=retrieval_mode,
                 min_similarity=min_similarity,
@@ -1073,6 +1074,7 @@ class SQLiteSearchRepository(SearchRepositoryBase):
             note_types=note_types,
             after_date=after_date,
             search_item_types=search_item_types,
+            categories=categories,
             metadata_filters=metadata_filters,
         )
         sql = f"SELECT COUNT(*) FROM {from_clause} WHERE {where_clause}"
@@ -1080,7 +1082,20 @@ class SQLiteSearchRepository(SearchRepositoryBase):
         try:
             async with db.scoped_session(self.session_maker) as session:
                 result = await session.execute(text(sql), params)
-                return int(result.scalar_one())
+                total = int(result.scalar_one())
+                relaxed = (
+                    self._relaxed_fts_text(search_text) if allow_relaxed and total == 0 else None
+                )
+                if relaxed and params.get("text"):
+                    params["text"] = relaxed
+                    with logfire.span(
+                        "search.count.relaxed_fts_retry",
+                        backend="sqlite",
+                        token_count=len(relaxed_query_words(search_text) or ()),
+                    ):
+                        result = await session.execute(text(sql), params)
+                        total = int(result.scalar_one())
+                return total
         except Exception as e:
             if self._is_fts5_syntax_error(e):  # pragma: no cover
                 logger.warning(f"FTS5 syntax error for search term: {search_text}, error: {e}")

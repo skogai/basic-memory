@@ -1,6 +1,6 @@
 """Tests for parse_tags utility function."""
 
-from typing import Any, List, Union, cast
+from typing import override, Any, List, Union, cast
 
 import pytest
 
@@ -17,6 +17,11 @@ from basic_memory.utils import parse_tags
         (["tag1", "tag2"], ["tag1", "tag2"]),
         (["tag1", "", "tag2"], ["tag1", "tag2"]),  # Empty tags are filtered
         ([" tag1 ", " tag2 "], ["tag1", "tag2"]),  # Whitespace is stripped
+        # Comma inside a single list element is split (CLI `--tags "a,b"` -> ["a,b"])
+        (["tag1,tag2"], ["tag1", "tag2"]),
+        (["tag1, tag2", "tag3"], ["tag1", "tag2", "tag3"]),
+        # None entries (e.g. YAML `tags: [alpha, null]`) are skipped, not revived as "None"
+        (["alpha", None], ["alpha"]),
         # String inputs
         ("", []),
         ("tag1", ["tag1"]),
@@ -48,6 +53,7 @@ def test_parse_tags_special_case() -> None:
 
     # Test with custom object that has __str__ method
     class TagObject:
+        @override
         def __str__(self) -> str:
             return "tag1,tag2"
 

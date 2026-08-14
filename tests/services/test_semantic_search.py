@@ -9,7 +9,7 @@ from sqlalchemy import text
 
 from basic_memory import db
 from basic_memory.repository import EntityRepository
-from basic_memory.repository.search_repository_base import VectorSyncBatchResult
+from basic_memory.runtime.vector_sync import VectorSyncBatchResult
 from basic_memory.repository.semantic_errors import (
     SemanticDependenciesMissingError,
     SemanticSearchDisabledError,
@@ -187,24 +187,48 @@ async def test_semantic_vector_sync_batch_skips_embed_opt_out_and_reports_skips(
 
 
 @pytest.mark.asyncio
+async def test_semantic_vector_sync_empty_batch_preserves_index_identity(
+    search_service,
+    monkeypatch,
+):
+    repository = _sqlite_repo(search_service)
+    expected = VectorSyncBatchResult(
+        entities_total=0,
+        entities_synced=0,
+        entities_failed=0,
+        vector_index="sqlite-vec",
+        embedding_model="FastEmbedEmbeddingProvider:test-model",
+    )
+    sync_batch = AsyncMock(return_value=expected)
+    monkeypatch.setattr(repository, "sync_entity_vectors_batch", sync_batch)
+
+    result = await search_service.sync_entity_vectors_batch([])
+
+    assert result is expected
+    sync_batch.assert_awaited_once_with([])
+
+
+@pytest.mark.asyncio
 async def test_embed_opt_out_note_still_participates_in_fts(
     search_service, session_maker, test_project
 ):
     """Per-note semantic opt-out should not remove the note from FTS search."""
-    entity_repo = EntityRepository(session_maker, project_id=test_project.id)
-    entity = await entity_repo.create(
-        {
-            "title": "FTS Opt Out",
-            "note_type": "note",
-            "entity_metadata": {"embed": False},
-            "content_type": "text/markdown",
-            "file_path": "test/fts-opt-out.md",
-            "permalink": "test/fts-opt-out",
-            "project_id": test_project.id,
-            "created_at": datetime.now(),
-            "updated_at": datetime.now(),
-        }
-    )
+    entity_repo = EntityRepository(project_id=test_project.id)
+    async with db.scoped_session(session_maker) as session:
+        entity = await entity_repo.create(
+            session,
+            {
+                "title": "FTS Opt Out",
+                "note_type": "note",
+                "entity_metadata": {"embed": False},
+                "content_type": "text/markdown",
+                "file_path": "test/fts-opt-out.md",
+                "permalink": "test/fts-opt-out",
+                "project_id": test_project.id,
+                "created_at": datetime.now(),
+                "updated_at": datetime.now(),
+            },
+        )
 
     await search_service.index_entity(
         entity,
@@ -238,23 +262,32 @@ async def test_reindex_vectors_respects_embed_opt_out(search_service, monkeypatc
     sync_batch = AsyncMock(
         return_value=VectorSyncBatchResult(
             entities_total=2,
-            entities_synced=1,
-            entities_failed=0,
+            entities_synced=0,
+            entities_failed=1,
             entities_skipped=1,
+            sample_errors=("embedding service unavailable",),
+            vector_index="sqlite-vec",
+            embedding_model="FastEmbedEmbeddingProvider:test-model",
         )
     )
     monkeypatch.setattr(search_service, "_purge_stale_search_rows", purge_stale_rows)
     monkeypatch.setattr(search_service, "sync_entity_vectors_batch", sync_batch)
+    reconcile = AsyncMock()
+    monkeypatch.setattr(search_service.repository, "reconcile_vector_index", reconcile)
 
     stats = await search_service.reindex_vectors()
 
     purge_stale_rows.assert_awaited_once()
     sync_batch.assert_awaited_once_with([41, 42], progress_callback=None)
+    reconcile.assert_awaited_once()
     assert stats == {
         "total_entities": 2,
-        "embedded": 1,
+        "embedded": 0,
         "skipped": 1,
-        "errors": 0,
+        "errors": 1,
+        "sample_errors": ("embedding service unavailable",),
+        "vector_index": "sqlite-vec",
+        "embedding_model": "FastEmbedEmbeddingProvider:test-model",
     }
 
 
@@ -278,25 +311,37 @@ async def test_reindex_vectors_purges_sqlite_vectors_before_sync(search_service,
         assert entity_ids == [42]
         assert progress_callback is None
         calls.append("sync")
-        return VectorSyncBatchResult(entities_total=1, entities_synced=1, entities_failed=0)
+        return VectorSyncBatchResult(
+            entities_total=1,
+            entities_synced=1,
+            entities_failed=0,
+            vector_index="sqlite-vec",
+            embedding_model="FastEmbedEmbeddingProvider:test-model",
+        )
 
     monkeypatch.setattr(repository, "delete_stale_vector_rows", delete_stale_vector_rows)
     monkeypatch.setattr(search_service, "sync_entity_vectors_batch", sync_entity_vectors_batch)
+    reconcile = AsyncMock()
+    monkeypatch.setattr(repository, "reconcile_vector_index", reconcile)
 
     stats = await search_service.reindex_vectors()
 
     assert calls == ["purge", "sync"]
+    reconcile.assert_awaited_once()
     assert stats == {
         "total_entities": 1,
         "embedded": 1,
         "skipped": 0,
         "errors": 0,
+        "sample_errors": (),
+        "vector_index": "sqlite-vec",
+        "embedding_model": "FastEmbedEmbeddingProvider:test-model",
     }
 
 
 @pytest.mark.asyncio
-async def test_reindex_all_uses_sqlite_vec_aware_drop(search_service, monkeypatch):
-    """Full service reindex should not drop vec0 tables through a raw connection."""
+async def test_reindex_all_uses_vector_adapter_cleanup(search_service, monkeypatch):
+    """Full service reindex should clean vectors through the repository boundary."""
     repository = _sqlite_repo(search_service)
     executed_sql: list[str] = []
     calls: list[str] = []
@@ -304,17 +349,17 @@ async def test_reindex_all_uses_sqlite_vec_aware_drop(search_service, monkeypatc
     async def execute_query(query, params=None):
         executed_sql.append(str(query))
 
-    async def drop_vector_tables():
-        calls.append("drop_vector_tables")
+    async def delete_project_vector_rows():
+        calls.append("delete_project_vector_rows")
 
     monkeypatch.setattr(repository, "execute_query", execute_query)
-    monkeypatch.setattr(repository, "drop_vector_tables", drop_vector_tables)
+    monkeypatch.setattr(repository, "delete_project_vector_rows", delete_project_vector_rows)
     monkeypatch.setattr(search_service, "init_search_index", AsyncMock())
     monkeypatch.setattr(search_service.entity_repository, "find_all", AsyncMock(return_value=[]))
 
     await search_service.reindex_all()
 
-    assert calls == ["drop_vector_tables"]
+    assert calls == ["delete_project_vector_rows"]
     assert all("search_vector_embeddings" not in sql for sql in executed_sql)
 
 
@@ -375,10 +420,14 @@ async def test_reindex_vectors_force_full_clears_project_vectors_before_resync(
             entities_total=2,
             entities_synced=2,
             entities_failed=0,
+            vector_index="sqlite-vec",
+            embedding_model="FastEmbedEmbeddingProvider:test-model",
         )
     )
     monkeypatch.setattr(search_service, "_purge_stale_search_rows", purge_stale_rows)
     monkeypatch.setattr(repository, "delete_project_vector_rows", delete_project_vectors)
+    reconcile = AsyncMock()
+    monkeypatch.setattr(repository, "reconcile_vector_index", reconcile)
     monkeypatch.setattr(search_service, "sync_entity_vectors_batch", sync_batch)
 
     stats = await search_service.reindex_vectors(force_full=True)
@@ -386,11 +435,15 @@ async def test_reindex_vectors_force_full_clears_project_vectors_before_resync(
     purge_stale_rows.assert_awaited_once()
     delete_project_vectors.assert_awaited_once()
     sync_batch.assert_awaited_once_with([41, 42], progress_callback=None)
+    reconcile.assert_awaited_once()
     assert stats == {
         "total_entities": 2,
         "embedded": 2,
         "skipped": 0,
         "errors": 0,
+        "sample_errors": (),
+        "vector_index": "sqlite-vec",
+        "embedding_model": "FastEmbedEmbeddingProvider:test-model",
     }
 
 
@@ -412,11 +465,17 @@ async def test_semantic_vector_sync_batch_cleans_up_unknown_ids(search_service, 
                 entities_synced=1,
                 entities_failed=0,
                 entities_skipped=1,
+                sample_errors=("shared failure", "cleanup failure"),
+                vector_index="sqlite-vec",
+                embedding_model="FastEmbedEmbeddingProvider:test-model",
             ),
             VectorSyncBatchResult(
                 entities_total=1,
                 entities_synced=1,
                 entities_failed=0,
+                sample_errors=("shared failure", "embedding failure", "extra failure"),
+                vector_index="sqlite-vec",
+                embedding_model="FastEmbedEmbeddingProvider:test-model",
             ),
         ]
     )
@@ -440,3 +499,10 @@ async def test_semantic_vector_sync_batch_cleans_up_unknown_ids(search_service, 
     assert result.entities_synced == 2
     assert result.entities_failed == 0
     assert result.entities_skipped == 0
+    assert result.sample_errors == (
+        "shared failure",
+        "cleanup failure",
+        "embedding failure",
+    )
+    assert result.vector_index == "sqlite-vec"
+    assert result.embedding_model == "FastEmbedEmbeddingProvider:test-model"

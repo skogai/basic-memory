@@ -15,7 +15,7 @@ dependencies = [
     "aiosqlite>=0.20.0",
     "greenlet>=3.1.1",
     "pydantic[email,timezone]>=2.12.0",
-    "mcp>=1.23.1",
+    "mcp>=2,<3",
     "pydantic-settings>=2.6.1",
     "loguru>=0.7.3",
     "pyright>=1.1.390",
@@ -29,8 +29,7 @@ dependencies = [
     "alembic>=1.14.1",
     "pillow>=11.1.0",
     "pybars3>=0.9.7",
-    # Keep FastMCP pinned until each minor upgrade passes the MCP transport matrix.
-    "fastmcp==3.3.1",
+    "fastmcp==4.0.0b1",
     "pyjwt>=2.10.1",
     "python-dotenv>=1.1.0",
     "pytest-aio>=1.9.0",
@@ -48,8 +47,29 @@ dependencies = [
     "fastembed>=0.7.4",
     "sqlite-vec>=0.1.6",
     "openai>=1.100.2",
+    # LiteLLM 1.92 added a Rust bridge whose PyO3 version rejects Python 3.14.
+    # Keep the last universal wheel while Basic Memory supports Python 3.14.
+    "litellm>=1.60.0,<1.92.0",
     "logfire>=4.19.0",
     "psutil>=5.9.0",
+    # uvloop's C event loop has no self._ready.popleft() codepath, so the
+    # asyncpg engine-dispose race ("IndexError: pop from an empty deque") that
+    # crashes the Postgres backend cannot fire under it. Not available on Windows.
+    "uvloop>=0.21.0; sys_platform != 'win32'",
+    # Cross-platform advisory file lock (already resolved transitively via
+    # huggingface-hub; declared directly since the hook flush path imports it).
+    # Serializes concurrent `bm hook flush` runs so a stale sweep can't overwrite
+    # an artifact without a sibling flush's just-retired event.
+    "filelock>=3.12",
+]
+
+[project.optional-dependencies]
+milvus = [
+    "pymilvus>=3.0.0,<4; sys_platform == 'win32'",
+    "pymilvus[milvus-lite]>=3.0.0,<4; sys_platform != 'win32'",
+]
+redis = [
+    "redis>=8.0.0,<9",
 ]
 
 [project.urls]
@@ -68,9 +88,14 @@ build-backend = "hatchling.build"
 [tool.pytest.ini_options]
 pythonpath = ["src", "tests"]
 addopts = "--cov=basic_memory --cov-report term-missing"
-testpaths = ["tests", "test-int"]
+# plugins/ carries the co-located uv hook-script tests (one per script).
+testpaths = ["tests", "test-int", "plugins"]
 asyncio_mode = "strict"
 asyncio_default_fixture_loop_scope = "function"
+# Any test hanging >120s fails with a stack dump instead of stalling the CI job
+# until the runner times out (the FastMCP/asyncpg cleanup-hang family).
+timeout = 120
+timeout_method = "thread"
 filterwarnings = [
     "ignore:The @wait_container_is_ready decorator is deprecated.*:DeprecationWarning:testcontainers\\.core\\.waiting_utils",
     "ignore:The default datetime adapter is deprecated as of Python 3\\.12.*:DeprecationWarning:aiosqlite\\.core",
@@ -81,14 +106,21 @@ markers = [
     "benchmark: Performance benchmark tests (deselect with '-m \"not benchmark\"')",
     "slow: Slow-running tests (deselect with '-m \"not slow\"')",
     "postgres: Tests that run against Postgres backend (deselect with '-m \"not postgres\"')",
+    "redis: Tests that run against a real Redis server",
     "windows: Windows-specific tests (deselect with '-m \"not windows\"')",
     "smoke: Fast end-to-end smoke tests for MCP flows",
     "semantic: Tests requiring semantic dependencies (fastembed, sqlite-vec, openai)",
+    "live: Tests that call external provider APIs and require explicit opt-in",
 ]
 
 [tool.ruff]
+extend-exclude = ["*.md"]
 line-length = 100
 target-version = "py312"
+
+[tool.ruff.lint]
+# Ruff 0.16 expanded its defaults; preserve the repository's established lint baseline.
+select = ["E4", "E7", "E9", "F"]
 
 [dependency-groups]
 dev = [
@@ -100,19 +132,25 @@ dev = [
     "pytest-mock>=3.12.0",
     "pytest-asyncio>=0.24.0",
     "pytest-xdist>=3.0.0",
-    "ruff>=0.1.6",
+    "ruff>=0.16.0",
     "freezegun>=1.5.5",
     "testcontainers[postgres]>=4.0.0",
+    "redis>=8.0.0,<9",
     "psycopg>=3.2.0",
     "pyright>=1.1.408",
     "pytest-testmon>=2.2.0",
-    "ty>=0.0.18",
+    "ty>=0.0.64",
     "cst-lsp>=0.1.3",
     "libcst>=1.8.6",
+    "pytest-timeout>=2.4.0",
+    "pytest-split>=0.11.0",
 ]
 
 [tool.hatch.version]
 source = "uv-dynamic-versioning"
+
+[tool.uv]
+constraint-dependencies = ["fastmcp-slim==4.0.0b1"]
 
 [tool.uv-dynamic-versioning]
 vcs = "git"
@@ -120,15 +158,8 @@ style = "pep440"
 bump = true
 fallback-version = "0.0.0"
 
-[tool.pyright]
-include = ["src/"]
-exclude = ["**/__pycache__"]
-ignore = ["test/"]
-defineConstant = { DEBUG = true }
-reportMissingImports = "error"
-reportMissingTypeStubs = false
-reportUnusedImport = "none"
-pythonVersion = "3.12"
+[tool.ty.rules]
+all = "error"
 
 
 

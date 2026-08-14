@@ -1,5 +1,12 @@
 # Basic Memory - Modern Command Runner
 
+PYTEST_FLAGS := env_var_or_default("BASIC_MEMORY_PYTEST_FLAGS", "--import-mode=importlib")
+TESTMON_SELECT_FLAGS := env_var_or_default("BASIC_MEMORY_TESTMON_SELECT_FLAGS", "--import-mode=importlib --testmon --testmon-forceselect")
+TESTMON_REFRESH_FLAGS := env_var_or_default("BASIC_MEMORY_TESTMON_REFRESH_FLAGS", "--import-mode=importlib --testmon-noselect")
+# CI shards the Postgres unit suite across parallel jobs via pytest-split
+# (e.g. "--splits 3 --group 2"). Empty locally.
+PYTEST_SPLIT_FLAGS := env_var_or_default("BASIC_MEMORY_PYTEST_SPLIT_FLAGS", "")
+
 # Install dependencies
 install:
     uv sync
@@ -14,7 +21,10 @@ install:
 # Set BASIC_MEMORY_TEST_POSTGRES=1 to run against Postgres (uses testcontainers).
 #
 # Quick Start:
-#   just test              # Run all tests against SQLite (default)
+#   just check             # Run static checks only (fix, format, typecheck)
+#   just fast-check        # Fast static check: fix, format, typecheck
+#   just fast-test         # Run pytest-testmon impacted tests
+#   just test              # Run all tests against SQLite and Postgres
 #   just test-sqlite       # Run all tests against SQLite
 #   just test-postgres     # Run all tests against Postgres (testcontainers)
 #   just test-unit-sqlite  # Run unit tests against SQLite
@@ -36,15 +46,19 @@ test-postgres: test-unit-postgres test-int-postgres
 
 # Run unit tests against SQLite
 test-unit-sqlite:
-    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov tests
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov {{PYTEST_FLAGS}} tests
 
 # Run unit tests against Postgres
+# Exit code 5 (no tests collected) is success: a pytest-split shard can be empty.
 test-unit-postgres:
-    BASIC_MEMORY_ENV=test BASIC_MEMORY_TEST_POSTGRES=1 uv run pytest -p pytest_mock -v --no-cov tests
+    #!/usr/bin/env bash
+    set -euo pipefail
+    BASIC_MEMORY_ENV=test BASIC_MEMORY_TEST_POSTGRES=1 uv run pytest -p pytest_mock -v --no-cov {{PYTEST_FLAGS}} {{PYTEST_SPLIT_FLAGS}} tests || test $? -eq 5
 
-# Run integration tests against SQLite (excludes semantic benchmarks — use just test-semantic)
+# Run integration tests against SQLite (excludes semantic tests and on-demand benchmarks —
+# use just test-semantic / run benchmark files explicitly)
 test-int-sqlite:
-    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov -m "not semantic" test-int
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov {{PYTEST_FLAGS}} -m "not semantic and not benchmark" test-int
 
 # Run integration tests against Postgres
 # Note: Uses timeout due to FastMCP Client + asyncpg cleanup hang (tests pass, process hangs on exit)
@@ -55,27 +69,286 @@ test-int-postgres:
     # Use gtimeout (macOS/Homebrew) or timeout (Linux)
     TIMEOUT_CMD=$(command -v gtimeout || command -v timeout || echo "")
     if [[ -n "$TIMEOUT_CMD" ]]; then
-        $TIMEOUT_CMD --signal=KILL 600 bash -c 'BASIC_MEMORY_ENV=test BASIC_MEMORY_TEST_POSTGRES=1 uv run pytest -p pytest_mock -v --no-cov -m "not semantic" test-int' || test $? -eq 137
+        $TIMEOUT_CMD --signal=KILL 600 bash -c 'BASIC_MEMORY_ENV=test BASIC_MEMORY_TEST_POSTGRES=1 uv run pytest -p pytest_mock -v --no-cov {{PYTEST_FLAGS}} -m "not semantic and not benchmark" test-int' || test $? -eq 137
     else
         echo "⚠️  No timeout command found, running without timeout..."
-        BASIC_MEMORY_ENV=test BASIC_MEMORY_TEST_POSTGRES=1 uv run pytest -p pytest_mock -v --no-cov -m "not semantic" test-int
+        BASIC_MEMORY_ENV=test BASIC_MEMORY_TEST_POSTGRES=1 uv run pytest -p pytest_mock -v --no-cov {{PYTEST_FLAGS}} -m "not semantic and not benchmark" test-int
     fi
 
-# Run tests impacted by recent changes (requires pytest-testmon)
-# Pass paths or node ids after `just testmon` to limit the candidate set further.
+# Fast test selection for local iteration; run targeted tests explicitly when possible.
+fast-test *args: testmon-seed
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov {{TESTMON_SELECT_FLAGS}} --testmon-env=local {{args}}
+
+# Run tests impacted by recent changes (requires pytest-testmon).
+# Backcompat alias for the fast-test recipe.
 testmon *args:
-    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov --testmon {{args}}
+    just fast-test {{args}}
+
+# Seed pytest-testmon data into this worktree from the shared Git cache.
+testmon-seed:
+    uv run python scripts/testmon_cache.py seed
+
+# Refresh the shared pytest-testmon cache from a full backend test run.
+testmon-refresh:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    BASIC_MEMORY_PYTEST_FLAGS="{{TESTMON_REFRESH_FLAGS}}" just test
+    uv run python scripts/testmon_cache.py refresh
+
+# Show local and shared pytest-testmon cache locations.
+testmon-status:
+    uv run python scripts/testmon_cache.py status
 
 # Run MCP smoke test (fast end-to-end loop)
 test-smoke:
-    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov -m smoke test-int/mcp/test_smoke_integration.py
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov {{PYTEST_FLAGS}} -m smoke test-int/mcp/test_smoke_integration.py
 
-# Fast local loop: lint, format, typecheck, impacted tests via pytest-testmon
+# Run the complete semantic read-cache suite against a real Redis server.
+# BASIC_MEMORY_TEST_REDIS_URL may select an existing server; otherwise testcontainers owns one.
+test-read-cache:
+    BASIC_MEMORY_ENV=test LOGFIRE_IGNORE_NO_CONFIG=1 uv run pytest -p pytest_mock --no-cov -q test-int/read_cache
+
+# Fast static check: auto-fix lint, format, and typecheck, but do not run tests.
 fast-check:
     just fix
     just format
     just typecheck
-    just testmon
+
+# Fast local loop with live OpenAI-backed checks disabled.
+fast-check-no-openai:
+    OPENAI_API_KEY= just fast-check
+
+# ==============================================================================
+# Runtime / Event Indexing Refactor
+# ==============================================================================
+
+# Focused portable storage-event contract tests.
+storage-event-contract-test:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov \
+        tests/test_runtime_storage_events.py \
+        tests/index/test_storage_event_operation_processor.py \
+        tests/index/test_storage_event_orchestration.py
+
+# Focused provider-neutral project-index orchestration surface tests.
+project-index-surface-test:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov \
+        tests/index/test_project_index_surface.py
+
+# Focused provider-neutral project-index workflow tests.
+project-index-workflow-test:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov \
+        tests/indexing/test_project_index_workflow.py
+
+# Focused provider-neutral project-index coordinator tests.
+project-index-runner-test:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov \
+        tests/indexing/test_project_index_runner.py
+
+# Focused provider-neutral change-planning tests.
+change-planning-test:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov \
+        tests/indexing/test_change_planning.py
+
+# Focused local project-index adapter tests.
+local-project-index-test:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov \
+        tests/index/test_local_project_index.py
+
+# Focused local project-index scan parity tests.
+local-project-index-scan-test:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov \
+        tests/index/test_local_project_scan_parity.py
+
+# Focused local project-index directory delete parity test.
+local-project-index-directory-delete-test:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov \
+        tests/index/test_local_project_index.py::test_local_project_index_directory_delete_removes_notes_and_repairs_survivors
+
+# Focused local project-index hidden-file parity test.
+local-project-index-hidden-file-test:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov \
+        tests/index/test_local_project_index.py::test_local_project_index_skips_hidden_markdown_files
+
+# Focused local project-index null-checksum repair parity test.
+local-project-index-null-checksum-test:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov \
+        tests/index/test_local_project_index.py::test_local_project_index_repairs_null_checksum_entities
+
+# Focused local project-index file timestamp parity tests.
+local-project-index-timestamp-test:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov \
+        tests/index/test_local_project_index.py::test_local_project_index_uses_file_mtime_for_new_markdown_entities \
+        tests/index/test_local_project_index.py::test_local_project_index_updates_entity_mtime_on_file_modification
+
+# Focused local project-index regular-file parity tests.
+local-project-index-regular-file-test:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov \
+        tests/index/test_local_project_index.py::test_local_project_index_indexes_regular_files \
+        tests/index/test_local_project_index.py::test_local_project_index_updates_regular_file_checksum \
+        tests/index/test_local_project_index.py::test_local_project_index_moves_and_deletes_regular_file_entities \
+        tests/index/test_local_project_index.py::test_local_project_index_resolves_regular_file_relations
+
+# Focused local project-index markdown move conflict parity test.
+local-project-index-markdown-move-conflict-test:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov \
+        tests/index/test_local_project_index.py::test_local_project_index_moves_markdown_over_deleted_path_with_permalink_repair
+
+# Focused local project-index changed-during-index parity test.
+local-project-index-race-test:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov \
+        tests/index/test_local_project_index.py::test_local_project_index_reads_current_file_when_file_changes_after_observation
+
+# Focused local project-index duplicate permalink parity test.
+local-project-index-permalink-conflict-test:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov \
+        tests/index/test_local_project_index.py::test_local_project_index_resolves_duplicate_permalink_update
+
+# Focused local project-index new duplicate permalink parity test.
+local-project-index-new-permalink-conflict-test:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov \
+        tests/index/test_local_project_index.py::test_local_project_index_resolves_new_duplicate_permalink
+
+# Focused local project-index path-derived permalink conflict parity test.
+local-project-index-path-conflict-test:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov \
+        tests/index/test_local_project_index.py::test_local_project_index_assigns_unique_permalinks_for_path_conflicts
+
+# Focused local project-index frontmatter policy parity tests.
+local-project-index-frontmatter-policy-test:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov \
+        tests/index/test_local_project_index.py::test_local_project_index_does_not_add_frontmatter_when_disabled \
+        tests/index/test_local_project_index.py::test_local_project_index_indexes_thematic_break_content_without_frontmatter \
+        tests/index/test_local_project_index.py::test_local_project_index_writes_frontmatter_when_enabled_even_if_permalinks_disabled
+
+# Focused local project-index thematic-break frontmatter parity test.
+local-project-index-thematic-break-test:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov \
+        tests/index/test_local_project_index.py::test_local_project_index_indexes_thematic_break_content_without_frontmatter
+
+# Focused local project-index relation resolution parity test.
+local-project-index-relation-parity-test:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov \
+        tests/index/test_local_project_index.py::test_local_project_index_resolves_order_dependent_relations_after_batches \
+        tests/index/test_local_project_index.py::test_local_project_index_deduplicates_relations_by_type
+
+# Focused local project-index observation category parity test.
+local-project-index-observation-category-test:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov \
+        tests/index/test_local_project_index.py::test_local_project_index_preserves_loose_observation_categories
+
+# Focused local project-index wikilink stability parity test.
+local-project-index-wikilink-stability-test:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov \
+        tests/index/test_local_project_index.py::test_local_project_index_keeps_wikilink_source_stable_when_target_appears
+
+# Focused per-file indexing runner/model tests.
+file-index-runner-test:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov \
+        tests/indexing/test_index_file_runner.py \
+        tests/indexing/test_file_indexer.py \
+        tests/indexing/test_models.py
+
+# Focused file-batch indexing runner/payload tests.
+file-index-batch-test:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov \
+        tests/indexing/test_file_batch_runner.py \
+        tests/indexing/test_job_payloads.py
+
+# Focused batch-index semantic dependency parity test.
+file-index-semantic-dependency-test:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov \
+        tests/indexing/test_batch_indexer.py::test_batch_indexer_keeps_file_indexed_when_semantic_dependencies_are_missing
+
+# Focused startup wiring for local project-index fanout.
+local-project-index-startup-test:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov \
+        tests/services/test_initialization.py::test_initialize_file_indexing_uses_project_index_runtime_for_initial_sync_by_default
+
+# Focused CLI project-index surface tests.
+project-index-cli-test:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov \
+        tests/cli/test_db_reindex.py \
+        tests/cli/test_status_wait_timeout.py
+
+# Focused project-wide indexing orchestration surface tests.
+project-index-contract-test: project-index-surface-test project-index-workflow-test project-index-runner-test change-planning-test local-project-index-test local-project-index-scan-test local-project-index-markdown-move-conflict-test local-project-index-new-permalink-conflict-test local-project-index-path-conflict-test local-project-index-thematic-break-test local-project-index-observation-category-test local-project-index-wikilink-stability-test local-project-index-startup-test project-index-cli-test
+
+# Focused event-based indexing contract tests for the cloud/core extraction loop.
+local-event-index-regular-file-test:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov \
+        tests/index/test_local_watch_regular_file_parity.py
+
+# Focused local event-index relation cleanup parity test.
+local-event-index-relation-test:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov \
+        tests/index/test_local_watch_regular_file_parity.py::test_local_event_index_deletes_regular_file_relation_target_and_repairs_search
+
+# Focused local event-index atomic-write parity test.
+local-event-index-atomic-write-test:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov \
+        tests/index/test_local_watch_stress_parity.py::test_local_event_index_handles_rapid_atomic_writes_to_same_file
+
+# Focused local filesystem event temp/backup filtering parity test.
+filesystem-event-temp-file-test:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov \
+        tests/index/test_filesystem_events.py::test_editor_swap_and_backup_changes_are_filtered_before_indexing
+
+# Focused local event-index larger watcher batch parity tests.
+local-event-index-stress-test:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov \
+        tests/index/test_local_watch_stress_parity.py
+
+# Focused event-based indexing contract tests for the cloud/core extraction loop.
+event-index-contract-test: storage-event-contract-test filesystem-event-temp-file-test local-event-index-atomic-write-test local-event-index-stress-test
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov \
+        tests/indexing/test_external_file_delete_runner.py \
+        tests/index/test_filesystem_events.py \
+        tests/index/test_inline_storage_event_processor.py \
+        tests/index/test_local_watch_ignore_parity.py \
+        tests/index/test_local_watch_regular_file_parity.py \
+        tests/index/test_local_watch_orchestration.py \
+        tests/index/test_repository_storage_event_project_resolution.py \
+        tests/services/test_initialization.py::test_initialize_file_indexing_wires_event_index_runtime_by_default
+
+# Focused parity loop for local project scans and shared storage-event routing.
+event-index-parity-test:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov \
+        tests/test_runtime.py::TestRuntimeContracts::test_runtime_storage_event_operation_plans_index_delete_and_skip_work \
+        tests/test_runtime_observed_index_files.py \
+        tests/index/test_local_project_index.py \
+        tests/index/test_filesystem_events.py \
+        tests/index/test_storage_event_operation_processor.py \
+        tests/index/test_storage_event_orchestration.py
+
+# Focused indexing contract suite for the cloud/core extraction loop.
+index-contract-test: file-index-runner-test file-index-batch-test file-index-semantic-dependency-test project-index-contract-test event-index-contract-test
+
+# Focused core contract suite used by the basic-memory-cloud runtime refactor loop.
+runtime-core-pytest *args:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov {{args}}
+
+# Focused PR #1002 Codex feedback regressions.
+pr-1002-feedback-test:
+    BASIC_MEMORY_ENV=test BASIC_MEMORY_SEMANTIC_SEARCH_ENABLED=true LOGFIRE_IGNORE_NO_CONFIG=1 uv run pytest -p pytest_mock -q --no-cov \
+        tests/runtime/test_deleted_note_response.py \
+        tests/repository/test_accepted_note_search_repository.py \
+        tests/indexing/test_project_index_workflow.py \
+        tests/indexing/test_accepted_note_write_runner.py \
+        tests/indexing/test_directory_delete_runner.py
+
+runtime-core-fast-check-no-openai:
+    OPENAI_API_KEY= just fast-check
+
+runtime-refactor-contract-test:
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -q --no-cov \
+        tests/indexing/test_accepted_note_write_runner.py \
+        tests/indexing/test_accepted_note_enqueue_runner.py \
+        tests/indexing/test_note_content_read_repair_runner.py \
+        tests/runtime/test_accepted_note_response_planning.py \
+        tests/runtime/test_deleted_note_response.py \
+        tests/runtime/test_pending_note_materialization.py \
+        tests/runtime/test_note_content_read_planning.py
+    just index-contract-test
 
 # Reset Postgres test database (drops and recreates schema)
 # Useful when Alembic migration state gets out of sync during development
@@ -98,26 +371,30 @@ postgres-migrate:
 # These tests verify Windows-specific database optimizations (locking mode, NullPool)
 # Will be skipped automatically on non-Windows platforms
 test-windows:
-    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov -m windows tests test-int
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov {{PYTEST_FLAGS}} -m windows tests test-int
 
 # Run benchmark tests only (performance testing)
 # These are slow tests that measure sync performance with various file counts
 # Excluded from default test runs to keep CI fast
 test-benchmark:
-    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov -m benchmark tests test-int
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov {{PYTEST_FLAGS}} -m benchmark tests test-int
 
 # Run semantic search quality benchmarks (all combos)
 test-semantic:
-    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov -m semantic test-int/semantic/
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov {{PYTEST_FLAGS}} -m semantic test-int/semantic/
 
 # Run semantic benchmarks with JSON artifact output, then show report
 test-semantic-report:
     BASIC_MEMORY_ENV=test BASIC_MEMORY_BENCHMARK_OUTPUT=.benchmarks/semantic-quality.jsonl uv run pytest -p pytest_mock -v -s --no-cov -m semantic test-int/semantic/
     uv run python test-int/semantic/report.py .benchmarks/semantic-quality.jsonl
 
+# Run opt-in live LiteLLM provider checks against configured external APIs
+test-litellm-live *args:
+    BASIC_MEMORY_ENV=test BASIC_MEMORY_RUN_LITELLM_INTEGRATION=1 PYTHONPATH=test-int:src uv run python -m semantic.litellm_live_harness {{args}}
+
 # Run semantic benchmarks (Postgres combos only)
 test-semantic-postgres:
-    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov -m semantic -k postgres test-int/semantic/
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov {{PYTEST_FLAGS}} -m semantic -k postgres test-int/semantic/
 
 # View semantic benchmark results (rich formatted table)
 # Usage: just semantic-report [--filter-combo sqlite] [--filter-suite paraphrase] [--sort-by avg_latency_ms]
@@ -131,10 +408,50 @@ semantic-report *args:
 benchmark-compare baseline candidate *args:
     uv run python test-int/compare_search_benchmarks.py "{{baseline}}" "{{candidate}}" --format table {{args}}
 
+# Check the standalone read-load driver in the root environment that supplies Redis/testcontainers.
+bench-read-check:
+    uv run ruff check benchmarks/scripts/read_load_bench.py
+    uv run pyright benchmarks/scripts/read_load_bench.py
+
+# Run one MCP read-load sweep. An empty Redis URL is the authoritative baseline.
+bench-read-load label="authoritative" redis_url="":
+    uv run python benchmarks/scripts/read_load_bench.py \
+        --bm-command .venv/bin/basic-memory \
+        --label "{{label}}" \
+        --redis-url "{{redis_url}}" \
+        --scratch ".scratch/read-load-{{label}}" \
+        --output ".scratch/read-load-{{label}}/results.jsonl" \
+        --truncate
+
+# Exercise MCP startup, Redis pool capacity, warmup, result output, and provenance with a tiny corpus.
+bench-read-smoke redis_url="redis://127.0.0.1:6379/0":
+    uv run python benchmarks/scripts/read_load_bench.py \
+        --bm-command .venv/bin/basic-memory \
+        --label "smoke" \
+        --redis-url "{{redis_url}}" \
+        --scratch ".scratch/read-load-smoke" \
+        --output ".scratch/read-load-smoke/results.jsonl" \
+        --truncate \
+        --sizes 1024 \
+        --notes-per-size 2 \
+        --reads 64 \
+        --concurrency 64 \
+        --seed-concurrency 1 \
+        --quiesce-seconds 0.1
+
+# Run adjacent authoritative and warmed-Redis sweeps, then print their comparison.
+bench-read-cache redis_url="redis://127.0.0.1:6379/0" run_id="latest":
+    just bench-read-load "authoritative-{{run_id}}"
+    just bench-read-load "redis-warm-{{run_id}}" "{{redis_url}}"
+    uv run python test-int/compare_search_benchmarks.py \
+        ".scratch/read-load-authoritative-{{run_id}}/results.jsonl" \
+        ".scratch/read-load-redis-warm-{{run_id}}/results.jsonl" \
+        --format markdown
+
 # Run all tests including Windows, Postgres, and Benchmarks (for CI/comprehensive testing)
 # Use this before releasing to ensure everything works across all backends and platforms
 test-all:
-    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov tests test-int
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov {{PYTEST_FLAGS}} tests test-int
 
 # Generate HTML coverage report
 coverage:
@@ -259,14 +576,14 @@ telemetry-smoke:
 update-deps:
     uv sync --upgrade
 
-# Run all code quality checks and tests
-check: lint format typecheck test
+# Run static code quality checks. Use `just test` for the actual test suites.
+check: lint format typecheck
 
 # Run all code quality checks and all test suites, including semantic benchmarks
 check-all: lint format typecheck test test-semantic
 
-# Validate every consolidated agent package (Claude Code, skills, Hermes, OpenClaw)
-package-check: package-check-claude-code package-check-skills package-check-hermes package-check-openclaw
+# Validate every consolidated agent package (Claude Code, Codex, skills, Hermes, OpenClaw)
+package-check: package-check-claude-code package-check-codex package-check-skills package-check-hermes package-check-openclaw
 
 # Alias for plugin/package validation during consolidation work
 plugins-check: package-check
@@ -277,6 +594,10 @@ agent-harness-check: package-check-claude-code package-check-hermes package-chec
 # Claude Code plugin: manifests, bundled skills, bundled agent, and strict plugin validation
 package-check-claude-code:
     just --justfile plugins/claude-code/justfile --working-directory plugins/claude-code check
+
+# Codex plugin: manifest, bundled skills, hooks, MCP config, and schemas
+package-check-codex:
+    just --justfile plugins/codex/justfile --working-directory plugins/codex check
 
 # Shared top-level SKILL.md source
 package-check-skills:
@@ -295,9 +616,30 @@ package-check-openclaw:
 migration message:
     cd src/basic_memory/alembic && alembic revision --autogenerate -m "{{message}}"
 
+# Set the Basic Memory version across release manifests (scope: all | core | packages)
+set-version version scope="all":
+    python3 scripts/update_versions.py "{{version}}" --scope "{{scope}}"
+
+# Pin the Basic Memory Git ref used by all Codex uv hook scripts.
+set-codex-hook-version ref:
+    uv add --script plugins/codex/hooks/session_start.py --raw "basic-memory @ git+https://github.com/basicmachines-co/basic-memory@{{ref}}"
+    uv add --script plugins/codex/hooks/pre_compact.py --raw "basic-memory @ git+https://github.com/basicmachines-co/basic-memory@{{ref}}"
+
+# Preview a version update without writing (scope: all | core | packages)
+set-version-dry-run version scope="all":
+    python3 scripts/update_versions.py "{{version}}" --scope "{{scope}}" --dry-run
+
+# Set the version for just the plugin/agent artifacts (plugins, marketplaces, Hermes, OpenClaw)
+set-packages-version version:
+    just set-version "{{version}}" packages
+
+# Preview a plugin/agent-artifact version update without writing
+set-packages-version-dry-run version:
+    just set-version-dry-run "{{version}}" packages
+
 # Preview the consolidated manifest version update without changing files
 release-dry-run version:
-    python3 scripts/update_versions.py "{{version}}" --dry-run
+    just set-version-dry-run "{{version}}"
 
 # Create a stable release (e.g., just release v0.13.2)
 release version:
@@ -332,43 +674,96 @@ release version:
         echo "❌ Tag {{version}} already exists"
         exit 1
     fi
-    
+
+    # Changelog must already be on main (land it via a normal PR first)
+    if ! grep -q "^## {{version}} " CHANGELOG.md; then
+        echo "❌ CHANGELOG.md has no entry for {{version}}. Land one via PR first."
+        exit 1
+    fi
+
     # Run quality checks
     echo "🔍 Running lint  checks..."
     just lint
     just typecheck
-    
+
     # Update all package manifests to the one Basic Memory product version.
     echo "📝 Updating consolidated package versions..."
-    python3 scripts/update_versions.py "{{version}}"
+    just set-version "{{version}}"
+    just set-codex-hook-version "{{version}}"
 
-    # Commit version update
+    # Trigger: main's ruleset rejects direct pushes ("Changes must be made
+    # through a pull request").
+    # Why: the version bump must land on main before the tag is cut, so it
+    # rides a release PR that is rebase-merged (the repo disallows merge
+    # commits).
+    # Outcome: the bump commit gets a new SHA on main; the tag is created on
+    # that rebased commit, found by its commit subject.
+    COMMIT_SUBJECT="chore: update version to $VERSION_NUM for {{version}} release"
+    git checkout -b "release/{{version}}"
     git add \
         src/basic_memory/__init__.py \
         server.json \
         .claude-plugin/marketplace.json \
         plugins/claude-code/.claude-plugin/plugin.json \
         plugins/claude-code/.claude-plugin/marketplace.json \
+        plugins/codex/.codex-plugin/plugin.json \
+        plugins/codex/hooks/session_start.py \
+        plugins/codex/hooks/pre_compact.py \
         integrations/hermes/plugin.yaml \
         integrations/hermes/__init__.py \
         integrations/openclaw/package.json
-    git commit -s -m "chore: update version to $VERSION_NUM for {{version}} release"
-    
-    # Create and push tag
-    echo "🏷️  Creating tag {{version}}..."
-    git tag "{{version}}"
-    
-    echo "📤 Pushing to GitHub..."
-    git push origin main
+    git commit -s -m "$COMMIT_SUBJECT"
+
+    echo "📤 Opening release PR..."
+    git push -u origin "release/{{version}}"
+    gh pr create --title "chore(core): release {{version}}" \
+        --body "Version bump for {{version}}. See CHANGELOG.md for release notes."
+
+    # Trigger: the PR may not be mergeable synchronously (merge gates,
+    # required checks added later, or GitHub still computing mergeability).
+    # Why: the tag must point at the bump commit on main, so the recipe
+    # cannot tag until the merge has actually landed.
+    # Outcome: try a direct rebase-merge, fall back to queueing auto-merge,
+    # then poll main for the rebased bump commit before tagging.
+    if ! gh pr merge "release/{{version}}" --rebase --delete-branch; then
+        echo "⚠️  Direct merge did not complete (merge gates pending?). Queueing auto-merge..."
+        gh pr merge "release/{{version}}" --rebase --delete-branch --auto
+    fi
+
+    echo "⏳ Waiting for the bump commit to land on main..."
+    TAG_COMMIT=""
+    for _ in $(seq 1 60); do
+        git fetch origin main --quiet
+        TAG_COMMIT=$(git log FETCH_HEAD --fixed-strings --grep "$COMMIT_SUBJECT" --format='%H' -1)
+        [[ -n "$TAG_COMMIT" ]] && break
+        sleep 5
+    done
+    if [[ -z "$TAG_COMMIT" ]]; then
+        echo "❌ Bump commit not on main after 5 minutes (merge still pending?)."
+        echo "   Once the release PR merges, finish the release manually:"
+        echo "   git fetch origin main"
+        echo "   git tag {{version}} \$(git log FETCH_HEAD --fixed-strings --grep \"$COMMIT_SUBJECT\" --format='%H' -1)"
+        echo "   git push origin {{version}}"
+        exit 1
+    fi
+
+    git checkout main
+    git pull --ff-only origin main
+    git branch -D "release/{{version}}" 2>/dev/null || true
+
+    echo "🏷️  Creating tag {{version}} at $TAG_COMMIT..."
+    git tag "{{version}}" "$TAG_COMMIT"
     git push origin "{{version}}"
-    
+
     echo "✅ Release {{version}} created successfully!"
     echo "📦 GitHub Actions will build and publish to PyPI"
     echo "🔗 Monitor at: https://github.com/basicmachines-co/basic-memory/actions"
     echo ""
     echo "📝 REMINDER: Post-release tasks:"
-    echo "   1. docs.basicmemory.com - Add release notes to src/pages/latest-releases.mdx"
-    echo "   2. basicmachines.co - Update version in src/components/sections/hero.tsx"
+    echo "   1. docs.basicmemory.com - Add a What's New page under content/2.whats-new/"
+    echo "      and bump the badge in content/index.md (see that repo's CLAUDE.md)"
+    echo "   2. basicmemory.com - No version number in the site UI; for a significant"
+    echo "      release optionally add a post under src/content/blog/. Skip for patches."
     echo "   3. MCP Registry - Run: mcp-publisher publish"
     echo "   See: .claude/commands/release/release.md for detailed instructions"
 
@@ -413,36 +808,83 @@ beta version:
     
     # Update all package manifests to the one Basic Memory product version.
     echo "📝 Updating consolidated package versions..."
-    python3 scripts/update_versions.py "{{version}}"
+    just set-version "{{version}}"
+    just set-codex-hook-version "{{version}}"
 
-    # Commit version update
+    # Trigger: main's ruleset rejects direct pushes ("Changes must be made
+    # through a pull request").
+    # Why: the version bump must land on main before the tag is cut, so it
+    # rides a release PR that is rebase-merged (the repo disallows merge
+    # commits).
+    # Outcome: the bump commit gets a new SHA on main; the tag is created on
+    # that rebased commit, found by its commit subject.
+    COMMIT_SUBJECT="chore: update version to $VERSION_NUM for {{version}} beta release"
+    git checkout -b "release/{{version}}"
     git add \
         src/basic_memory/__init__.py \
         server.json \
         .claude-plugin/marketplace.json \
         plugins/claude-code/.claude-plugin/plugin.json \
         plugins/claude-code/.claude-plugin/marketplace.json \
+        plugins/codex/.codex-plugin/plugin.json \
+        plugins/codex/hooks/session_start.py \
+        plugins/codex/hooks/pre_compact.py \
         integrations/hermes/plugin.yaml \
         integrations/hermes/__init__.py \
         integrations/openclaw/package.json
-    git commit -s -m "chore: update version to $VERSION_NUM for {{version}} beta release"
-    
-    # Create and push tag
-    echo "🏷️  Creating tag {{version}}..."
-    git tag "{{version}}"
-    
-    echo "📤 Pushing to GitHub..."
-    git push origin main
+    git commit -s -m "$COMMIT_SUBJECT"
+
+    echo "📤 Opening release PR..."
+    git push -u origin "release/{{version}}"
+    gh pr create --title "chore(core): release {{version}}" \
+        --body "Version bump for {{version}} beta."
+
+    # Trigger: the PR may not be mergeable synchronously (merge gates,
+    # required checks added later, or GitHub still computing mergeability).
+    # Why: the tag must point at the bump commit on main, so the recipe
+    # cannot tag until the merge has actually landed.
+    # Outcome: try a direct rebase-merge, fall back to queueing auto-merge,
+    # then poll main for the rebased bump commit before tagging.
+    if ! gh pr merge "release/{{version}}" --rebase --delete-branch; then
+        echo "⚠️  Direct merge did not complete (merge gates pending?). Queueing auto-merge..."
+        gh pr merge "release/{{version}}" --rebase --delete-branch --auto
+    fi
+
+    echo "⏳ Waiting for the bump commit to land on main..."
+    TAG_COMMIT=""
+    for _ in $(seq 1 60); do
+        git fetch origin main --quiet
+        TAG_COMMIT=$(git log FETCH_HEAD --fixed-strings --grep "$COMMIT_SUBJECT" --format='%H' -1)
+        [[ -n "$TAG_COMMIT" ]] && break
+        sleep 5
+    done
+    if [[ -z "$TAG_COMMIT" ]]; then
+        echo "❌ Bump commit not on main after 5 minutes (merge still pending?)."
+        echo "   Once the release PR merges, finish the release manually:"
+        echo "   git fetch origin main"
+        echo "   git tag {{version}} \$(git log FETCH_HEAD --fixed-strings --grep \"$COMMIT_SUBJECT\" --format='%H' -1)"
+        echo "   git push origin {{version}}"
+        exit 1
+    fi
+
+    git checkout main
+    git pull --ff-only origin main
+    git branch -D "release/{{version}}" 2>/dev/null || true
+
+    echo "🏷️  Creating tag {{version}} at $TAG_COMMIT..."
+    git tag "{{version}}" "$TAG_COMMIT"
     git push origin "{{version}}"
-    
+
     echo "✅ Beta release {{version}} created successfully!"
     echo "📦 GitHub Actions will build and publish to PyPI as pre-release"
     echo "🔗 Monitor at: https://github.com/basicmachines-co/basic-memory/actions"
     echo "📥 Install with: uv tool install basic-memory --pre"
     echo ""
     echo "📝 REMINDER: For stable releases, update documentation sites:"
-    echo "   1. docs.basicmemory.com - Add release notes to src/pages/latest-releases.mdx"
-    echo "   2. basicmachines.co - Update version in src/components/sections/hero.tsx"
+    echo "   1. docs.basicmemory.com - Add a What's New page under content/2.whats-new/"
+    echo "      and bump the badge in content/index.md (see that repo's CLAUDE.md)"
+    echo "   2. basicmemory.com - No version number in the site UI; for a significant"
+    echo "      release optionally add a post under src/content/blog/. Skip for patches."
     echo "   See: .claude/commands/release/release.md for detailed instructions"
 
 # List all available recipes

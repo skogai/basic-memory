@@ -22,9 +22,10 @@ See the [README.md](README.md) file for a project overview.
 - Run unit tests (Postgres): `just test-unit-postgres`
 - Run integration tests (SQLite): `just test-int-sqlite`
 - Run integration tests (Postgres): `just test-int-postgres`
-- Run impacted tests: `just testmon` (pytest-testmon; only tests affected by changed code)
+- Run impacted tests: `just fast-test` or `just testmon` (pytest-testmon; only tests affected by changed code)
 - Run MCP smoke test: `just test-smoke`
-- Fast local loop: `just fast-check` (default iteration flow)
+- Fast static check: `just fast-check` (fix, format, typecheck)
+- Fast test loop: `just fast-test` (pytest-testmon impacted tests)
 - Local consistency check: `just doctor`
 - Run all consolidated agent package checks: `just package-check`
 - Run Claude Code plugin checks: `just package-check-claude-code`
@@ -39,7 +40,7 @@ See the [README.md](README.md) file for a project overview.
 - Type check: `just typecheck` or `uv run ty check src tests test-int`
 - Type check (pyright): `just typecheck-pyright` or `uv run pyright`
 - Format: `just format` or `uv run ruff format .`
-- Run all code checks: `just check` (runs lint, format, typecheck, test)
+- Run all static code checks: `just check` (runs lint, format, typecheck)
 - Create db migration: `just migration "Your migration message"`
 - Run development MCP Inspector: `just run-inspector`
 
@@ -54,10 +55,11 @@ See the [README.md](README.md) file for a project overview.
 ### Code/Test/Verify Loop (fast path)
 
 1) **Code:** make changes.
-2) **Test:** `just fast-check` (lint/format/typecheck + pytest-testmon impacted tests for changed code).
-3) **Verify:** `just doctor` (end-to-end file ↔ DB loop in a temp project).
-4) **Package verify:** `just package-check` when changes touch `plugins/`, `skills/`, `integrations/`, package metadata, or release wiring.
-5) **Full gate (when needed):** `just test` or `just check` for SQLite + Postgres.
+2) **Check:** `just fast-check` (fix, format, typecheck; no tests).
+3) **Test:** `just fast-test` for pytest-testmon impacted tests, or a targeted `uv run pytest ...` command.
+4) **Verify:** `just doctor` (end-to-end file ↔ DB loop in a temp project).
+5) **Package verify:** `just package-check` when changes touch `plugins/`, `skills/`, `integrations/`, package metadata, or release wiring.
+6) **Full gate (when needed):** `just test` for SQLite + Postgres.
 
 Run `just test-smoke` when you specifically need the MCP smoke flow.
 
@@ -68,7 +70,7 @@ If testmon is “cold,” the first run may be long. Subsequent runs get much fa
 The monorepo ships several host-native packages alongside the Python core. Use the root justfile as the canonical entry point:
 
 - `just package-check` — validates every copied package and generated bundle path.
-- `just package-check-claude-code` — validates the root and plugin-local Claude marketplace manifests, bundled Claude Code skills, hooks, `basic-memory-manager` agent, and runs `claude plugin validate . --strict`.
+- `just package-check-claude-code` — validates the root and plugin-local Claude marketplace manifests, the SessionStart/PreCompact hooks, the bundled output style, and the seed schemas, then runs `claude plugin validate . --strict`.
 - `just package-check-skills` — validates every top-level `skills/memory-*/SKILL.md` frontmatter block.
 - `just package-check-hermes` — validates `integrations/hermes/plugin.yaml`, the Hermes provider entrypoint, bundled skill, and runs the hermetic unit suite.
 - `just package-check-openclaw` — runs the OpenClaw package install, copies top-level skills into the generated bundle, typechecks, lints, builds `dist/`, runs Bun tests, and performs `npm pack --dry-run`.
@@ -83,7 +85,7 @@ Before opening or updating a PR, run the checks that mirror the common required 
 - Run `just typecheck` in addition to targeted `ruff` and `pytest` commands when tests were added or changed.
 - Sign commits with `git commit -s` so DCO passes. If a PR branch already has unsigned commits, rewrite the branch with signed-off commits before asking for review.
 - Use a semantic PR title accepted by `.github/workflows/pr-title.yml`: `type(scope): summary`.
-- Use one of the allowed scopes: `core`, `cli`, `api`, `mcp`, `sync`, `ui`, `deps`, `installer`, `plugins`, `skills`, `integrations`.
+- Use one of the allowed scopes: `core`, `cli`, `api`, `mcp`, `sync`, `ui`, `ci`, `deps`, `installer`, `plugins`, `skills`, `integrations`.
 
 ### Test Structure
 
@@ -108,14 +110,82 @@ Before opening or updating a PR, run the checks that mirror the common required 
 - Follow the repository pattern for data access
 - Tools communicate to api routers via the httpx ASGI client (in process)
 
+### Programming Style
+
+See [docs/ENGINEERING_STYLE.md](docs/ENGINEERING_STYLE.md) for the fuller house style and
+[docs/DOMAIN_MODEL.md](docs/DOMAIN_MODEL.md) for product language, ownership, identity, and
+source-of-truth rules. The short version for agents:
+
+For nontrivial Python writing, refactoring, or review, read and follow
+[`.agents/skills/pythonic-code/SKILL.md`](.agents/skills/pythonic-code/SKILL.md) in full. Use
+the skill's Write, Refactor, or Review mode that matches the task. GitHub coding and review
+agents must apply this skill before changing or evaluating Python code.
+
+- Prefer type-safe, explicit designs over object-heavy indirection. Use Python 3.12 `type`
+  aliases, full annotations, and narrow `Protocol`s when a caller only needs a capability.
+- Prefer functions and typed values before classes, and concrete classes before abstract base
+  classes. Treat private-helper sprawl as a prompt to simplify the data flow.
+- Use dataclasses for internal value objects and operation results; use Pydantic v2 at API,
+  CLI, MCP, and persistence boundaries where validation and serialization matter.
+- Keep async boundaries obvious. Resource-owning code should use context managers, propagate
+  cancellation, and avoid hidden background work unless the lifecycle is explicit.
+- Fail fast. Do not add silent fallback logic, broad exception swallowing, speculative
+  `getattr`, or casts that hide an unclear model shape.
+- Keep control flow simple and local. Push branching decisions up, keep leaf helpers focused,
+  and name values after the domain concept they carry.
+- Use evidence-first testing. Add or update meaningful regression tests for bugs and risky
+  behavior, prefer real code paths over mocks, and run the narrowest command that proves the
+  change before widening verification.
+- Comments should explain why a branch, invariant, or constraint exists. Avoid comments that
+  merely narrate obvious code.
+
 ### Code Change Guidelines
 
 - **Full file read before edits**: Before editing any file, read it in full first to ensure complete context; partial reads lead to corrupted edits
 - **Minimize diffs**: Prefer the smallest change that satisfies the request. Avoid unrelated refactors or style rewrites unless necessary for correctness
-- **No speculative getattr**: Never use `getattr(obj, "attr", default)` when unsure about attribute names. Check the class definition or source code first
-- **Fail fast**: Write code with fail-fast logic by default. Do not swallow exceptions with errors or warnings
-- **No fallback logic**: Do not add fallback logic unless explicitly told to and agreed with the user
+- **House style is canonical**: Follow the Programming Style section above for type-safe,
+  fail-fast code; do not hide unclear models with speculative attributes, broad exception
+  handling, casts, or unapproved fallback logic
 - **No guessing**: Do not say "The issue is..." before you actually know what the issue is. Investigate first.
+
+### Consistency Model — Review Expectations
+
+Basic Memory separates canonical state from derived state, and reviews (human or automated)
+must hold them to different standards:
+
+- **Canonical state** — the markdown bytes of a note (on disk and as accepted
+  `note_content`). Writes are guarded: CAS on `db_version`, generation fences,
+  checksum-guarded file operations. Corrupting, wrongly rewriting, or wrongly deleting note
+  content is always a real finding, in every code path — materialization writes canonical
+  bytes into their portable file form, so the file's *content* is never "just a projection".
+- **Derived state** — entity file metadata, observation/relation graph rows, search index
+  rows, and materialization status/lineage (file versions, checksums, write status, *when*
+  a file catches up to its accepted row). This is **eventually consistent by design**. It
+  converges through the next write, the next index pass, `reindex`, or the scheduled orphan
+  sweeper (cloud). Stale writers no-op on generation fences instead of blocking; concurrent
+  races resolve last-writer-wins.
+
+Deadlocks are always worse than temporary staleness. Do NOT raise review findings that
+propose, for derived-state paths:
+
+- adding `SELECT ... FOR UPDATE` or wider/shared transactions — this class of "fix" caused
+  the production deadlock clusters (#1213, #1224) and the silent observation duplication
+  (#1214). (Code that legitimately takes locks must still follow the canonical
+  NoteContent-first order documented by `current_relation_generation_statement`; flagging a
+  violation of that ordering IS a real finding — the ban is on adding serialization, not on
+  policing the existing protocol.);
+- adding compensating re-checks, retry markers, or two-phase machinery for races whose
+  drift self-heals on a later write or index pass;
+- treating a window where a projection lags its canonical source as a bug, including rare
+  transient-failure windows that a later edit, `reindex`, or the orphan sweeper repairs.
+  (`doctor` diagnoses in a temporary project; it is not a repair mechanism and does not
+  count as one.)
+
+A derived-state race is a real finding only when it converges to a *wrong* state that no
+existing mechanism repairs, with a realistically hittable window. Name that non-converging
+end state explicitly and the mechanism gap; otherwise do not raise it. When in doubt,
+prefer the smaller, lock-free design and note the alternative in the PR discussion instead
+of a review finding.
 
 ### Literate Programming Style
 
@@ -167,7 +237,9 @@ counter += 1  # track retries for backoff calculation
 
 ### Codebase Architecture
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed architecture documentation.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for code layers and dependency direction. See
+[docs/DOMAIN_MODEL.md](docs/DOMAIN_MODEL.md) for the meaning and invariants of the concepts those
+layers implement.
 
 **Directory Structure:**
 - `/alembic` - Alembic db migrations
@@ -178,10 +250,13 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed architecture docum
 - `/markdown` - Markdown parsing and processing
 - `/mcp` - MCP server + `container.py` composition root + `clients/` typed API clients
 - `/models` - SQLAlchemy ORM models
+- `/picoschema` - Picoschema parsing, resolution, validation, inference, and drift
 - `/repository` - Data access layer
 - `/schemas` - Pydantic models for validation
 - `/services` - Business logic layer
-- `/sync` - File synchronization services + `coordinator.py` for lifecycle management
+- `/index` - Local runtime indexing adapters, watch service + `watch_coordinator.py` for lifecycle management
+- `/indexing` - Portable indexing runners and planners shared by local and hosted runtimes
+- `/runtime` - RuntimeMode resolution + runtime Protocol contracts
 - `/plugins/claude-code` - Claude Code plugin marketplace package, hooks, skills, and agent harness
 - `/skills` - Canonical framework-agnostic Basic Memory `SKILL.md` source
 - `/integrations/hermes` - Hermes memory-provider plugin
@@ -279,7 +354,9 @@ See SPEC-16 for full context manager refactor details.
 
 ### Release Process
 
-Releases are driven by `just release` / `just beta` — never by a bare `git tag`. The recipes bump version metadata, run pre-flight checks, commit, tag, and push. GitHub Actions then publishes to PyPI and updates the Homebrew formula.
+Releases are driven by `just release` / `just beta` — never by a bare `git tag`. The recipes bump version metadata, run pre-flight checks, land the bump on `main` through a release PR, tag, and push the tag. GitHub Actions then publishes to PyPI and updates the Homebrew formula.
+
+**Main requires PRs.** The `main` ruleset rejects direct pushes ("Changes must be made through a pull request") and the repo disallows merge commits, so the recipes push a `release/vX.Y.Z` branch, open a PR titled `chore(core): release vX.Y.Z`, rebase-merge it with `gh pr merge --rebase`, then tag the rebased bump commit on `main` (located by its commit subject, since rebasing rewrites the SHA) and push the tag. The CHANGELOG entry for the version must already be on `main` — land it via a normal PR before running the recipe (it pre-flight-checks for a `## vX.Y.Z` heading).
 
 **Stable release:**
 
@@ -287,7 +364,7 @@ Releases are driven by `just release` / `just beta` — never by a bare `git tag
 just release v0.21.3
 ```
 
-The recipe runs `just lint` + `just typecheck`, then updates every release manifest through `scripts/update_versions.py`: `src/basic_memory/__init__.py`, `server.json`, the root Claude marketplace, the Claude Code plugin manifest and local marketplace, the Hermes `plugin.yaml`, and the OpenClaw `package.json`. It commits as `chore: update version to X.Y.Z for vX.Y.Z release`, creates the `vX.Y.Z` tag, and pushes both the commit and the tag to `origin/main`. After the tag lands, the `Release` workflow builds the Python package, publishes to PyPI, creates the GitHub release with auto-generated notes, publishes the OpenClaw npm package, and updates the Homebrew formula. The recipe finishes by printing the post-release tasks the workflow doesn't cover.
+The recipe runs `just lint` + `just typecheck`, then updates every release manifest through `scripts/update_versions.py`: `src/basic_memory/__init__.py`, `server.json`, the root Claude marketplace, the Claude Code plugin manifest and local marketplace, the Hermes `plugin.yaml`, and the OpenClaw `package.json`. It commits as `chore: update version to X.Y.Z for vX.Y.Z release` on a `release/vX.Y.Z` branch, lands it on `main` via a rebase-merged PR, then tags the rebased commit and pushes the tag. After the tag lands, the `Release` workflow builds the Python package, publishes to PyPI, creates the GitHub release with auto-generated notes, publishes the OpenClaw npm package, and updates the Homebrew formula. The recipe finishes by printing the post-release tasks the workflow doesn't cover.
 
 **Beta release:** `just beta v0.21.3b1` — same flow with a beta-suffixed tag. PyPI consumers install with `pip install basic-memory --pre`.
 
@@ -298,8 +375,13 @@ The recipe runs `just lint` + `just typecheck`, then updates every release manif
 **Do not tag releases by hand.** A bare `git tag vX.Y.Z` skips the in-code version bump. Package metadata is still correct (uv-dynamic-versioning derives it from the git tag) but `basic-memory --version` reports the previous release, which is what happened with v0.21.2 → v0.21.3.
 
 **Post-release tasks** the recipe surfaces but doesn't run:
-- `docs.basicmemory.com` — add notes to `src/pages/latest-releases.mdx`
-- `basicmachines.co` — bump version in `src/components/sections/hero.tsx`
+- `docs.basicmemory.com` — add a What's New page under `content/2.whats-new/` and bump the version badge in `content/index.md` (the changelog page auto-fetches GitHub releases; see that repo's CLAUDE.md version-bump checklist)
+- `basicmemory.com` — the marketing site (Astro + React, repo
+  `basicmachines-co/basicmemory.com`, formerly `basicmachines.co`) carries **no
+  hardcoded version number** in its UI, so there is nothing to bump. For a
+  significant release, optionally add a dated announcement post under
+  `src/content/blog/` (model it on an existing `basic-memory-vX-Y-Z-release.md`).
+  Skip entirely for routine patch releases.
 - MCP Registry — `mcp-publisher publish` from the repo root
 
 See `.claude/commands/release/release.md` (and `beta.md`, `release-check.md`, `changelog.md` alongside it) for the full release + post-release runbook, including the slash commands.
@@ -308,9 +390,11 @@ See `.claude/commands/release/release.md` (and `beta.md`, `release-check.md`, `c
 
 ### Knowledge Structure
 
-- Entity: Any concept, document, or idea represented as a markdown file
+- Project: The knowledge and isolation boundary for entities, graph state, and search
+- Note: A user-facing Markdown document and the canonical representation of its knowledge
+- Entity: The project-scoped indexed representation of a file or resource
 - Observation: A categorized fact about an entity (`- [category] content`)
-- Relation: A directional link between entities (`- relation_type [[Target]]`)
+- Relation: A directed semantic link owned by its source entity (`- relation_type [[Target]]`)
 - Frontmatter: YAML metadata at the top of markdown files
 - Knowledge representation follows precise markdown format:
     - Observations with [category] prefixes
@@ -327,6 +411,12 @@ See `.claude/commands/release/release.md` (and `beta.md`, `release-check.md`, `c
 - Import from Memory JSON: `basic-memory import memory-json`
 - Tool access: `basic-memory tool` (provides CLI access to MCP tools)
     - Continue: `basic-memory tool continue-conversation --topic="search"`
+
+**Config Management:**
+- List all settings (effective values, env overrides marked): `basic-memory config list`
+- Get one setting: `basic-memory config get cli_output_style`
+- Set a setting (validated through the config model): `basic-memory config set cli_output_style plain`
+- Revert a setting to its default: `basic-memory config unset cli_output_style`
 
 **Project Management:**
 - List projects: `basic-memory project list`
@@ -347,6 +437,13 @@ See `.claude/commands/release/release.md` (and `beta.md`, `release-check.md`, `c
 - Create API key: `basic-memory cloud create-key "name"`
 - Manage snapshots: `basic-memory cloud snapshot [create|list|delete|show|browse]`
 - Restore from snapshot: `basic-memory cloud restore <path> --snapshot <id>`
+
+**Cloud Sync Commands (Personal and Team workspaces):**
+- Fetch cloud changes (cloud -> local): `basic-memory cloud pull --name "name"` (Team-safe; additive, never deletes local)
+- Upload local changes (local -> cloud): `basic-memory cloud push --name "name"` (Team-safe; additive, never deletes cloud)
+- Resolve conflicts on push/pull: `--on-conflict [fail|keep-local|keep-cloud|keep-both]` (default `fail` lists conflicts and aborts, git-style)
+- One-way mirror (local -> cloud): `basic-memory cloud sync --name "name"` (Personal workspaces only; deletes cloud files missing locally)
+- Two-way mirror (local <-> cloud): `basic-memory cloud bisync --name "name"` (Personal workspaces only)
 
 ### MCP Capabilities
 
@@ -373,9 +470,6 @@ See `.claude/commands/release/release.md` (and `beta.md`, `release-check.md`, `c
     - `list_memory_projects()` - List all available projects with their status
     - `create_memory_project(project_name, project_path, set_default)` - Create new Basic Memory projects
     - `delete_project(project_name)` - Delete a project from configuration
-
-  **Visualization:**
-    - `canvas(nodes, edges, title, directory)` - Generate Obsidian canvas files for knowledge graph visualization
 
   **ChatGPT-Compatible Tools:**
     - `search(query)` - Search across knowledge base (OpenAI actions compatible)
@@ -506,7 +600,7 @@ With GitHub integration, the development workflow includes:
 5. **Code Commits**: ALWAYS sign off commits with `git commit -s`
 6. **Pull Request Titles**: PR titles must follow the semantic format enforced by `.github/workflows/pr-title.yml`: `type(scope): summary`
    - Allowed types: `feat`, `fix`, `chore`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`
-   - Allowed scopes: `core`, `cli`, `api`, `mcp`, `sync`, `ui`, `deps`, `installer`, `plugins`, `skills`, `integrations`
+   - Allowed scopes: `core`, `cli`, `api`, `mcp`, `sync`, `ui`, `ci`, `deps`, `installer`, `plugins`, `skills`, `integrations`
    - Example: `fix(cli): propagate cloud workspace routing`
 
 This level of integration represents a new paradigm in AI-human collaboration, where the AI assistant becomes a full-fledged team member rather than just a tool for generating code snippets.

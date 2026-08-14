@@ -8,7 +8,8 @@ from contextlib import contextmanager
 import httpx
 import logfire
 import pytest
-from mcp.server.fastmcp.exceptions import ToolError
+from fastmcp.exceptions import ToolError
+from typing import Any
 
 knowledge_client_module = importlib.import_module("basic_memory.mcp.clients.knowledge")
 search_client_module = importlib.import_module("basic_memory.mcp.clients.search")
@@ -16,7 +17,7 @@ utils_module = importlib.import_module("basic_memory.mcp.tools.utils")
 
 
 def _capture_spans():
-    spans: list[tuple[str, dict]] = []
+    spans: list[tuple[str, dict[str, Any]]] = []
 
     @contextmanager
     def fake_span(name: str, **attrs):
@@ -26,7 +27,7 @@ def _capture_spans():
             def set_attribute(self, key: str, value) -> None:
                 attrs[key] = value
 
-            def set_attributes(self, new_attrs: dict) -> None:
+            def set_attributes(self, new_attrs: dict[str, Any]) -> None:
                 attrs.update(new_attrs)
 
         yield FakeSpan()
@@ -73,7 +74,7 @@ async def test_search_client_emits_client_and_http_spans(monkeypatch) -> None:
     monkeypatch.setattr(logfire, "span", fake_span)
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        assert request.method == "POST"
+        assert request.method == "QUERY"
         return httpx.Response(
             200,
             json={
@@ -95,7 +96,7 @@ async def test_search_client_emits_client_and_http_spans(monkeypatch) -> None:
         "mcp.http.request",
     ]
     assert spans[1][1] == {
-        "method": "POST",
+        "method": "QUERY",
         "client_name": "search",
         "operation": "search",
         "path_template": "/v2/projects/{project_id}/search/",
@@ -157,7 +158,8 @@ async def test_call_get_emits_transport_error_outcome(monkeypatch) -> None:
 
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport, base_url="https://example.test") as client:
-        with pytest.raises(httpx.ConnectError, match="boom"):
+        # Transport errors are wrapped in ToolError so callers never see blank messages (#1034)
+        with pytest.raises(ToolError, match="boom"):
             await utils_module.call_get(
                 client,
                 "/boom",

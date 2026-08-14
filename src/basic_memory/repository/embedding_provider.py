@@ -1,13 +1,16 @@
 """Embedding provider protocol for pluggable semantic backends."""
 
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 
 class EmbeddingProvider(Protocol):
     """Contract for semantic embedding providers."""
 
-    model_name: str
-    dimensions: int
+    @property
+    def model_name(self) -> str: ...
+
+    @property
+    def dimensions(self) -> int: ...
 
     async def embed_query(self, text: str) -> list[float]:
         """Embed a single query string."""
@@ -20,3 +23,19 @@ class EmbeddingProvider(Protocol):
     def runtime_log_attrs(self) -> dict[str, Any]:
         """Return provider-specific runtime settings suitable for startup logs."""
         ...
+
+
+@runtime_checkable
+class EmbeddingIdentityProvider(Protocol):
+    """Optional capability for providers with semantics beyond model and dimensions."""
+
+    def identity_key(self) -> str:
+        """Return a stable identity for persisted-vector invalidation."""
+        ...
+
+
+def embedding_provider_identity(provider: EmbeddingProvider) -> str:
+    """Return a provider's explicit semantic identity or the protocol fallback."""
+    if isinstance(provider, EmbeddingIdentityProvider):
+        return provider.identity_key()
+    return f"{provider.model_name}:{provider.dimensions}"

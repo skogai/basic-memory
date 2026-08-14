@@ -4,7 +4,7 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import cast
+from typing import Any
 
 import typer
 from loguru import logger
@@ -280,7 +280,7 @@ def _normalize_project_visibility(visibility: str | None) -> ProjectVisibility:
 
     normalized = visibility.strip().lower()
     if normalized in {"workspace", "shared", "private"}:
-        return cast(ProjectVisibility, normalized)
+        return normalized
 
     raise ValueError("Invalid visibility. Expected one of: workspace, shared, private.")
 
@@ -495,6 +495,23 @@ def list_projects(
             generate_permalink(project_name): project_name for project_name in config.projects
         }
 
+        # Trigger: a project in config.projects was surfaced by neither query — the
+        #   cloud branch is skipped without credentials, and a cloud-mode project is
+        #   not returned by the local query.
+        # Why: without a fallback such a project is invisible in `bm project list`,
+        #   yet `bm project add` reads the DB and reports it already exists (#1003).
+        #   The two commands must agree on whether a configured project exists.
+        # Outcome: seed a local-keyed row from config so the project still renders;
+        #   the row-building logic below derives its display from the config entry.
+        # Constraint: only fill from config for the default combined view. Explicit
+        #   --local, --cloud, and --workspace listings are deliberately scoped, so
+        #   configured projects must not leak into them.
+        if not local and local_result is not None and not workspace_filter_requested:
+            seeded_permalinks = {permalink for _, permalink in row_names_by_key}
+            for permalink, project_name in configured_names_by_permalink.items():
+                if permalink not in seeded_permalinks:
+                    row_names_by_key[(None, permalink)] = project_name
+
         def _workspace_priority(row_key: tuple[str | None, str]) -> tuple[bool, int, str, str]:
             """Prefer the user's default/personal workspace when a project is duplicated."""
             workspace = cloud_workspaces_by_key.get(row_key)
@@ -564,7 +581,7 @@ def list_projects(
             attached_row_by_permalink[permalink] = _select_attached_row_key(permalink, entry)
 
         # --- Build unified project list ---
-        project_rows: list[dict] = []
+        project_rows: list[dict[str, Any]] = []
         sorted_row_keys = sorted(
             row_names_by_key,
             key=lambda key: (row_names_by_key[key], key[0] or ""),
@@ -945,7 +962,8 @@ def remove_project(
                 console.print(f"[yellow]Note: Local files remain at {local_path_config}[/yellow]")
 
     except Exception as e:
-        console.print(f"[red]Error removing project: {str(e)}[/red]")
+        # str() of httpx transport errors is often empty (#1034) — never print a blank error.
+        console.print(f"[red]Error removing project: {str(e) or repr(e)}[/red]")
         raise typer.Exit(1)
 
 
@@ -1050,12 +1068,13 @@ async def _detach_local_project_row(app_config: BasicMemoryConfig, name: str) ->
         db_type=db.DatabaseType.FILESYSTEM,
     )
     try:
-        repo = ProjectRepository(session_maker)
-        existing = await repo.get_by_name(name)
-        if existing is None:
-            return False
-        await repo.delete(existing.id)
-        return True
+        repo = ProjectRepository()
+        async with db.scoped_session(session_maker) as session:
+            existing = await repo.get_by_name(session, name)
+            if existing is None:
+                return False
+            await repo.delete(session, existing.id)
+            return True
     finally:
         # CLI-only: safe to tear down the global DB singleton here since
         # set-cloud/set-local never run inside a long-lived MCP/API server.
@@ -1082,20 +1101,22 @@ async def _attach_local_project_row(app_config: BasicMemoryConfig, name: str, pa
         db_type=db.DatabaseType.FILESYSTEM,
     )
     try:
-        repo = ProjectRepository(session_maker)
-        existing = await repo.get_by_name(name)
-        if existing is None:
-            await repo.create(
-                {
-                    "name": name,
-                    "path": path,
-                    "permalink": generate_permalink(name),
-                    "is_active": True,
-                }
-            )
-            return
-        if existing.path != path:
-            await repo.update_path(existing.id, path)
+        repo = ProjectRepository()
+        async with db.scoped_session(session_maker) as session:
+            existing = await repo.get_by_name(session, name)
+            if existing is None:
+                await repo.create(
+                    session,
+                    {
+                        "name": name,
+                        "path": path,
+                        "permalink": generate_permalink(name),
+                        "is_active": True,
+                    },
+                )
+                return
+            if existing.path != path:
+                await repo.update_path(session, existing.id, path)
     finally:
         # CLI-only: safe to tear down the global DB singleton here since
         # set-cloud/set-local never run inside a long-lived MCP/API server.
@@ -1494,7 +1515,7 @@ def display_project_info(
             )
 
             # --- Assemble dashboard ---
-            parts: list = [columns, ""]
+            parts: list[Table | Group | str] = [columns, ""]
             if cloud_section is not None:
                 parts.extend([cloud_section, ""])
             if bars_section:

@@ -8,13 +8,13 @@ Files are read directly without any knowledge graph processing.
 import base64
 import io
 
-from typing import Annotated, Optional
+from typing import Any, Annotated, Optional
 
 from loguru import logger
 from PIL import Image as PILImage
 from fastmcp import Context
 from pydantic import AliasChoices, Field
-from mcp.server.fastmcp.exceptions import ToolError
+from fastmcp.exceptions import ToolError
 
 from basic_memory.config import ConfigManager
 from basic_memory.mcp.project_context import (
@@ -155,8 +155,18 @@ def optimize_image(img, content_length, max_output_bytes=350000):
 
 
 @mcp.tool(
-    description="Read a file's raw content by path or permalink",
-    annotations={"readOnlyHint": True, "openWorldHint": False},
+    title="Read Content",
+    description=(
+        "Read a file's raw content by path or permalink. Paths resolve against the Basic "
+        "Memory knowledge base API — see https://docs.basicmemory.com/local/mcp-tools-local"
+    ),
+    tags={"notes"},
+    annotations={
+        "title": "Read Content",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": False,
+    },
 )
 async def read_content(
     path: Annotated[
@@ -166,7 +176,7 @@ async def read_content(
     project: Optional[str] = None,
     project_id: Optional[str] = None,
     context: Context | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """Read a file's raw content by path or permalink.
 
     This tool provides direct access to file content in the knowledge base,

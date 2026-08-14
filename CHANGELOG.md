@@ -2,44 +2,403 @@
 
 ## Unreleased
 
+## v0.23.0 (2026-08-XX)
+
+Semantic search grows up and concurrent writes stop deadlocking. Search gains
+opt-in cross-encoder reranking, pluggable vector indexes with a first-party
+Milvus adapter, and a batch of embedding-correctness fixes; the indexing and
+persistence path is rebuilt around generation-versioned, compare-and-swap
+writes so concurrent multi-agent workloads can no longer deadlock or lose
+observations and relations. Day-to-day operation gets a real front door with
+`bm config`, Rich `bm tool` output, a diagnostics tool, and an honest
+reindex; `bm hook` brings harness lifecycle capture into the package; and
+cloud adds `bm cloud share`, `bm cloud prune`, and an optional Redis read
+cache. Five database migrations run automatically on first start, including
+a one-time repair that dedupes duplicate observation rows and purges their
+stale full-text search entries.
+
+### Breaking Changes
+
+- **#1111**: The `canvas` MCP tool is removed, along with the API resource
+  write endpoints that backed it (**#1106**). Obsidian canvas generation is
+  no longer available.
+- **#1145**: The `cloud_info` and `release_notes` MCP tools are removed.
+- **#1121**: Pre-v0.18.0 legacy HTTP API routes are dropped (**#1116**).
+  Old clients still calling them now get 404s.
+- **#1035**: The ChatGPT-compatibility `search`/`fetch` tools now refuse
+  non-OpenAI MCP clients with a clear rejection; other clients should use
+  `search_notes`/`read_note` instead.
+- **#1061**: One-way `bm cloud sync` now deletes newly-`.bmignore`d files
+  from the cloud instead of leaving them there forever (**#1032**).
+  Intentional, but destructive relative to prior behavior — review your
+  `.bmignore` before the first mirror after upgrading.
+- **#1002**: `bm status` is redesigned around project index status; scripts
+  that scraped the old sync-report output will break. As part of this, the
+  config keys `sync_delay`/`sync_changes` are renamed
+  `index_delay`/`index_changes` — legacy config.json keys and
+  `BASIC_MEMORY_SYNC_*` env vars are auto-migrated, no action needed.
+- The `sync_thread_pool_size` and `sync_max_concurrent_files` config keys
+  are removed with no alias and are silently ignored if present; the closest
+  replacement knob is the new `materialization_workers` setting.
+- **#1240**: `bm reindex --embeddings` now exits nonzero when entities fail
+  to embed, surfaces the failures, and reports which index identity it wrote
+  (**#1237**). Wrappers that relied on unconditional exit 0 must handle real
+  failures.
+- **#1063**: `edit_note`'s `replace_section` is heading-level-aware and now
+  replaces nested subsections by default instead of silently preserving
+  content past the next heading; pass `replace_subsections=false` for the
+  shallow behavior (**#1012**).
+- **#1082**: `list_directory` results are bounded and paginated (**#1048**).
+  Consumers expecting one exhaustive listing must page.
+- **#1198**: The MCP server now runs on FastMCP 4.0.0b1 and MCP SDK v2 — a
+  beta framework release. Downstream embedders pinning FastMCP 3.x must
+  upgrade together.
+
+### Features
+
+- **#1143**: Opt-in cross-encoder reranking of vector/hybrid search
+  candidates (**#950**, **#618**, **#666**): `reranker_enabled` (default off) with a
+  local FastEmbed ONNX reranker or LiteLLM API rerankers (Cohere, Jina,
+  Voyage), plus candidates, timeout, char-cap, and API tuning knobs.
+- **#1141**: Pluggable semantic vector indexes on Postgres (SPEC-81):
+  `semantic_vector_index` selects `pgvector` (default) or `milvus`, and a
+  new index identity/readiness manifest lets vector search tell "no ready
+  index" from "no results". SQLite keeps sqlite-vec. After switching
+  backends, run `bm reindex --embeddings`.
+- **#1158**: First-party Milvus, Milvus Lite, and Zilliz Cloud vector index
+  adapter via `pip install basic-memory[milvus]`; existing collections
+  reload after restart (**#1185**), with identical rankings verified across
+  sqlite-vec, pgvector, and Milvus Lite.
+- **#1043**: LiteLLM embeddings accept a custom `api_base` and direct
+  `api_key` for OpenAI-compatible and self-hosted servers (**#1005**), and
+  literal document/query prefixes support prefix-sensitive asymmetric
+  models (**#1044**, **#1008**).
+- **#1088**: New `bm config` command group: `list` (effective values with
+  env overrides marked), `get`, `set` (validated through the config model),
+  and `unset` (**#991**).
+- **#967**: Interactive `bm tool` commands render Rich panels, tables, and
+  trees on a TTY, with a `cli_output_style` setting and per-invocation
+  `--plain`/`--json` overrides; piped output stays machine-readable
+  (**#678**).
+- **#963**: New `basic_memory_diagnostics` MCP tool reports version and
+  system info for bug reports (**#187**).
+- **#1018**: The local Postgres backend is usable end to end: migrations,
+  connection pooling, and default-project resolution.
+- SQLite write-path tuning is exposed via new `sqlite_synchronous`,
+  `sqlite_mmap_size`, `sqlite_wal_autocheckpoint`, and `sqlite_page_size`
+  settings.
+- **#1100**: `created`/`modified` frontmatter timestamps are honored as note
+  timestamps (**#238**). Recency ordering can change after the first
+  re-sync for notes carrying historical dates.
+- **#1079**: Notes written through the API/MCP persist their observations
+  and relations immediately instead of waiting for the next file re-index
+  (**#1076**).
+- **#1227 / #1220 / #1228**: Persistence is generation-versioned with
+  compare-and-swap publication — a stale indexing pass can never clobber or
+  deadlock against a newer write, so observations and relations stay intact
+  under concurrent agent write load (**#1224**, **#1213**, **#1214**).
+- **#1204 / #1132 / #1131**: Relation resolution and vector prepare work are
+  batched instead of serial, and a new `materialization_workers` setting
+  (default 4) bounds concurrent write materializations.
+- **#1165**: Relation-derived search refreshes are durable, retryable work
+  items (**#1163**), pending relations refresh from accepted content
+  (**#1161**, **#1159**), and forward references back-resolve when their
+  target note is created, without a full reindex (**#1015**).
+- **#1070**: Added the `bm hook` harness front door (SPEC-55, **#997**).
+  Lifecycle verbs (`session-start`, `pre-compact`, `stop`) move plugin hook
+  logic into the package behind per-harness stdin adapters. Default-on
+  bounded envelope capture records lifecycle metadata into a local inbox
+  WAL; `bm hook flush` archives it locally, `bm hook status` shows the
+  surface, and `captureEvents: false` disables capture. `bm hook install` /
+  `bm hook remove` wire hooks into user-level harness config for standalone
+  users with ownership-tagged, surgical merging. The Claude Code and Codex
+  plugin hooks are now zero-logic PEP 723 uv scripts invoking
+  `basic-memory hook` in-process, with `BM_BIN` overriding the uv-managed
+  environment for development.
+- **#1119**: Plugins surface hook capture setup and health (**#1117**), and
+  Claude Code hook config falls back to user-level `~/.claude` settings
+  (**#924**).
+- **#1123 / #1138 / #1142 / #1147**: Codex hooks and memory notes are
+  reliable, checkpoints are authored and prompted after compaction, and
+  checkpoints are directly resumable.
+- **#1124 / #1126 / #1050**: New skills: `bm-writing` with coding setup,
+  `bm-decide`/`bm-orient`, and the shared `memory-onboarding` skill; coding
+  session profiles are queryable (**#1125**).
+- **#965**: New `bm cloud share` command group: `create`, `list`, `update`,
+  `revoke` (**#880**).
+- **#1061**: New `bm cloud prune` removes `.bmignore`d files from the cloud
+  on demand (**#1032**; see Breaking Changes for the one-way sync behavior
+  change).
+- **#1168 / #1172**: Optional Redis read caching accelerates standalone MCP
+  reads via the `basic-memory[redis]` extra (`redis_url`,
+  `redis_max_connections`) (**#980**).
+- **#1062 / #1074**: Cloud project deletion errors are surfaced, with an
+  optional notes purge and a visible deletion job (**#1033**, **#1034**).
+- **#1145**: First-connect MCP onboarding: server instructions, empty-state
+  guidance, and a `getting_started` prompt for new users.
+- **#1090**: `edit_note` accepts a `metadata` param to update frontmatter
+  fields (**#1011**).
+- **#1075**: `move_note` returns the previous accepted path (**#1072**).
+- **#1040 / #1101 / #1103**: `external_id` is exposed in `list_directory`,
+  `recent_activity`, search results, and `search_notes` markdown output.
+- **#1031 / #1036 / #1037**: MCP tool annotations are directory-compliant,
+  destructive hints are explicit, and `edit_note` exposes its operation
+  enum.
+
+### Bug Fixes
+
+- **#1193 / #1202**: Two indexing deadlock families are eliminated:
+  Entity/NoteContent lock-order inversions during materialization and
+  Entity/Observation inversions between indexing and accepted writes
+  (**#1187**, **#1199**, **#1209**).
+- A one-time migration dedupes historical duplicate observation rows and
+  purges their orphaned full-text search entries (companion to **#1228**).
+- **#1152 / #1160**: Moves record a durable vacate marker, so a
+  byte-identical copy at the old path indexes as a new note instead of
+  being skipped as a lingering move source.
+- **#1016**: Direct on-disk edits picked up by the file watcher are now
+  vector-embedded, so externally edited notes no longer go missing from
+  semantic search until a reindex (closed by the vector-sync overhaul,
+  **#1129**–**#1131**, **#1141**).
+- **#1023**: FastEmbed embeddings are L2-normalized for non-bge models, so
+  semantic search no longer silently degrades to FTS-only.
+- **#1071**: SQLite full-text search covers complete note content —
+  previously content beyond ~6000 characters was invisible (**#1065**) —
+  and CJK terms work in the relaxed FTS fallback (**#1022**).
+- **#1069**: Unknown semantic/hybrid result totals are explicit in
+  structured search responses (**#1068**).
+- **#1190**: `bm reindex --embeddings` warns when the project has no synced
+  entities instead of silently no-opping (**#1184**).
+- **#1196**: A legacy pgvector embeddings schema no longer breaks
+  `bm project info` (**#1195**).
+- **#1151**: Ambiguous identifier resolution fails loudly instead of
+  returning the wrong note (**#1148**), and project-scoped entity
+  resolution is separated from cross-project wikilink resolution
+  (**#1192**, **#1170**).
+- **#1189**: Note-type filters are case-canonicalized, so `Person` and
+  `person` match the same population (**#1180**).
+- **#1081**: `write_note` rejects filename-convention twins (kebab-case vs
+  Title Case) instead of creating duplicate notes (**#1077**).
+- **#1073**: `edit_note` with a `memory://` URL routes to the target
+  project instead of creating phantom notes (**#1066**), and scoped
+  `memory://` URL paths are preserved (**#1092**).
+- **#1188**: Sync preserves malformed frontmatter instead of prepending a
+  second frontmatter block that shadows `name`/`description` (**#1171**).
+- **#1239**: Timestamp-prefixed transcript lines and checkbox markers
+  (`[x]`, `[/]`, `[>]`, `[?]`) no longer mint junk observation categories
+  (**#1219**, **#1241**).
+- **#1060**: `schema_validate` with no arguments validates all
+  schema-covered types instead of type "unknown" (**#1013**), and invalid
+  schema-validation modes are rejected instead of silently degrading to
+  warn (**#1223**, **#1222**).
+- **#1085**: Re-adding a retained cloud project reindexes its existing
+  notes (**#1084**).
+- **#1010**: `bm project list` shows configured cloud-mode projects even
+  when uncredentialed (**#1003**), and deleting the default project
+  auto-reassigns the default instead of refusing (**#1139**).
+- **#1058 / #1094**: `bm doctor` never prints a blank failure message, and
+  migrations adapt to existing event loops (**#1027**).
+- **#1080**: Loading config no longer recreates an empty `~/basic-memory`
+  directory as a side effect (**#1029**).
+- **#1057**: Large projects no longer crash reindex on SQLite's
+  bound-parameter limit (**#1045**).
+- **#1218 / #1216**: Windows: the MCP server no longer dies at startup on a
+  log-cleanup race (**#1211**), note content no longer crashes log
+  formatting during index retries (**#1212**), the watch service no longer
+  crashes on mapped network drives (**#1047**), and a PermissionError
+  during project scan no longer triggers mass index deletion (**#1007**).
+- **#1059 / #1179**: Hermes: `bm mcp` child processes no longer leak
+  (**#1017**), and bm subprocesses no longer inherit Hermes's Python
+  environment (**#1093**).
+
+### Maintenance
+
+- **#1113 / #1114**: Dependency injection is consolidated behind the v2
+  composition roots (**#1109**).
+- **#1122 / #1133–#1136 / #1229**: The largest service god-files are split
+  into focused modules (**#1108**).
+- Removed the hook-specific redaction subsystem, its `detect-secrets`
+  dependency, and the retired lifecycle projector compatibility module.
+- Kept Milvus as a first-party optional vector backend while removing the
+  unused Python entry-point registry for separately packaged vector
+  adapters.
+
+## v0.22.1 (2026-06-12)
+
+Follow-up patch to v0.22.0. Fixes project and default-project resolution on
+fresh installs, MCP workspace routing, sync project selection, and CLI startup
+latency, plus a few MCP parity additions.
+
+### Features
+
+- Added a `workspace` parameter to `write_note` for parity with `edit_note`.
+- **#826**: Added `title` and `tags` annotations to all MCP tool decorators
+  (phase 1).
+- **#930**: `search_notes` now comma-splits `note_types`, `entity_types`, and
+  `categories`.
+- **#971**: Added the manual-pages flow — manpage seed schema, flow docs, and
+  verification fixes.
+
+### Bug Fixes
+
+- Fresh installs no longer fail when the projects table is empty: resolve now
+  points them at project setup, the first project is promoted to default when
+  the config default is missing from the database, the promoted default state
+  is returned from the project-create API, and a default can be set when none
+  is currently set. An existing database default is preserved when repairing a
+  missing config default.
+- **#949**: Sync skips projects without an absolute local path and excludes
+  orphan DB projects that are absent from config.
+- **#952 / #981**: Resolved workspace display names and tenant ids in qualified
+  project routes, closing out the manual verification findings.
+- `note_types`/`entity_types`/`categories` are normalized on the direct-call
+  path, with non-string list elements rejected.
+- Vector-search hydration keys on `(type, id)` to prevent id collisions.
+- `file_utils` requires line-anchored frontmatter fences.
+- CLI startup is faster: FastAPI and app imports are deferred out of CLI
+  startup, and rich/typer modules are preloaded before an in-place upgrade.
+- `config.json` is written atomically.
+- In-memory SQLite sessions are serialized so concurrent rollbacks cannot
+  destroy writes.
+
+### Maintenance
+
+- Release recipes route through PRs and wait for the release PR merge to land
+  before tagging; the release runbook is refreshed and stripped of
+  user-specific absolute paths.
+
+## v0.22.0 (2026-06-11)
+
+Team-safe cloud sync. New additive `bm cloud push` and `bm cloud pull`
+commands work safely on shared Team workspaces, while the destructive mirror
+commands are gated to Personal workspaces. Also: a large batch of MCP tool
+fixes, search improvements, and embedding reliability work.
+
+### Features
+
+- **#917**: Added Team-safe `bm cloud push` / `bm cloud pull`. Both are
+  additive (they never delete on the destination) and abort on conflicts by
+  default, git-style, with `--on-conflict {fail|keep-local|keep-cloud|keep-both}`.
+  The destructive `bm cloud sync` / `bm cloud bisync` mirrors are now gated
+  to Personal workspaces.
+- **#920**: Team push/pull uses per-workspace rclone remotes, so remotes and
+  credentials stay scoped to each workspace.
+- **#908**: Search supports an observation category filter.
+- **#809**: Added an experimental LiteLLM embedding provider for semantic
+  search (marked experimental, see **#899**).
+- **#907**: `bm tool write-note` accepts `--type`.
+- **#906**: `bm status` accepts `--wait` and `--timeout`.
+- Added the `bm tool delete-note` command.
+- **#905**: Improved workspace and cloud bisync command discoverability.
+
+### Bug Fixes
+
+- **#931 / #946**: Truncated observation permalinks are disambiguated to
+  prevent search-index collisions, and `build_context` resolves observations
+  by the same permalink the search index uses (**#909**, **#929**).
+- **#934**: `edit_note` recovers when the file exists on disk but is not yet
+  indexed (**#581**).
+- **#911 / #932 / #941**: Comma-separated tags are split consistently in
+  `parse_tags` and the `search_notes` tags parameter, with input normalized
+  for direct callers (**#910**).
+- **#933**: `read_note` accepts `page`/`page_size` for parity with sibling
+  tools (**#883**).
+- **#914 / #904 / #916**: `move_note` resolves `memory://` URLs, stops
+  falsely rejecting same-project moves as cross-project, no longer reports
+  false success across project boundaries, and mismatch guidance points at
+  the landing path.
+- **#915**: Navigation pagination is validated, and `recent_activity` shows
+  the correct project.
+- **#913**: `bm tool` commands align with MCP behavior (error exit codes,
+  overwrite handling, category support, defaults).
+- **#923**: `bm cloud setup` no longer overwrites an existing rclone remote
+  (**#922**).
+- **#912**: The `note_types` search filter is case-insensitive.
+- `build_context` allows cross-project context traversal, `write_note`
+  resolves overwrite conflicts, and sync uses strict deferred relation
+  resolution.
+- Embedding reliability: FastEmbed vectors are L2-normalized (**#843**),
+  corrupt FastEmbed model caches self-heal (**#900**), a single embedding
+  provider is reused per process (**#903**), `sqlite-vec` loads for the
+  embedding-status query (**#901**), and engine disposal no longer crashes
+  on the Postgres backend (**#902**).
+
+### Maintenance
+
+- Leaner, faster CI: testmon-selected branch builds, sharded Postgres jobs,
+  and faster default test fixtures (**#928**, **#938**, **#945**).
+- Documented personal-vs-team cloud sync semantics (**#947**, closes
+  **#851**).
+- Fixed npx skill install docs (**#927**).
+- Added `glama.json` to claim the Glama MCP directory listing (**#953**).
+
+## v0.21.6 (2026-06-04)
+
+Monorepo consolidation plus a redesigned Claude Code plugin. The satellite
+repositories now live in the main `basic-memory` tree, and the plugin is
+rebuilt as a memory bridge with a guided setup interview, capture skills, and
+team workspaces. Codex, Hermes, and OpenClaw integration packages ship
+alongside it.
+
 ### Core
 
 - Consolidated the Basic Memory satellite repositories into the main
   `basic-memory` tree as the canonical source, discovery, documentation,
   issue, and release home.
 - Added root marketplace/package validation for the consolidated repository
-  layout while keeping Phase 1 focused on parity.
-- Added root and package-local justfile targets so Claude Code, skills,
+  layout.
+- Added root and package-local justfile targets so Claude Code, Codex, skills,
   Hermes, and OpenClaw builds can be verified from the monorepo.
+- Removed the legacy `ui/` directory.
+
+### API
+
+- Entity resolution now exposes the owning project on resolved entities so
+  callers can route follow-up reads to the correct workspace/project.
+
+### CLI
+
+- Added an "auto BM" GitHub CI workflow that captures notes from CI runs.
+- Exposed project sync-support metadata and surfaced copyable workspace
+  identifiers in project listings.
+- `cloud login` now surfaces non-subscription errors instead of masking them.
+- Team workspaces block `rclone sync`, with the team-workspace guard limited
+  to `bisync`.
+
+### Claude Code
+
+- Rebuilt the Claude Code plugin as a memory bridge with SessionStart and
+  PreCompact hooks, a bundled output style, and seeded note schemas.
+- Added the `/basic-memory:setup` bootstrap interview and the
+  `/basic-memory:remember`, `/basic-memory:status`, and `/basic-memory:share`
+  skills.
+- Added team workspace support with attribution for shared writes.
+- Prefixed plugin skills with `bm-` and installed the shared `memory-*` skills
+  instead of duplicating them in the plugin.
+- Hooks fall back to `uvx`/`uv` when no CLI binary is on PATH.
+
+### Codex
+
+- Added the Codex plugin under `plugins/codex/` with its native
+  `.codex-plugin`, hooks, seeded schemas, and `bm-*` skills.
 
 ### Skills
 
 - Added the shared Basic Memory `SKILL.md` collection under top-level
-  `skills/`.
-- Updated skills documentation to point at `basicmachines-co/basic-memory`
-  and document manual copy as the temporary fallback when subpath installs are
-  unavailable.
-
-### Claude Code
-
-- Added the Claude Code plugin under `plugins/claude-code/` with its native
-  `.claude-plugin`, hooks, skills, agent, changelog, and docs.
-- Added the root Claude marketplace manifest pointing `basic-memory` to
-  `./plugins/claude-code`.
+  `skills/` and ported useful retired plugin skills into the `memory-*` set.
+- Fixed invalid picoschema enum YAML in the memory skills.
 
 ### Hermes
 
 - Added the Hermes memory provider plugin under `integrations/hermes/` with
   its native Python module, `plugin.yaml`, skill, tests, docs, and release
   metadata.
-- Updated Hermes install and development docs for monorepo subpath usage.
 
 ### OpenClaw
 
 - Added the OpenClaw plugin under `integrations/openclaw/` with its native
-  npm/TypeScript package shape, tests, docs, and release metadata.
-- Updated OpenClaw package metadata to point at the monorepo subdirectory and
-  changed skill bundling to copy from the top-level `skills/` source.
+  npm/TypeScript package shape, tests, docs, and release metadata; skill
+  bundling copies from the top-level `skills/` source.
 
 ## v0.21.5 (2026-05-26)
 

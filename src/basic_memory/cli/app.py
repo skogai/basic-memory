@@ -41,9 +41,48 @@ def app_callback(
 ) -> None:
     """Basic Memory - Local-first personal knowledge management."""
 
+    command_name = ctx.invoked_subcommand or "root"
+
+    # Trigger: a `hook` invocation (the advisory harness front door, SPEC-55).
+    # Why: the hook verbs need none of the global composition root — they resolve
+    # config lazily via ConfigManager when they run, the lifecycle verbs
+    # (session-start/pre-compact) each wrap their body in _run_fail_open, and the
+    # operator verbs (install/remove) touch no global config at all. Everything
+    # the callback does here — logging setup (Logfire loads config), the span,
+    # the container, uvloop — can raise SystemExit on a malformed config
+    # (ConfigManager reports bad JSON that way), and none of it may abort the verb
+    # before its own guard: even config-free work (envelope capture, `hook
+    # install`) must still run.
+    # Outcome: run that setup best-effort, swallowing (Exception, SystemExit) so a
+    # broken config surfaces only where it belongs — a lifecycle verb's fail-open
+    # guard, or an operator verb that needs config. Skip global init and the
+    # promo/init-line/auto-update messaging (off the session-start/pre-compact hot
+    # path, out of the brief). KeyboardInterrupt is left to propagate.
+    if ctx.invoked_subcommand == "hook":
+        try:
+            init_cli_logging()
+            ctx.with_resource(
+                logfire.span(
+                    f"cli.command.{command_name}",
+                    entrypoint="cli",
+                    command_name=command_name,
+                )
+            )
+            container = CliContainer.create()
+            set_container(container)
+            # uvloop must own the event-loop policy before the hook verbs run
+            # async search/write/flush through run_with_cleanup's asyncio.run(),
+            # or a Postgres backend hits the asyncpg engine-dispose race
+            # (#831/#877). No-op for SQLite, so hook startup stays light.
+            from basic_memory.db import maybe_install_uvloop
+
+            maybe_install_uvloop(container.config)
+        except (Exception, SystemExit):
+            pass
+        return
+
     # Initialize logging for CLI (file only, no stdout)
     init_cli_logging()
-    command_name = ctx.invoked_subcommand or "root"
     ctx.with_resource(
         logfire.span(
             f"cli.command.{command_name}",
@@ -56,6 +95,14 @@ def app_callback(
     # Create container and read config (single point of config access)
     container = CliContainer.create()
     set_container(container)
+
+    # Trigger: Postgres backend resolved at CLI startup, before any asyncio.run().
+    # Why: uvloop must own the event-loop policy before the loop is created so the
+    # asyncpg engine-dispose race (#831/#877) cannot fire. No-op for SQLite.
+    # Outcome: subsequent asyncio.run() calls in CLI commands use uvloop on Postgres.
+    from basic_memory.db import maybe_install_uvloop
+
+    maybe_install_uvloop(container.config)
 
     # Trigger: first-run init confirmation before command output.
     # Why: informational "initialized" message belongs above command results, not in the upsell panel.
@@ -75,17 +122,23 @@ def app_callback(
     # Skip for 'mcp' command - it has its own lifespan that handles initialization
     # Skip for API-using commands (status, sync, etc.) - they handle initialization via deps.py
     # Skip for 'reset' command - it manages its own database lifecycle
+    # Skip for 'man' - it only copies packaged files; a broken local database
+    # must not block installing the offline docs
+    # ('hook' returns above, before this point.)
     skip_init_commands = {
         "doctor",
+        "man",
         "mcp",
         "status",
         "sync",
         "project",
+        "config",
         "tool",
         "reset",
         "reindex",
         "update",
         "watch",
+        "workspace",
     }
     if (
         not version

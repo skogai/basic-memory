@@ -133,6 +133,23 @@ async def write_file_atomic(path: FilePath, content: str) -> None:
         raise FileWriteError(f"Failed to write file {path}: {e}")
 
 
+async def write_file_atomic_bytes(path: FilePath, content: bytes) -> None:
+    """Write bytes atomically without text newline translation."""
+    path_obj = Path(path) if isinstance(path, str) else path
+    temp_path = path_obj.with_suffix(".tmp")
+
+    try:
+        async with aiofiles.open(temp_path, mode="wb") as f:
+            await f.write(content)
+
+        temp_path.replace(path_obj)
+        logger.debug("Wrote file atomically", path=str(path_obj), content_length=len(content))
+    except Exception as e:  # pragma: no cover
+        temp_path.unlink(missing_ok=True)
+        logger.error("Failed to write file", path=str(path_obj), error=str(e))
+        raise FileWriteError(f"Failed to write file {path}: {e}")
+
+
 async def format_markdown_builtin(path: Path) -> Optional[str]:
     """
     Format a markdown file using the built-in mdformat formatter.
@@ -302,25 +319,75 @@ async def format_file(
         return None
 
 
+# A frontmatter fence is a line containing exactly `---`, optionally followed by
+# trailing horizontal whitespace. Anchoring to a full line (rather than a bare
+# substring/`startswith`) prevents single-line content like
+# `---\nstatus: active\n---\nBody` — where `\n` is a literal backslash-n, not a
+# newline — from being misread as frontmatter. See issue #972.
+_FENCE_RE = re.compile(r"^---[ \t]*$")
+
+
+def _split_frontmatter(content: str) -> Optional[tuple[str, str]]:
+    """Split content into (yaml_block, body) when it opens with a line-anchored fence.
+
+    The opening fence must be the very first line and the closing fence must be a
+    later line, each matching exactly `---` (with optional trailing whitespace).
+
+    Returns:
+        A `(yaml_block, body)` tuple when a complete fenced block is present, or
+        ``None`` when the content does not open with a frontmatter fence.
+
+    Raises:
+        ParseError: If the content opens with a fence but has no closing fence.
+    """
+    lines = content.splitlines(keepends=True)
+
+    # Skip leading blank lines: a document may begin with whitespace before the
+    # opening fence (e.g. a heredoc/dedented string starting with a newline). This
+    # does NOT relax line-anchoring — the opening fence must still be the first
+    # non-blank line, all on its own, so a single-line `---\\nstatus...` (literal
+    # backslash-n) is still rejected. See issue #972.
+    start = 0
+    while start < len(lines) and lines[start].strip() == "":
+        start += 1
+
+    if start >= len(lines) or not _FENCE_RE.match(lines[start].rstrip("\r\n")):
+        return None
+
+    # Find the closing fence on its own line somewhere after the opening fence.
+    for index in range(start + 1, len(lines)):
+        if _FENCE_RE.match(lines[index].rstrip("\r\n")):
+            yaml_block = "".join(lines[start + 1 : index])
+            body = "".join(lines[index + 1 :])
+            return yaml_block, body
+
+    raise ParseError("Invalid frontmatter format")
+
+
 def has_frontmatter(content: str) -> bool:
     """
     Check if content contains valid YAML frontmatter.
+
+    Frontmatter requires `---` fences on their own lines; an inline `---` (such as
+    a single-line string that merely starts with the characters `---`) is not
+    frontmatter.
 
     Args:
         content: Content to check
 
     Returns:
-        True if content has valid frontmatter markers (---), False otherwise
+        True if content has line-anchored frontmatter fences, False otherwise
     """
     if not content:
         return False
 
     # Strip BOM before checking for frontmatter markers
-    content = strip_bom(content).strip()
-    if not content.startswith("---"):
+    content = strip_bom(content)
+    try:
+        return _split_frontmatter(content) is not None
+    except ParseError:
+        # An opening fence with no closing fence is not usable frontmatter.
         return False
-
-    return "---" in content[3:]
 
 
 def parse_frontmatter(content: str) -> Dict[str, Any]:
@@ -339,17 +406,14 @@ def parse_frontmatter(content: str) -> Dict[str, Any]:
     try:
         # Strip BOM before parsing frontmatter
         content = strip_bom(content)
-        if not content.strip().startswith("---"):
+        split = _split_frontmatter(content)
+        if split is None:
             raise ParseError("Content has no frontmatter")
-
-        # Split on first two occurrences of ---
-        parts = content.split("---", 2)
-        if len(parts) < 3:
-            raise ParseError("Invalid frontmatter format")
+        yaml_block, _ = split
 
         # Parse YAML
         try:
-            frontmatter = yaml.safe_load(parts[1])
+            frontmatter = yaml.safe_load(yaml_block)
             # Handle empty frontmatter (None from yaml.safe_load)
             if frontmatter is None:
                 return {}
@@ -367,12 +431,16 @@ def parse_frontmatter(content: str) -> Dict[str, Any]:
         raise
 
 
-def remove_frontmatter(content: str) -> str:
+def remove_frontmatter(content: str, *, strip: bool = True) -> str:
     """
     Remove YAML frontmatter from content.
 
     Args:
         content: Content with frontmatter
+        strip: When True (default), strip surrounding whitespace from the returned
+            body — the historical behavior. Pass False to get the body exactly as
+            it appears after the closing fence; frontmatter-only rewrites must not
+            reflow the note body (issue #1090 review).
 
     Returns:
         Content with frontmatter removed, or original content if no frontmatter
@@ -381,18 +449,17 @@ def remove_frontmatter(content: str) -> str:
         ParseError: If content starts with frontmatter marker but is malformed
     """
     # Strip BOM before processing
-    content = strip_bom(content).strip()
+    content = strip_bom(content)
 
-    # Return as-is if no frontmatter marker
-    if not content.startswith("---"):
-        return content
+    split = _split_frontmatter(content)
+    # Trigger: content does not open with a line-anchored fence
+    # Why: inline `---` is ordinary content, not frontmatter (issue #972)
+    # Outcome: return the content untouched (stripped to preserve prior behavior)
+    if split is None:
+        return content.strip() if strip else content
 
-    # Split on first two occurrences of ---
-    parts = content.split("---", 2)
-    if len(parts) < 3:
-        raise ParseError("Invalid frontmatter format")
-
-    return parts[2].strip()
+    _, body = split
+    return body.strip() if strip else body
 
 
 def dump_frontmatter(post: frontmatter.Post) -> str:

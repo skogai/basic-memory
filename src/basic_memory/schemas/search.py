@@ -9,9 +9,9 @@ The search system supports three primary modes:
 from typing import Optional, List, Union, Any
 from datetime import datetime
 from enum import Enum
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
-from basic_memory.schemas.base import Permalink
+from basic_memory.schemas.base import Permalink, normalize_note_type
 
 
 class SearchItemType(str, Enum):
@@ -42,6 +42,7 @@ class SearchQuery(BaseModel):
     Optionally filter results by:
     - note_types: Limit to specific note types (frontmatter "type")
     - entity_types: Limit to search item types (entity/observation/relation)
+    - categories: Limit observation results to exact category matches (e.g. "requirement")
     - after_date: Only items after date
     - metadata_filters: Structured frontmatter filters (field -> value)
     - tags: Convenience frontmatter tag filter
@@ -63,6 +64,7 @@ class SearchQuery(BaseModel):
     # Optional filters
     note_types: Optional[List[str]] = None  # Filter by note type (frontmatter "type")
     entity_types: Optional[List[SearchItemType]] = None  # Filter by entity type
+    categories: Optional[List[str]] = None  # Filter observations by exact category
     after_date: Optional[Union[datetime, str]] = None  # Time-based filter
     metadata_filters: Optional[dict[str, Any]] = None  # Structured frontmatter filters
     tags: Optional[List[str]] = None  # Convenience tag filter
@@ -78,6 +80,14 @@ class SearchQuery(BaseModel):
             return v.isoformat()
         return v
 
+    @field_validator("note_types")
+    @classmethod
+    def normalize_note_types(cls, values: Optional[List[str]]) -> Optional[List[str]]:
+        """Apply the same canonical identity used when note types are written."""
+        if values is None:
+            return None
+        return [normalize_note_type(value) for value in values]
+
     def no_criteria(self) -> bool:
         text_is_empty = self.text is None or (isinstance(self.text, str) and not self.text.strip())
         metadata_is_empty = not self.metadata_filters
@@ -85,6 +95,7 @@ class SearchQuery(BaseModel):
         status_is_empty = self.status is None or (isinstance(self.status, str) and not self.status)
         note_types_is_empty = not self.note_types
         entity_types_is_empty = not self.entity_types
+        categories_is_empty = not self.categories
         return (
             self.permalink is None
             and self.permalink_match is None
@@ -93,6 +104,7 @@ class SearchQuery(BaseModel):
             and self.after_date is None
             and note_types_is_empty
             and entity_types_is_empty
+            and categories_is_empty
             and metadata_is_empty
             and tags_is_empty
             and status_is_empty
@@ -117,12 +129,17 @@ class SearchResult(BaseModel):
     type: SearchItemType
     score: float
     entity: Optional[Permalink] = None
+    # External UUID of the note this result belongs to (the parent entity for observation and
+    # relation hits). Stable, API-friendly id the hosted MCP layer uses to build web-app
+    # deep-links to the matching note (#1423).
+    external_id: Optional[str] = None
     permalink: Optional[str]
     content: Optional[str] = None
     matched_chunk: Optional[str] = None
     file_path: str
+    updated_at: Optional[datetime] = None
 
-    metadata: Optional[dict] = None
+    metadata: Optional[dict[str, Any]] = None
 
     # IDs for v2 API consistency
     entity_id: Optional[int] = None  # Entity ID (always present for entities)
@@ -142,5 +159,12 @@ class SearchResponse(BaseModel):
     results: List[SearchResult]
     current_page: int
     page_size: int
-    total: int = 0
+    total: int = Field(
+        default=0,
+        description="Total matching results when total_is_exact is true; otherwise a sentinel or estimate",
+    )
+    total_is_exact: bool = Field(
+        default=True,
+        description="Whether total is an exact count that clients can use for pagination",
+    )
     has_more: bool = False

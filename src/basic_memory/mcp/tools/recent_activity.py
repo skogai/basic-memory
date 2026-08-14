@@ -2,7 +2,7 @@
 
 from datetime import timezone
 from pathlib import PurePosixPath
-from typing import Annotated, List, Union, Optional, Literal
+from typing import Any, Annotated, List, Union, Optional, Literal
 
 from loguru import logger
 from fastmcp import Context
@@ -26,6 +26,7 @@ from basic_memory.schemas.search import SearchItemType
 
 
 @mcp.tool(
+    title="Recent Activity",
     description="""Get recent activity for a project or across all projects.
 
     Timeframe supports natural language formats like:
@@ -36,7 +37,13 @@ from basic_memory.schemas.search import SearchItemType
     - "3 weeks ago"
     Or standard formats like "7d"
     """,
-    annotations={"readOnlyHint": True, "openWorldHint": False},
+    tags={"navigation", "notes"},
+    annotations={
+        "title": "Recent Activity",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": False,
+    },
 )
 async def recent_activity(
     type: Annotated[
@@ -65,7 +72,7 @@ async def recent_activity(
     project_id: Optional[str] = None,
     output_format: Literal["text", "json"] = "text",
     context: Context | None = None,
-) -> str | list[dict]:
+) -> str | list[dict[str, Any]]:
     """Get recent activity for a specific project or across all projects.
 
     Project Resolution:
@@ -144,7 +151,7 @@ async def recent_activity(
         raise ValueError(f"page_size must be <= 100, got {page_size}")
 
     # Build common parameters for API calls
-    params: dict = {
+    params: dict[str, Any] = {
         "page": page,
         "page_size": page_size,
         "max_related": 10,
@@ -238,7 +245,7 @@ async def recent_activity(
                         most_active_project = project_info.name
 
         if output_format == "json":
-            rows: list[dict] = []
+            rows: list[dict[str, Any]] = []
             for project_name, project_activity in projects_activity.items():
                 rows.extend(_extract_recent_rows(project_activity.activity, project_name))
             return rows
@@ -300,14 +307,20 @@ async def recent_activity(
     else:
         # Project-Specific Mode: Get activity for specific project
         # Uses get_project_client() for per-project routing (local vs cloud)
-        logger.info(
-            f"Getting recent activity from project {resolved_project}: type={type}, depth={depth}, timeframe={timeframe}"
-        )
-
         async with get_project_client(resolved_project, context=context, project_id=project_id) as (
             client,
             active_project,
         ):
+            # Trigger: caller routed by project_id (a UUID), so resolved_project holds the
+            #          raw UUID rather than a human-readable name.
+            # Why: active_project.name is the canonical, display-safe project name regardless
+            #      of whether routing was by name or by external_id.
+            # Outcome: logs and the formatted text header always show the project name.
+            logger.info(
+                f"Getting recent activity from project {active_project.name}: "
+                f"type={type}, depth={depth}, timeframe={timeframe}"
+            )
+
             response = await call_get(
                 client,
                 f"/v2/projects/{active_project.external_id}/memory/recent",
@@ -318,12 +331,20 @@ async def recent_activity(
             if output_format == "json":
                 return _extract_recent_rows(activity_data)
 
-            # Format project-specific mode output
-            return _format_project_output(resolved_project, activity_data, timeframe, type, page)
+            # Format project-specific mode output. Pass the external id so onboarding examples
+            # route by id, not by a name that can collide across cloud workspaces.
+            return _format_project_output(
+                active_project.name,
+                activity_data,
+                timeframe,
+                page=page,
+                project_id=active_project.external_id,
+                type_filter_applied=bool(type),
+            )
 
 
 async def _get_project_activity(
-    client, project_info: ProjectItem, params: dict, depth: int
+    client, project_info: ProjectItem, params: dict[str, Any], depth: int
 ) -> ProjectActivity:
     """Get activity data for a single project.
 
@@ -377,9 +398,9 @@ async def _get_project_activity(
 
 def _extract_recent_rows(
     activity_data: GraphContext, project_name: Optional[str] = None
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Flatten GraphContext into a list of recent rows."""
-    rows: list[dict] = []
+    rows: list[dict[str, Any]] = []
     for result in activity_data.results:
         primary = result.primary_result
         row = {
@@ -396,7 +417,7 @@ def _extract_recent_rows(
 
 
 def _format_discovery_output(
-    projects_activity: dict, summary: ActivityStats, timeframe: str, guidance: str
+    projects_activity: dict[str, Any], summary: ActivityStats, timeframe: str, guidance: str
 ) -> str:
     """Format discovery mode output as human-readable text."""
     lines = [f"## Recent Activity Summary ({timeframe})"]
@@ -467,14 +488,60 @@ def _format_project_output(
     project_name: str,
     activity_data: GraphContext,
     timeframe: str,
-    type_filter: Union[str, List[str]],
     page: int = 1,
+    project_id: str | None = None,
+    type_filter_applied: bool = False,
 ) -> str:
-    """Format project-specific mode output as human-readable text."""
+    """Format project-specific mode output as human-readable text.
+
+    `project_id` is the project's route-safe external id. When present, onboarding examples use
+    it instead of the display name so a model following them cannot land in a different
+    same-named project in another cloud workspace.
+    """
     lines = [f"## Recent Activity: {project_name} ({timeframe})"]
 
     if not activity_data.results:
-        lines.append(f"\nNo recent activity found in '{project_name}' project.")
+        # Trigger: the requested activity page contains no rows.
+        # Why: filtered and later-page misses do not establish that the project has no notes.
+        # Outcome: only an unfiltered first-page orientation offers first-note onboarding.
+        if page > 1:
+            lines.append(
+                f"\nNo recent activity was found on page {page} for "
+                f"'{project_name}' within {timeframe}."
+            )
+            lines.append(f"Try page={page - 1} or return to page=1.")
+            return "\n".join(lines)
+
+        if type_filter_applied:
+            lines.append(
+                f"\nNo recent activity matched the requested type filter in "
+                f"'{project_name}' within {timeframe}."
+            )
+            lines.append("Try another type or omit `type` to see recent notes and documents.")
+            return "\n".join(lines)
+
+        lines.append(f"\nNo recent activity in '{project_name}' within {timeframe}.")
+        # recent_activity is the orientation call a model makes at session start, so an empty
+        # result is the natural moment to help. Stay offer-not-act, and cover both a brand-new
+        # (empty) knowledge base and an established one that is merely quiet in this window.
+        # Prefer the external id in examples: names collide across cloud workspaces, project_id
+        # does not.
+        route = f'project_id="{project_id}"' if project_id else f'project="{project_name}"'
+        lines.append("")
+        lines.append(
+            "If the user is just getting started and has no notes yet, briefly explain that "
+            "Basic Memory keeps notes that persist across conversations and are shared between "
+            "the user and their AI, then offer to save something useful from this conversation "
+            "as their first note — wait for them to agree before writing:"
+        )
+        lines.append("```")
+        lines.append(f'write_note({route}, title="...", content="...", directory="notes")')
+        lines.append("```")
+        lines.append(
+            f"Otherwise, widen the window with "
+            f'recent_activity({route}, timeframe="30d") or find a topic '
+            f'with search_notes({route}, query="...").'
+        )
         return "\n".join(lines)
 
     # Group results by type
@@ -503,7 +570,9 @@ def _format_project_output(
                 folder_path = str(PurePosixPath(entity.file_path).parent)
                 if folder_path and folder_path != ".":
                     folder = f" ({folder_path})"
-            lines.append(f"  • {title}{folder}")
+            # external_id makes rows linkable: hosted MCP appends a web-app
+            # link template that the agent fills with this id on request.
+            lines.append(f"  • {title}{folder} [id: {entity.external_id}]")
 
     # Show observations (categorized insights)
     if observations:

@@ -54,13 +54,13 @@ Users can install or update skills with the [Skills CLI](https://github.com/verc
 
 ```bash
 # Install all skills
-npx skills add basicmachines-co/basic-memory --path skills
+npx skills add basicmachines-co/basic-memory/skills
 
 # Install a specific skill
-npx skills add basicmachines-co/basic-memory --path skills --skill memory-tasks
+npx skills add basicmachines-co/basic-memory/skills --skill memory-tasks
 
 # Install for a specific agent
-npx skills add basicmachines-co/basic-memory --path skills --agent claude
+npx skills add basicmachines-co/basic-memory/skills --agent claude
 ```
 
 ## Adding a New Skill
@@ -70,6 +70,40 @@ npx skills add basicmachines-co/basic-memory --path skills --agent claude
 3. Write skill instructions in markdown
 4. Update `README.md` with the new skill's summary
 5. Commit and push
+
+## Packaging for Distribution
+
+`just dist` (from `skills/`) validates the skills, then zips them into
+`dist/` (at the monorepo root) in two flavors:
+
+```
+dist/skills/<name>.zip               # Agent Skills format (SKILL.md + resources)
+dist/skills/basic-memory-skills.zip  # all skills bundled
+dist/skills-openai/<name>.zip        # same skill + agents/openai.yaml
+dist/skills-openai/basic-memory-skills.zip
+```
+
+Each zip contains a `<name>/SKILL.md` folder at its root, so unzipping (or
+dropping it into an uploader) lands a valid skill directory — the layout the
+[Agent Skills spec](https://agentskills.io/specification), Claude Desktop, and
+the ChatGPT plugin builder all expect. `dist/` is gitignored; the archives are
+build artifacts, so the `skills/` source stays pure markdown.
+
+### ChatGPT / Codex (openai.yaml)
+
+A ChatGPT/Codex skill is the *same* SKILL.md plus an optional
+[`agents/openai.yaml`](https://learn.chatgpt.com/docs/build-skills) holding
+OpenAI-specific display metadata. `just dist` generates that file for each skill
+from the SKILL.md frontmatter (`interface.display_name`, `short_description`,
+`brand_color`) — see `scripts/build_skills_dist.py`. To hand-tune a skill, add a
+source `skills/<name>/agents/openai.yaml`; the builder copies it verbatim
+instead of generating one.
+
+No MCP dependency is pinned in `openai.yaml`: these skills need the basic-memory
+MCP server, but that is wired at the host/plugin level (the ChatGPT plugin
+builder's **MCP** step, or a local `.mcp.json`), not per skill. To upload into a
+ChatGPT plugin's **Skills** step, drag one `dist/skills-openai/<name>.zip` per
+skill.
 
 ## OpenClaw Plugin Integration
 

@@ -204,7 +204,10 @@ async def test_delete_project_basic_operation(mcp_server, app, test_project, tmp
         assert "removed successfully" in delete_text
         assert "Removed project details:" in delete_text
         assert "Name: to-be-deleted" in delete_text
-        assert "Files remain on disk but project is no longer tracked" in delete_text
+        assert (
+            "Note files remain on disk but the project is no longer tracked by Basic Memory."
+            in delete_text
+        )
 
         # Verify project no longer appears in list
         list_result_after = await client.call_tool("list_memory_projects", {})
@@ -251,12 +254,8 @@ async def test_delete_current_project_protection(mcp_server, app, test_project):
 
         # Should show error about deleting current project
         error_message = str(exc_info.value)
-        assert "delete_project" in error_message
-        assert (
-            "currently active" in error_message
-            or "test-project" in error_message
-            or "Switch to a different project" in error_message
-        )
+        assert "Cannot delete default project" in error_message
+        assert "test-project" in error_message
 
 
 @pytest.mark.asyncio
@@ -591,36 +590,35 @@ async def test_nested_project_paths_rejected(mcp_server, app, test_project, tmp_
 
 
 @pytest.mark.asyncio
-async def test_create_project_accepts_workspace_in_local_mode(
+async def test_create_project_workspace_without_credentials_fails_fast(
     mcp_server, app, test_project, tmp_path
 ):
-    """Passing workspace via the MCP wire is accepted by the tool schema and
-    does not break the local create path.
+    """A workspace selector without cloud credentials fails fast — no local create (#954).
 
-    In local mode there is no cloud factory installed, so workspace is a no-op:
-    the request lands on the ASGI transport which has no workspace concept. This
-    test guards the schema so a future change can't accidentally drop the parameter.
+    The previous contract treated workspace as a local no-op, which was the bug:
+    a caller asking for a cloud team workspace got a silent local project. The
+    tool schema still accepts the parameter (this test exercises it over the
+    MCP wire), but the create must error with auth guidance and leave no
+    project behind.
     """
+    from fastmcp.exceptions import ToolError
 
     async with Client(mcp_server) as client:
-        create_result = await client.call_tool(
-            "create_memory_project",
-            {
-                "project_name": "ws-local-test",
-                "project_path": str(
-                    tmp_path.parent / (tmp_path.name + "-projects") / "project-ws-local-test"
-                ),
-                "workspace": "team-paul",
-            },
-        )
+        with pytest.raises(ToolError, match="cloud workspace was requested"):
+            await client.call_tool(
+                "create_memory_project",
+                {
+                    "project_name": "ws-local-test",
+                    "project_path": str(
+                        tmp_path.parent / (tmp_path.name + "-projects") / "project-ws-local-test"
+                    ),
+                    "workspace": "team-paul",
+                },
+            )
 
-        assert len(create_result.content) == 1
-        create_text = create_result.content[0].text  # pyright: ignore [reportAttributeAccessIssue]
-        assert "✓" in create_text
-        assert "ws-local-test" in create_text
-
+        # The failed create must not leave a local project behind
         list_result = await client.call_tool("list_memory_projects", {})
-        assert "ws-local-test" in list_result.content[0].text  # pyright: ignore [reportAttributeAccessIssue]
+        assert "ws-local-test" not in list_result.content[0].text  # pyright: ignore [reportAttributeAccessIssue]
 
 
 @pytest.mark.asyncio

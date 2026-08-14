@@ -12,6 +12,7 @@ from sqlalchemy import text
 from basic_memory import db
 from basic_memory.config import BasicMemoryConfig, DatabaseBackend
 import basic_memory.repository.search_repository_base as search_repository_base_module
+from basic_memory.repository.litellm_provider import LiteLLMEmbeddingProvider
 from basic_memory.repository.postgres_search_repository import (
     PostgresSearchRepository,
     _strip_nul_from_row,
@@ -19,6 +20,7 @@ from basic_memory.repository.postgres_search_repository import (
 from basic_memory.repository.semantic_errors import SemanticSearchDisabledError
 from basic_memory.repository.search_index_row import SearchIndexRow
 from basic_memory.schemas.search import SearchItemType, SearchRetrievalMode
+from typing import override
 
 
 pytestmark = pytest.mark.postgres
@@ -55,6 +57,32 @@ class StubEmbeddingProviderV2(StubEmbeddingProvider):
     """Same vectors, different model identity to force Postgres resync."""
 
     model_name = "stub-v2"
+
+
+class StubLiteLLMEmbeddingProvider(LiteLLMEmbeddingProvider):
+    """LiteLLM-shaped provider with deterministic vectors and no network calls."""
+
+    def __init__(
+        self,
+        *,
+        document_input_type: str,
+        query_input_type: str,
+    ) -> None:
+        super().__init__(
+            model_name="nvidia_nim/nvidia/embed-qa-4",
+            dimensions=4,
+            batch_size=2,
+            document_input_type=document_input_type,
+            query_input_type=query_input_type,
+        )
+
+    @override
+    async def embed_query(self, text: str) -> list[float]:
+        return StubEmbeddingProvider._vectorize(text)
+
+    @override
+    async def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [StubEmbeddingProvider._vectorize(text) for text in texts]
 
 
 def _oversized_entity_content(bullet_count: int) -> str:
@@ -236,6 +264,56 @@ async def test_postgres_search_repository_tsquery_syntax_error_returns_empty(
     results = await repo.search(search_text="coffee AND")
     assert results == []
     assert await repo.count(search_text="coffee AND") == 0
+
+
+@pytest.mark.asyncio
+async def test_postgres_search_tsquery_error_does_not_poison_caller_session(
+    session_maker, test_project
+):
+    """A tsquery syntax error on a caller-owned session must not abort its transaction.
+
+    The search() session param lets callers run FTS inside their own transaction
+    (e.g. LinkResolver during context building). Without a SAVEPOINT, a tsquery
+    syntax error aborts the shared Postgres transaction and every later query on
+    that session fails with "current transaction is aborted". This exercises the
+    real begin_nested() isolation on a caller-owned session.
+    """
+    repo = PostgresSearchRepository(session_maker, project_id=test_project.id)
+
+    now = datetime.now(timezone.utc)
+    await repo.index_item(
+        SearchIndexRow(
+            project_id=test_project.id,
+            id=1,
+            title="Coffee Brewing",
+            content_stems="coffee brewing",
+            content_snippet="coffee brewing snippet",
+            permalink="docs/coffee-brewing",
+            file_path="docs/coffee-brewing.md",
+            type="entity",
+            metadata={"note_type": "note"},
+            created_at=now,
+            updated_at=now,
+        )
+    )
+
+    async with db.scoped_session(session_maker) as session:
+        # Establish an active transaction the caller expects to keep using.
+        pre = await session.execute(text("SELECT 1"))
+        assert pre.scalar_one() == 1
+
+        # Trailing boolean operator produces an invalid tsquery; this used to abort
+        # the caller's transaction. With the savepoint it returns [] cleanly.
+        results = await repo.search(search_text="coffee AND", session=session)
+        assert results == []
+
+        # Proof the caller-owned transaction survived: a normal query still works,
+        # and a valid FTS query on the same session returns the indexed row.
+        post = await session.execute(text("SELECT 1"))
+        assert post.scalar_one() == 1
+
+        recovered = await repo.search(search_text="coffee", session=session)
+        assert any(r.permalink == "docs/coffee-brewing" for r in recovered)
 
 
 @pytest.mark.asyncio
@@ -566,6 +644,97 @@ async def test_postgres_vector_sync_skips_unchanged_and_reembeds_changed_content
 
 
 @pytest.mark.asyncio
+async def test_postgres_litellm_role_change_reembeds_existing_chunks(session_maker, test_project):
+    """LiteLLM role changes must invalidate existing Postgres vector chunks."""
+    await _skip_if_pgvector_unavailable(session_maker)
+    app_config = BasicMemoryConfig(
+        env="test",
+        projects={"test-project": "/tmp/basic-memory-test"},
+        default_project="test-project",
+        database_backend=DatabaseBackend.POSTGRES,
+        semantic_search_enabled=True,
+    )
+    repo = PostgresSearchRepository(
+        session_maker,
+        project_id=test_project.id,
+        app_config=app_config,
+        embedding_provider=StubLiteLLMEmbeddingProvider(
+            document_input_type="passage",
+            query_input_type="query",
+        ),
+    )
+    await repo.init_search_index()
+
+    now = datetime.now(timezone.utc)
+    content = "# Retrieval Roles\n- auth token rotation\n- database schema migration planning"
+    await repo.index_item(
+        SearchIndexRow(
+            project_id=test_project.id,
+            id=431,
+            title="LiteLLM Retrieval Roles",
+            content_stems=content,
+            content_snippet=content,
+            permalink="specs/litellm-retrieval-roles",
+            file_path="specs/litellm-retrieval-roles.md",
+            type=SearchItemType.ENTITY.value,
+            entity_id=431,
+            metadata={"note_type": "spec"},
+            created_at=now,
+            updated_at=now,
+        )
+    )
+
+    initial_result = await repo.sync_entity_vectors_batch([431])
+    assert initial_result.entities_synced == 1
+    assert initial_result.entities_skipped == 0
+    assert initial_result.chunks_total >= 2
+    assert initial_result.chunks_skipped == 0
+    assert initial_result.embedding_jobs_total == initial_result.chunks_total
+
+    unchanged_result = await repo.sync_entity_vectors_batch([431])
+    assert unchanged_result.entities_synced == 1
+    assert unchanged_result.entities_skipped == 1
+    assert unchanged_result.embedding_jobs_total == 0
+    assert unchanged_result.chunks_skipped == unchanged_result.chunks_total
+
+    role_changed_repo = PostgresSearchRepository(
+        session_maker,
+        project_id=test_project.id,
+        app_config=app_config,
+        embedding_provider=StubLiteLLMEmbeddingProvider(
+            document_input_type="document",
+            query_input_type="query",
+        ),
+    )
+    await role_changed_repo.init_search_index()
+
+    role_changed_result = await role_changed_repo.sync_entity_vectors_batch([431])
+    assert role_changed_result.entities_synced == 1
+    assert role_changed_result.entities_skipped == 0
+    assert role_changed_result.chunks_skipped == 0
+    assert role_changed_result.embedding_jobs_total == role_changed_result.chunks_total
+
+    async with db.scoped_session(session_maker) as session:
+        stored_rows = await session.execute(
+            text(
+                "SELECT DISTINCT embedding_model "
+                "FROM search_vector_chunks "
+                "WHERE project_id = :project_id AND entity_id = :entity_id"
+            ),
+            {"project_id": test_project.id, "entity_id": 431},
+        )
+        embedding_models = {row.embedding_model for row in stored_rows.fetchall()}
+
+    assert embedding_models == {
+        "StubLiteLLMEmbeddingProvider:"
+        "nvidia_nim/nvidia/embed-qa-4:4:"
+        "document_input_type=document:"
+        "query_input_type=query:"
+        "forward_dimensions=false"
+    }
+
+
+@pytest.mark.asyncio
 async def test_postgres_vector_sync_shards_oversized_entity_and_resumes(
     session_maker, test_project, monkeypatch
 ):
@@ -816,3 +985,180 @@ async def test_postgres_metadata_filters_path_parameterized(session_maker, test_
     # Nested path should work without SQL injection risk
     results = await repo.search(metadata_filters={"schema.confidence": {"$gt": 0.5}})
     assert isinstance(results, list)
+
+
+@pytest.mark.asyncio
+async def test_postgres_search_categories_exact_match(session_maker, test_project):
+    """categories filter matches the observation category exactly (mirror of #430).
+
+    A [decision] observation that merely mentions "requirement" must be excluded
+    when categories=["requirement"] is requested.
+    """
+    repo = PostgresSearchRepository(session_maker, project_id=test_project.id)
+    now = datetime.now(timezone.utc)
+
+    await repo.bulk_index_items(
+        [
+            SearchIndexRow(
+                project_id=test_project.id,
+                id=70101,
+                type=SearchItemType.OBSERVATION.value,
+                content_stems="the auth requirement must be enforced on every call",
+                content_snippet="the auth requirement must be enforced on every call",
+                permalink="test/obs/requirement/70101",
+                file_path="test/obs.md",
+                entity_id=1,
+                category="requirement",
+                metadata={"note_type": "note"},
+                created_at=now,
+                updated_at=now,
+            ),
+            SearchIndexRow(
+                project_id=test_project.id,
+                id=70102,
+                type=SearchItemType.OBSERVATION.value,
+                content_stems="we deferred the auth requirement to next sprint",
+                content_snippet="we deferred the auth requirement to next sprint",
+                permalink="test/obs/decision/70102",
+                file_path="test/obs.md",
+                entity_id=1,
+                category="decision",
+                metadata={"note_type": "note"},
+                created_at=now,
+                updated_at=now,
+            ),
+        ]
+    )
+
+    # Without the category filter, a text search for "requirement" matches both.
+    text_results = await repo.search(
+        search_text="requirement",
+        search_item_types=[SearchItemType.OBSERVATION],
+    )
+    assert {r.id for r in text_results} == {70101, 70102}
+
+    # With categories=["requirement"], only the requirement observation survives.
+    filtered = await repo.search(
+        search_text="requirement",
+        search_item_types=[SearchItemType.OBSERVATION],
+        categories=["requirement"],
+    )
+    assert {r.id for r in filtered} == {70101}
+    assert filtered[0].category == "requirement"
+
+    # Standalone filter and count both honor the exact category.
+    filtered_only = await repo.search(categories=["requirement"])
+    assert {r.id for r in filtered_only} == {70101}
+    assert await repo.count(categories=["requirement"]) == 1
+
+    # Multiple categories union.
+    multi = await repo.search(categories=["requirement", "decision"])
+    assert {r.id for r in multi} == {70101, 70102}
+
+
+@pytest.mark.asyncio
+async def test_postgres_question_punctuation_and_relaxation(session_maker, test_project):
+    """Question-form queries must produce clean lexemes and a usable relaxation.
+
+    Parity with SQLite: sentence punctuation previously reached tsquery terms,
+    and a strict all-AND miss had no relaxed retry, silently disabling the FTS
+    half of hybrid search for natural-language questions.
+    """
+    repo = PostgresSearchRepository(session_maker, project_id=test_project.id)
+
+    # Edge punctuation stripped before lexeme formatting.
+    prepared = repo._prepare_search_term("When did Melanie paint a sunrise?")
+    assert "?" not in prepared
+    assert "sunrise:*" in prepared
+
+    # Relaxation drops stopwords and OR-joins content terms.
+    relaxed = repo._relaxed_tsquery_text("When did Melanie paint a sunrise?")
+    assert relaxed == "melanie:* | paint:* | sunrise:*"
+
+    # User intent is not second-guessed.
+    assert repo._relaxed_tsquery_text("alpha AND beta") is None
+    assert repo._relaxed_tsquery_text('"exact phrase"') is None
+    assert repo._relaxed_tsquery_text(None) is None
+
+
+@pytest.mark.asyncio
+async def test_postgres_multiword_query_relaxes_on_strict_miss(session_maker, test_project):
+    repo = PostgresSearchRepository(session_maker, project_id=test_project.id)
+    now = datetime.now(timezone.utc)
+    await repo.index_item(
+        SearchIndexRow(
+            project_id=test_project.id,
+            id=77,
+            title="Trip plans",
+            content_stems="melanie painted a sunrise over the lake last year",
+            content_snippet="Melanie painted a sunrise over the lake last year.",
+            permalink="docs/trip-plans",
+            file_path="docs/trip-plans.md",
+            type="entity",
+            metadata={"note_type": "note"},
+            created_at=now,
+            updated_at=now,
+        )
+    )
+
+    # A content word absent from the doc ("hiking") makes the strict
+    # all-terms-AND query miss even after Postgres drops stopwords — without
+    # it, to_tsquery('english', ...) already strips "when/did/a" and matches.
+    strict = await repo.search(search_text="Did Melanie go hiking at sunrise?")
+    assert strict == []
+
+    # The hybrid FTS branch opts in; OR-relaxation surfaces the partial match.
+    results = await repo.search(search_text="Did Melanie go hiking at sunrise?", allow_relaxed=True)
+    assert any(r.id == 77 for r in results)
+
+
+@pytest.mark.asyncio
+async def test_postgres_relaxes_after_strict_tsquery_syntax_error(
+    session_maker,
+    test_project,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Punctuated strict queries retry safely with the relaxed token rendering."""
+    repo = PostgresSearchRepository(session_maker, project_id=test_project.id)
+    now = datetime.now(timezone.utc)
+    await repo.index_item(
+        SearchIndexRow(
+            project_id=test_project.id,
+            id=78,
+            title="Baz reference",
+            content_stems="a document containing baz",
+            content_snippet="A document containing baz.",
+            permalink="docs/baz-reference",
+            file_path="docs/baz-reference.md",
+            type="entity",
+            metadata={"note_type": "note"},
+            created_at=now,
+            updated_at=now,
+        )
+    )
+
+    syntax_errors: list[Exception] = []
+    real_is_syntax_error = repo._is_tsquery_syntax_error
+
+    def record_syntax_error(exc: Exception) -> bool:
+        is_syntax_error = real_is_syntax_error(exc)
+        if is_syntax_error:
+            syntax_errors.append(exc)
+        return is_syntax_error
+
+    monkeypatch.setattr(repo, "_is_tsquery_syntax_error", record_syntax_error)
+
+    query = "foo<bar baz qux"
+    async with db.scoped_session(session_maker) as caller_session:
+        results = await repo.search(
+            search_text=query,
+            allow_relaxed=True,
+            session=caller_session,
+        )
+        assert any(row.id == 78 for row in results)
+        assert (await caller_session.execute(text("SELECT 1"))).scalar_one() == 1
+
+    assert syntax_errors
+    search_syntax_error_count = len(syntax_errors)
+    assert await repo.count(search_text=query, allow_relaxed=True) == 1
+    assert len(syntax_errors) > search_syntax_error_count

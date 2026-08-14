@@ -1,13 +1,14 @@
 """Read note tool for Basic Memory MCP server."""
 
 from textwrap import dedent
-from typing import Optional, Literal, cast
+from typing import Any, Annotated, Optional, Literal, cast
+from uuid import UUID
 
 import logfire
-import yaml
 
 from loguru import logger
 from fastmcp import Context
+from pydantic import AliasChoices, Field
 
 from basic_memory.config import ConfigManager
 from basic_memory.mcp.project_context import (
@@ -15,10 +16,25 @@ from basic_memory.mcp.project_context import (
     get_project_client,
     resolve_project_and_path,
 )
+from basic_memory.mcp.note_reads import (
+    parse_opening_frontmatter,
+    read_note_json_by_external_id,
+)
 from basic_memory.mcp.server import mcp
 from basic_memory.mcp.tools.search import search_notes
 from basic_memory.schemas.memory import memory_url_path
 from basic_memory.utils import validate_project_path
+
+# The title-match fallback exists to find THE note by exact title, so it scans
+# fixed-size pages of title results instead of the caller's page/page_size
+# (which apply only to the text-search suggestion listing).
+_TITLE_LOOKUP_PAGE_SIZE = 10
+
+# Hard safety cap on title-lookup pages. The loop normally stops as soon as an
+# exact match is found or results run out (has_more=False); the cap only bounds
+# pathological knowledge bases where hundreds of fuzzy titles contain the
+# queried phrase. Exhausting the cap falls through to the suggestion behavior.
+_TITLE_LOOKUP_MAX_PAGES = 10
 
 
 def _is_exact_title_match(identifier: str, title: str) -> bool:
@@ -26,55 +42,55 @@ def _is_exact_title_match(identifier: str, title: str) -> bool:
     return identifier.strip().casefold() == title.strip().casefold()
 
 
-def _parse_opening_frontmatter(content: str) -> tuple[str, dict | None]:
-    """Parse opening YAML frontmatter and return (body, frontmatter).
+def _parse_opening_frontmatter(content: str) -> tuple[str, dict[str, Any] | None]:
+    """Retain the existing test/import surface for the shared parser."""
+    return parse_opening_frontmatter(content)
 
-    Mirrors CLI behavior: only parses a frontmatter block at the very top.
-    If parsing fails or frontmatter is not a mapping, returns body unchanged and None.
-    """
-    original_content = content
-    lines = content.splitlines(keepends=True)
-    if not lines or lines[0].strip() != "---":
-        return original_content, None
 
-    closing_index = None
-    for i in range(1, len(lines)):
-        if lines[i].strip() == "---":
-            closing_index = i
-            break
-
-    if closing_index is None:
-        return original_content, None
-
-    fm_text = "".join(lines[1:closing_index])
+def _exact_external_id(identifier: str) -> str | None:
+    """Return the canonical UUID when the whole identifier is an external ID."""
     try:
-        parsed = yaml.safe_load(fm_text)
-    except yaml.YAMLError:
-        return original_content, None
-
-    if parsed is None:
-        parsed = {}
-    if not isinstance(parsed, dict):
-        return original_content, None
-
-    body_content = "".join(lines[closing_index + 1 :])
-    return body_content, parsed
+        return str(UUID(identifier.strip()))
+    except ValueError:
+        return None
 
 
 @mcp.tool(
+    title="Read Note",
     description="Read a markdown note by title or permalink.",
+    tags={"notes"},
     # TODO: re-enable once MCP client rendering is working
     # meta={"ui/resourceUri": "ui://basic-memory/note-preview"},
-    annotations={"readOnlyHint": True, "openWorldHint": False},
+    annotations={
+        "title": "Read Note",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": False,
+    },
 )
 async def read_note(
     identifier: str,
     project: Optional[str] = None,
     project_id: Optional[str] = None,
+    # Accept common pagination aliases models reach for from training data
+    # (page_number/limit/per_page), matching the sibling navigation tools
+    # (search_notes, build_context, recent_activity). The schema advertises
+    # only the canonical names; aliases are silently mapped at validation time.
+    # `offset` is intentionally NOT aliased: offset is item-indexed (skip N
+    # items) while page is a 1-indexed page-number, so direct aliasing would
+    # return the wrong slice.
+    page: Annotated[
+        int,
+        Field(default=1, validation_alias=AliasChoices("page", "page_number")),
+    ] = 1,
+    page_size: Annotated[
+        int,
+        Field(default=10, validation_alias=AliasChoices("page_size", "limit", "per_page")),
+    ] = 10,
     output_format: Literal["text", "json"] = "text",
     include_frontmatter: bool = False,
     context: Context | None = None,
-) -> str | dict:
+) -> str | dict[str, Any]:
     """Return the raw markdown for a note, or guidance text if no match is found.
 
     Finds and retrieves a note by its title, permalink, or content search,
@@ -99,6 +115,14 @@ async def read_note(
                 workspaces. Takes precedence over `project`. Get from list_memory_projects().
         identifier: The title or permalink of the note to read
                    Can be a full memory:// URL, a permalink, a title, or search text
+        page: Page of fallback-search results to use when the identifier does not
+            resolve to a note directly (default: 1). A direct or exact-title match
+            always returns the full note content — page/page_size never chunk the
+            note itself, and the title-match lookup pages through fixed-size pages
+            of title results until an exact match is found or results are
+            exhausted, regardless of page or page_size.
+        page_size: Number of fallback-search results per page (default: 10). When no
+            match is found, this caps how many related-note suggestions are listed.
         output_format: "text" returns markdown content or guidance text.
             "json" returns a structured object with title/permalink/file_path/content/frontmatter.
         include_frontmatter: When output_format="json", whether content should include the
@@ -122,6 +146,9 @@ async def read_note(
         # Read recent meeting notes
         read_note("team-docs", "Weekly Standup")
 
+        # Page through fallback-search suggestions when nothing matches directly
+        read_note("unknown topic", page=2, page_size=5)
+
     Raises:
         HTTPError: If project doesn't exist or is inaccessible
         SecurityError: If identifier attempts path traversal
@@ -130,6 +157,15 @@ async def read_note(
         If the exact note isn't found, this tool provides helpful suggestions
         including related notes, search commands, and note creation templates.
     """
+    # Trigger: page < 1 or page_size < 1 (e.g. page_size=0 or negative).
+    # Why: both flow into the fallback search's server-side slicing, where
+    #      non-positive values produce empty result pages with unreachable
+    #      pagination. Fail fast, matching search_notes/build_context.
+    if page < 1:
+        raise ValueError(f"page must be >= 1, got {page}")
+    if page_size < 1:
+        raise ValueError(f"page_size must be >= 1, got {page_size}")
+
     # Detect project from a memory URL or permalink prefix before routing.
     # project_id routes by external UUID, so it bypasses URL discovery entirely.
     if project is None and project_id is None:
@@ -147,6 +183,8 @@ async def read_note(
         tool_name="read_note",
         requested_project=project,
         requested_project_id=project_id,
+        page=page,
+        page_size=page_size,
         output_format=output_format,
         include_frontmatter=include_frontmatter,
     ):
@@ -203,26 +241,7 @@ async def read_note(
             knowledge_client = KnowledgeClient(client, active_project.external_id)
             resource_client = ResourceClient(client, active_project.external_id)
 
-            async def _read_json_payload(entity_id: str) -> dict:
-                with logfire.span(
-                    "mcp.read_note.shape_response",
-                    domain="mcp",
-                    action="read_note",
-                    phase="shape_response",
-                ):
-                    entity = await knowledge_client.get_entity(entity_id)
-                    response = await resource_client.read(entity_id)
-                    content_text = response.text
-                    body_content, parsed_frontmatter = _parse_opening_frontmatter(content_text)
-                    return {
-                        "title": entity.title,
-                        "permalink": entity.permalink,
-                        "file_path": entity.file_path,
-                        "content": content_text if include_frontmatter else body_content,
-                        "frontmatter": parsed_frontmatter,
-                    }
-
-            def _empty_json_payload() -> dict:
+            def _empty_json_payload() -> dict[str, Any]:
                 return {
                     "title": None,
                     "permalink": None,
@@ -245,7 +264,7 @@ async def read_note(
                 ]
 
             async def _search_candidates(
-                identifier_text: str, *, title_only: bool
+                identifier_text: str, *, title_only: bool, lookup_page: int = 1
             ) -> dict[str, object]:
                 # Trigger: direct entity resolution failed for the caller's identifier.
                 # Why: search_notes applies the same memory:// normalization and tool-level
@@ -256,11 +275,24 @@ async def read_note(
                 # Without this, project names that collide across workspaces could re-resolve
                 # to a different tenant via the default-workspace fallback (CLI/context=None).
                 search_type = "title" if title_only else "text"
+                # Trigger: title_only — the title search exists to find THE note by
+                #          exact title, not to page through suggestions.
+                # Why: paginating it by the caller's page would skip an exact match
+                #      sitting on page 1 (read_note("Exact Title", page=2)), and a
+                #      small caller page_size could let a higher-ranked fuzzy title
+                #      displace the exact match out of the lookup window
+                #      (read_note("Foo Bar", page_size=1) when "Foo Bar Foo Bar"
+                #      ranks first) — both returning suggestions instead of the note.
+                # Outcome: title lookup uses its own lookup_page with a fixed lookup
+                #          size, walked by the caller below; caller page/page_size
+                #          apply only to the text-search suggestion listing.
                 response = await search_notes(
                     project=active_project.name,
                     project_id=active_project.external_id,
                     query=identifier_text,
                     search_type=search_type,
+                    page=lookup_page if title_only else page,
+                    page_size=_TITLE_LOOKUP_PAGE_SIZE if title_only else page_size,
                     output_format="json",
                     context=context,
                 )
@@ -277,32 +309,71 @@ async def read_note(
                 value = item.get("file_path")
                 return str(value) if value else None
 
-            try:
-                # Try to resolve identifier to entity ID
-                entity_id = await knowledge_client.resolve_entity(entity_path, strict=True)
+            def _result_external_id(item: dict[str, object]) -> str | None:
+                value = item.get("external_id")
+                return value if isinstance(value, str) and value else None
 
-                # Fetch content using entity ID
-                response = await resource_client.read(entity_id)
+            if output_format == "json":
+                exact_external_id = _exact_external_id(entity_path)
+                if exact_external_id is not None:
+                    return dict(
+                        await read_note_json_by_external_id(
+                            knowledge_client=knowledge_client,
+                            resource_client=resource_client,
+                            entity_external_id=exact_external_id,
+                            include_frontmatter=include_frontmatter,
+                        )
+                    )
 
-                # If successful, return the content
-                if response.status_code == 200:
+                try:
+                    entity_id = await knowledge_client.resolve_entity(entity_path, strict=True)
+                except Exception as error:  # pragma: no cover
+                    logger.info(f"Direct lookup failed for '{entity_path}': {error}")
+                else:
                     logger.info(
-                        "Returning read_note result from resource: {path}",
+                        "Returning JSON read_note result from entity: {path}",
                         path=entity_path,
                     )
-                    if output_format == "json":
-                        return await _read_json_payload(entity_id)
-                    return response.text
-            except Exception as e:  # pragma: no cover
-                logger.info(f"Direct lookup failed for '{entity_path}': {e}")
-                # Continue to fallback methods
+                    return dict(
+                        await read_note_json_by_external_id(
+                            knowledge_client=knowledge_client,
+                            resource_client=resource_client,
+                            entity_external_id=entity_id,
+                            include_frontmatter=include_frontmatter,
+                        )
+                    )
+            else:
+                # Text mode intentionally retains the resolve -> resource behavior.
+                try:
+                    entity_id = await knowledge_client.resolve_entity(entity_path, strict=True)
+                    response = await resource_client.read(entity_id)
+                    if response.status_code == 200:
+                        logger.info(
+                            "Returning read_note result from resource: {path}",
+                            path=entity_path,
+                        )
+                        return response.text
+                except Exception as error:  # pragma: no cover
+                    logger.info(f"Direct lookup failed for '{entity_path}': {error}")
 
-            # Fallback 1: Try title search via API
+            # Fallback 1: Try title search via API, walking fixed-size pages of
+            # title results until an exact match is found or results run out.
+            # A single page is not enough: when more than _TITLE_LOOKUP_PAGE_SIZE
+            # higher-ranked fuzzy titles contain the queried phrase, the exact
+            # title lands on a later page and a one-page lookup would miss it.
             logger.info(f"Search title for: {identifier}")
-            title_results = await _search_candidates(identifier, title_only=True)
-
-            title_candidates = _search_results(title_results)
-            if title_candidates:
+            result: dict[str, object] | None = None
+            for lookup_page in range(1, _TITLE_LOOKUP_MAX_PAGES + 1):
+                title_results = await _search_candidates(
+                    identifier, title_only=True, lookup_page=lookup_page
+                )
+                title_candidates = _search_results(title_results)
+                if not title_candidates:
+                    logger.info(
+                        f"No results in title search for: {identifier} "
+                        f"in project {active_project.name}"
+                    )
+                    break
                 # Trigger: direct resolution failed and title search returned candidates.
                 # Why: avoid returning unrelated notes when search yields only fuzzy matches.
                 # Outcome: fetch content only when a true exact title match exists.
@@ -314,33 +385,56 @@ async def read_note(
                     ),
                     None,
                 )
-                if not result:
+                if result is not None:
+                    break
+                # Trigger: this page held only fuzzy titles and the server reports
+                #          no further pages (has_more is False or absent).
+                # Why: continuing past the last page would issue empty lookups.
+                # Outcome: give up on the title fallback and try text search below.
+                if title_results.get("has_more") is not True:
                     logger.info(f"No exact title match found for: {identifier}")
-                elif _result_permalink(result):
-                    try:
-                        # Resolve the permalink to entity ID
+                    break
+
+            if result is not None and output_format == "json":
+                try:
+                    entity_id = _result_external_id(result)
+                    if entity_id is None and _result_permalink(result) is not None:
                         entity_id = await knowledge_client.resolve_entity(
                             _result_permalink(result) or "", strict=True
                         )
-
-                        # Fetch content using the entity ID
-                        response = await resource_client.read(entity_id)
-
-                        if response.status_code == 200:
-                            logger.info(
-                                f"Found note by exact title search: {_result_permalink(result)}"
-                            )
-                            if output_format == "json":
-                                return await _read_json_payload(entity_id)
-                            return response.text
-                    except Exception as e:  # pragma: no cover
+                    if entity_id is not None:
                         logger.info(
-                            f"Failed to fetch content for found title match {_result_permalink(result)}: {e}"
+                            f"Found note by exact title search: {_result_permalink(result)}"
                         )
-            else:
-                logger.info(
-                    f"No results in title search for: {identifier} in project {active_project.name}"
-                )
+                        return dict(
+                            await read_note_json_by_external_id(
+                                knowledge_client=knowledge_client,
+                                resource_client=resource_client,
+                                entity_external_id=entity_id,
+                                include_frontmatter=include_frontmatter,
+                            )
+                        )
+                except Exception as error:  # pragma: no cover
+                    logger.info(
+                        "Failed to fetch content for found title match "
+                        f"{_result_permalink(result)}: {error}"
+                    )
+            elif result is not None and _result_permalink(result):
+                try:
+                    entity_id = await knowledge_client.resolve_entity(
+                        _result_permalink(result) or "", strict=True
+                    )
+                    response = await resource_client.read(entity_id)
+                    if response.status_code == 200:
+                        logger.info(
+                            f"Found note by exact title search: {_result_permalink(result)}"
+                        )
+                        return response.text
+                except Exception as error:  # pragma: no cover
+                    logger.info(
+                        "Failed to fetch content for found title match "
+                        f"{_result_permalink(result)}: {error}"
+                    )
 
             # Fallback 2: Text search as a last resort
             logger.info(f"Title search failed, trying text search for: {identifier}")
@@ -352,6 +446,9 @@ async def read_note(
                 if output_format == "json":
                     return _empty_json_payload()
                 return format_not_found_message(active_project.name, identifier)
+            # The fallback search is paginated server-side to page_size, so list
+            # the whole returned page instead of a hardcoded cap — otherwise the
+            # caller's page_size would be silently ignored past the cap.
             if output_format == "json":
                 payload = _empty_json_payload()
                 payload["related_results"] = [
@@ -360,10 +457,10 @@ async def read_note(
                         "permalink": _result_permalink(result),
                         "file_path": _result_file_path(result),
                     }
-                    for result in text_candidates[:5]
+                    for result in text_candidates
                 ]
                 return payload
-            return format_related_results(active_project.name, identifier, text_candidates[:5])
+            return format_related_results(active_project.name, identifier, text_candidates)
 
 
 def format_not_found_message(project: str | None, identifier: str) -> str:

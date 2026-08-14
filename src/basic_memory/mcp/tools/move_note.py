@@ -2,16 +2,49 @@
 
 from pathlib import Path, PureWindowsPath
 from textwrap import dedent
-from typing import Annotated, Optional, Literal
+from typing import Any, Annotated, Optional, Literal
 
 from loguru import logger
 from fastmcp import Context
-from mcp.server.fastmcp.exceptions import ToolError
+from fastmcp.exceptions import ToolError
 from pydantic import AliasChoices, Field
 
+from basic_memory.config import ConfigManager
 from basic_memory.mcp.server import mcp
-from basic_memory.mcp.project_context import get_project_client
-from basic_memory.utils import validate_project_path
+from basic_memory.mcp.project_context import get_project_client, resolve_project_and_path
+from basic_memory.schemas.project_info import ProjectItem
+from basic_memory.utils import (
+    generate_permalink,
+    normalize_project_reference,
+    validate_project_path,
+)
+from basic_memory.workspace_context import current_workspace_permalink_context
+
+
+def _directory_path_for_move(
+    resolved_identifier: str,
+    active_project: ProjectItem,
+    *,
+    include_project_prefix: bool,
+) -> str:
+    """Return the project-relative source directory expected by the move API."""
+    directory = normalize_project_reference(resolved_identifier).strip("/")
+    project_permalink = active_project.permalink
+
+    route_prefixes: list[str] = []
+    workspace_context = current_workspace_permalink_context()
+    if workspace_context and workspace_context.should_prefix_permalinks:
+        route_prefixes.append(
+            f"{generate_permalink(workspace_context.workspace_slug)}/{project_permalink}"
+        )
+    if include_project_prefix:
+        route_prefixes.append(project_permalink)
+
+    for route_prefix in route_prefixes:
+        if directory.startswith(f"{route_prefix}/"):
+            return directory.removeprefix(f"{route_prefix}/")
+
+    return directory
 
 
 async def _detect_cross_project_move_attempt(
@@ -37,22 +70,35 @@ async def _detect_cross_project_move_attempt(
         project_list = await project_client.list_projects()
         project_names = [p.name.lower() for p in project_list.projects]
 
-        # Check if destination path contains any project names
         dest_lower = destination_path.lower()
-        path_parts = dest_lower.split("/")
+        path_parts = [part for part in dest_lower.split("/") if part]
 
-        # Look for project names in the destination path
-        for part in path_parts:
-            if part in project_names and part != current_project.lower():
-                # Found a different project name in the path
+        # --- Detection 1: leading segment is a known project name ---
+        # Trigger: the first path segment matches a different project's name.
+        # Why: a routing-style destination like "other-project/file.md" expresses an
+        #      intent to move into another project, which move_note cannot do — it
+        #      would silently create a same-project nested folder instead.
+        # Outcome: reject with cross-project guidance rather than fake success.
+        if path_parts:
+            leading = path_parts[0]
+            if leading in project_names and leading != current_project.lower():
                 matching_project = next(
-                    p.name for p in project_list.projects if p.name.lower() == part
+                    p.name for p in project_list.projects if p.name.lower() == leading
                 )
                 return _format_cross_project_error_response(
                     identifier, destination_path, current_project, matching_project
                 )
 
-        # No other cross-project patterns detected
+        # NOTE: a "<seg>/projects/<seg>/..." structural heuristic was removed here.
+        # Why: matching any destination whose 2nd segment is literally "projects" is
+        #      fundamentally ambiguous — it cannot distinguish the cloud workspace
+        #      routing shape from a legitimate same-project nested folder like
+        #      "notes/projects/2025/file.md" or "work/projects/q1/report.md". The
+        #      heuristic produced false CROSS_PROJECT_MOVE_NOT_SUPPORTED rejections for
+        #      those common layouts.
+        # Outcome: cross-workspace routing that does not match a known project name (above)
+        #      now falls through to the move and is caught honestly by the MOVE_OUTCOME_MISMATCH
+        #      backstop if the result lands somewhere other than the requested path.
 
     except Exception as e:
         # If we can't detect, don't interfere with normal error handling
@@ -100,49 +146,6 @@ def _format_cross_project_error_response(
         ## Available projects:
         Use `list_memory_projects()` to see all available projects.
         """).strip()
-
-
-def _format_potential_cross_project_guidance(
-    identifier: str, destination_path: str, current_project: str, available_projects: list[str]
-) -> str:
-    """Format guidance for potentially cross-project moves."""
-    other_projects = ", ".join(available_projects[:3])  # Show first 3 projects  # pragma: no cover
-    if len(available_projects) > 3:  # pragma: no cover
-        other_projects += f" (and {len(available_projects) - 3} others)"  # pragma: no cover
-
-    return (  # pragma: no cover
-        dedent(f"""
-        # Move Failed - Check Project Context
-        
-        Cannot move '{identifier}' to '{destination_path}' within the current project '{current_project}'.
-        
-        ## If you intended to move within the current project:
-        The destination path should be relative to the project root:
-        ```
-        move_note("{identifier}", "folder/filename.md")
-        ```
-        
-        ## If you intended to move to a different project:
-        Cross-project moves require switching projects first. Available projects: {other_projects}
-        
-        ### To move to another project:
-        ```
-        # 1. Read the content
-        read_note("{identifier}")
-        
-        # 2. Create note in target project
-        write_note("Title", "content", "folder", project="target-project-name")
-
-        # 3. Delete original if desired
-        delete_note("{identifier}", project="{current_project}")
-        ```
-        
-        ### To see all projects:
-        ```
-        list_memory_projects()
-        ```
-        """).strip()
-    )
 
 
 def _format_move_error_response(error_message: str, identifier: str, destination_path: str) -> str:
@@ -344,8 +347,15 @@ delete_note("{identifier}")
 
 
 @mcp.tool(
+    title="Move Note",
     description="Move a note or directory to a new location, updating database and maintaining links.",
-    annotations={"destructiveHint": False, "openWorldHint": False},
+    tags={"notes"},
+    annotations={
+        "title": "Move Note",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "openWorldHint": False,
+    },
 )
 async def move_note(
     identifier: str,
@@ -374,7 +384,7 @@ async def move_note(
     project_id: Optional[str] = None,
     output_format: Literal["text", "json"] = "text",
     context: Context | None = None,
-) -> str | dict:
+) -> str | dict[str, Any]:
     """Move a note or directory to a new location within the same project.
 
     Moves a note or directory from one location to another within the project,
@@ -541,18 +551,57 @@ The destination path '{destination_path}' is not allowed - paths must stay withi
 move_note("{identifier}", "notes/{destination_path.split("/")[-1] if "/" in destination_path else destination_path}")
 ```"""
 
+        # Resolve every source before branching so file and directory mutations share
+        # the same fail-closed project boundary.
+        from basic_memory.mcp.clients import KnowledgeClient
+
+        knowledge_client = KnowledgeClient(client, active_project.external_id)
+        source_project, resolved_identifier, is_memory_url = await resolve_project_and_path(
+            client,
+            identifier,
+            active_project.name,
+            context,
+            strict_project_routing=True,
+            allow_missing_project_fallback=True,
+            cache_resolved_project=False,
+        )
+
+        # move_note only supports moves inside the active project.
+        if source_project.external_id != active_project.external_id:
+            logger.info(
+                f"Move rejected: source '{identifier}' resolves to project "
+                f"'{source_project.name}', not the active project '{active_project.name}'"
+            )
+            if output_format == "json":
+                return {
+                    "moved": False,
+                    "title": None,
+                    "permalink": None,
+                    "file_path": None,
+                    "source": identifier,
+                    "destination": destination_path,
+                    "error": "CROSS_PROJECT_MOVE_NOT_SUPPORTED",
+                }
+            return _format_cross_project_error_response(
+                identifier, destination_path, active_project.name, source_project.name
+            )
+
         # Handle directory moves
         if is_directory:
-            # Import here to avoid circular import
-            from basic_memory.mcp.clients import KnowledgeClient
-
-            knowledge_client = KnowledgeClient(client, active_project.external_id)
-
             try:
-                result = await knowledge_client.move_directory(identifier, destination_path)
+                source_directory = (
+                    _directory_path_for_move(
+                        resolved_identifier,
+                        active_project,
+                        include_project_prefix=ConfigManager().config.permalinks_include_project,
+                    )
+                    if is_memory_url
+                    else resolved_identifier
+                )
+                result = await knowledge_client.move_directory(source_directory, destination_path)
                 if output_format == "json":
                     return {
-                        "moved": result.failed_moves == 0,
+                        "moved": result.total_files > 0 and result.failed_moves == 0,
                         "title": None,
                         "permalink": None,
                         "file_path": None,
@@ -562,7 +611,20 @@ move_note("{identifier}", "notes/{destination_path.split("/")[-1] if "/" in dest
                         "total_files": result.total_files,
                         "successful_moves": result.successful_moves,
                         "failed_moves": result.failed_moves,
+                        **(
+                            {"error": "Directory not found or empty: no files matched"}
+                            if result.total_files == 0
+                            else {}
+                        ),
                     }
+
+                if result.total_files == 0:
+                    return f"""# Directory Move Failed - No Files Found
+
+No files found for source directory `{identifier}`.
+Total files: 0.
+
+<!-- Project: {active_project.name} -->"""
 
                 # Build success message for directory move
                 result_lines = [
@@ -633,30 +695,6 @@ list_directory("{identifier}")
 move_note("path/to/file.md", "{destination_path}/file.md")
 ```"""
 
-        # Check for potential cross-project move attempts (file moves only)
-        cross_project_error = await _detect_cross_project_move_attempt(
-            client, identifier, destination_path, active_project.name
-        )
-        if cross_project_error:
-            logger.info(f"Detected cross-project move attempt: {identifier} -> {destination_path}")
-            if output_format == "json":
-                return {
-                    "moved": False,
-                    "title": None,
-                    "permalink": None,
-                    "file_path": None,
-                    "source": identifier,
-                    "destination": destination_path,
-                    "error": "CROSS_PROJECT_MOVE_NOT_SUPPORTED",
-                }
-            return cross_project_error
-
-        # Import here to avoid circular import
-        from basic_memory.mcp.clients import KnowledgeClient
-
-        # Use typed KnowledgeClient for API calls
-        knowledge_client = KnowledgeClient(client, active_project.external_id)
-
         # Resolve once and reuse the entity ID across extension validation and move.
         source_ext = "md"  # Default to .md if we can't determine source extension
         resolved_entity_id: str | None = None
@@ -666,7 +704,9 @@ move_note("path/to/file.md", "{destination_path}/file.md")
             """Resolve and cache the source entity ID for the duration of this move."""
             nonlocal resolved_entity_id
             if resolved_entity_id is None:
-                resolved_entity_id = await knowledge_client.resolve_entity(identifier, strict=True)
+                resolved_entity_id = await knowledge_client.resolve_entity(
+                    resolved_identifier, strict=True
+                )
             return resolved_entity_id
 
         try:
@@ -756,6 +796,63 @@ The destination folder '{destination_folder}' is not allowed - paths must stay w
 move_note("{identifier}", destination_folder="notes")
 ```"""
 
+        # --- Cross-boundary intent guard (file moves only) ---
+        # Trigger: destination_path now holds the real combined target, whether it came
+        #          from destination_path or was resolved from destination_folder above.
+        # Why: detection must run AFTER folder resolution — running it earlier (when a
+        #      caller used destination_folder) saw an empty destination_path and skipped
+        #      entirely (#881 Gap 3).
+        # Outcome: a cross-workspace/cross-project routing destination is rejected with
+        #          guidance instead of silently degrading to a same-project nested folder.
+        cross_project_error = await _detect_cross_project_move_attempt(
+            client, identifier, destination_path, active_project.name
+        )
+        if cross_project_error:
+            logger.info(f"Detected cross-project move attempt: {identifier} -> {destination_path}")
+            if output_format == "json":
+                return {
+                    "moved": False,
+                    "title": None,
+                    "permalink": None,
+                    "file_path": None,
+                    "source": identifier,
+                    "destination": destination_path,
+                    "error": "CROSS_PROJECT_MOVE_NOT_SUPPORTED",
+                }
+            return cross_project_error
+
+        # Trigger: caller asks to move a note to its current normalized file path.
+        # Why: the API treats this as a successful update, but no file actually moved.
+        # Outcome: report an honest no-op failure so callers can choose a new path.
+        if source_entity is not None:
+            normalized_source = PureWindowsPath(source_entity.file_path).as_posix().strip("/")
+            normalized_destination = PureWindowsPath(destination_path).as_posix().strip("/")
+            if normalized_source == normalized_destination:
+                logger.info(
+                    f"Move rejected because source and destination are the same: "
+                    f"{source_entity.file_path}"
+                )
+                if output_format == "json":
+                    return {
+                        "moved": False,
+                        "title": source_entity.title,
+                        "permalink": source_entity.permalink,
+                        "file_path": source_entity.file_path,
+                        "source": identifier,
+                        "destination": destination_path,
+                        "error": "DESTINATION_SAME_AS_SOURCE",
+                    }
+                return dedent(f"""
+                    # Move Failed - Destination Same As Source
+
+                    The note '{identifier}' is already at the requested destination.
+
+                    **Current path:** `{source_entity.file_path}`
+                    **Requested destination:** `{destination_path}`
+
+                    Choose a different destination path to move or rename this note.
+                    """).strip()
+
         # Validate that destination path includes a file extension
         if "." not in destination_path or not destination_path.split(".")[-1]:
             logger.warning(f"Move failed - no file extension provided: {destination_path}")
@@ -839,6 +936,53 @@ move_note("{identifier}", destination_folder="notes")
 
             # Call the move API using KnowledgeClient
             result = await knowledge_client.move_entity(resolved_entity_id, destination_path)
+
+            # --- Outcome validation (honest success backstop) ---
+            # Trigger: the resulting file_path differs from the destination the caller
+            #          requested.
+            # Why: move_entity stores the path relative to the *current* project root, so
+            #      a cross-boundary intent silently degrades into a same-project nested
+            #      folder. The old code reported "✅ moved successfully" regardless,
+            #      misleading the agent (#881 Gap 2). This is the robust backstop behind
+            #      the up-front detection: any divergence the caller did not ask for
+            #      surfaces as a failure rather than a fake success.
+            # Outcome: report failure with the actual landing path instead of "✅".
+            normalized_requested = PureWindowsPath(destination_path).as_posix().strip("/")
+            normalized_actual = PureWindowsPath(result.file_path).as_posix().strip("/")
+            if normalized_actual != normalized_requested:
+                logger.warning(
+                    f"Move outcome diverged from intent: requested={destination_path} "
+                    f"actual={result.file_path}"
+                )
+                if output_format == "json":
+                    return {
+                        "moved": False,
+                        "title": result.title,
+                        "permalink": result.permalink,
+                        "file_path": result.file_path,
+                        "source": identifier,
+                        "destination": destination_path,
+                        "error": "MOVE_OUTCOME_MISMATCH",
+                    }
+                return dedent(f"""
+                    # Move Failed - Unexpected Result Location
+
+                    The move of '{identifier}' did not land at the requested destination.
+
+                    **Requested:** `{destination_path}`
+                    **Actual:** `{result.file_path}`
+
+                    This usually means the destination referenced a different
+                    workspace/project, which move_note cannot do — notes can only be
+                    moved within the same project. To move content between projects:
+
+                    ```
+                    read_note("{result.file_path}")
+                    write_note("Title", "content", "folder", project="target-project")
+                    delete_note("{result.file_path}", project="{active_project.name}")
+                    ```
+                    """).strip()
+
             if output_format == "json":
                 return {
                     "moved": True,

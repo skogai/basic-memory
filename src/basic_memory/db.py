@@ -1,10 +1,10 @@
 import asyncio
 import os
 import sys
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from enum import Enum, auto
 from pathlib import Path
-from typing import AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, Optional
 
 from basic_memory.config import BasicMemoryConfig, ConfigManager, DatabaseBackend
 from alembic import command
@@ -19,14 +19,17 @@ from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     async_scoped_session,
 )
-from sqlalchemy.pool import NullPool
+from sqlalchemy.pool import AsyncAdaptedQueuePool, NullPool
 
-from basic_memory.repository.postgres_search_repository import PostgresSearchRepository
-from basic_memory.repository.sqlite_search_repository import SQLiteSearchRepository
 
 # -----------------------------------------------------------------------------
 # Windows event loop policy
 # -----------------------------------------------------------------------------
+def _install_event_loop_policy(policy: Any) -> None:
+    """Install the Python 3.12-3.15 process-wide compatibility policy."""
+    asyncio.set_event_loop_policy(policy)  # ty: ignore[deprecated]
+
+
 # On Windows, the default ProactorEventLoop has known rough edges with aiosqlite
 # during shutdown/teardown (threads posting results to a loop that's closing),
 # which can manifest as:
@@ -37,7 +40,54 @@ from basic_memory.repository.sqlite_search_repository import SQLiteSearchReposit
 # asyncio.create_subprocess_shell() (like sync_service._quick_count_files) must
 # detect Windows and use fallback implementations.
 if sys.platform == "win32":  # pragma: no cover
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    # Constraint: Basic Memory supports Python 3.12-3.15, where the policy API
+    # remains the only process-wide way to cover every independently owned loop
+    # entrypoint. Replace this compatibility seam with loop factories before 3.16.
+    # The factory is a Windows-only asyncio export, so resolve it only after the
+    # runtime platform guard (also keeps all-platform static analysis portable).
+    windows_selector_policy = getattr(asyncio, "WindowsSelectorEventLoopPolicy")
+    _install_event_loop_policy(windows_selector_policy())
+
+
+def maybe_install_uvloop(config: BasicMemoryConfig) -> bool:
+    """Install the uvloop event-loop policy for the Postgres backend.
+
+    Trigger: process entrypoint starting with database_backend == postgres,
+    uvloop importable, and a non-Windows platform.
+    Why: asyncpg engine teardown (engine.dispose()) races the stdlib asyncio
+    loop shutdown and surfaces "IndexError: pop from an empty deque" from
+    base_events._run_once (see #831/#877). uvloop's C scheduler has no
+    self._ready.popleft() codepath, so that class of crash cannot fire under it.
+    Outcome: Postgres deployments run on uvloop; SQLite users keep the default
+    loop (no behavior change, smaller blast radius). Must run before the event
+    loop is created, i.e. before asyncio.run().
+
+    Returns:
+        True if the uvloop policy was installed, False otherwise.
+    """
+    # uvloop is not available on Windows; the default loop already differs there.
+    if sys.platform == "win32":  # pragma: no cover
+        return False
+
+    # Limit the change to the backend that actually hits the asyncpg dispose race.
+    if config.database_backend != DatabaseBackend.POSTGRES:
+        return False
+
+    # Deferred import: uvloop is an optional, platform-gated dependency and the
+    # default (SQLite) path must not require it to be installed.
+    try:
+        import uvloop
+    except ImportError:  # pragma: no cover
+        logger.warning("uvloop not available - using default event loop for Postgres backend")
+        return False
+
+    # Constraint: CLI commands and FastMCP/AnyIO own several separate loop
+    # entrypoints. A single policy install keeps all of them on uvloop through
+    # Python 3.15; migrate those entrypoints to loop factories before 3.16.
+    _install_event_loop_policy(uvloop.EventLoopPolicy())
+    logger.info("Installed uvloop event-loop policy for Postgres backend")
+    return True
+
 
 # Module level state
 _engine: Optional[AsyncEngine] = None
@@ -93,7 +143,7 @@ class DatabaseType(Enum):
 
 def get_scoped_session_factory(
     session_maker: async_sessionmaker[AsyncSession],
-) -> async_scoped_session:
+) -> async_scoped_session[AsyncSession]:
     """Create a scoped session factory scoped to current task."""
     return async_scoped_session(session_maker, scopefunc=asyncio.current_task)
 
@@ -101,52 +151,101 @@ def get_scoped_session_factory(
 @asynccontextmanager
 async def scoped_session(
     session_maker: async_sessionmaker[AsyncSession],
+    session: AsyncSession | None = None,
 ) -> AsyncGenerator[AsyncSession, None]:
     """
     Get a scoped session with proper lifecycle management.
 
+    This is the one shared session-scope seam for services and indexing code.
+    It covers both real usage variants:
+
+    - ``session`` provided: the caller-owned session is yielded unchanged and
+      the caller keeps commit/rollback ownership (composed multi-step writes).
+    - ``session`` omitted: a fresh task-scoped session is opened that commits
+      on success, rolls back on error, and always closes.
+
     Args:
         session_maker: Session maker to create scoped sessions from
+        session: Optional caller-owned session to reuse instead of opening one
     """
+    # Trigger: the caller already owns a transaction and passes its session in.
+    # Why: nested scopes must not commit or roll back mid-way through the
+    # caller's composed write; transaction ownership stays with the opener.
+    # Outcome: yield the session untouched and let the outermost scope finish it.
+    if session is not None:
+        yield session
+        return
+
     factory = get_scoped_session_factory(session_maker)
-    session = factory()
+    owned_session = factory()
     try:
         # Only enable foreign keys for SQLite (Postgres has them enabled by default)
         # Detect database type from session's bind (engine) dialect
-        engine = session.get_bind()
+        engine = owned_session.get_bind()
         dialect_name = engine.dialect.name
 
         if dialect_name == "sqlite":
-            await session.execute(text("PRAGMA foreign_keys=ON"))
+            await owned_session.execute(text("PRAGMA foreign_keys=ON"))
 
-        yield session
-        await session.commit()
+        yield owned_session
+        await owned_session.commit()
     except Exception:
-        await session.rollback()
+        await owned_session.rollback()
         raise
     finally:
-        await session.close()
+        await owned_session.close()
         await factory.remove()
 
 
-def _configure_sqlite_connection(dbapi_conn, enable_wal: bool = True) -> None:
-    """Configure SQLite connection with WAL mode and optimizations.
+_SQLITE_SYNCHRONOUS = {"OFF", "NORMAL", "FULL", "EXTRA"}
+
+
+def _configure_sqlite_connection(
+    dbapi_conn,
+    enable_wal: bool = True,
+    *,
+    synchronous: str = "NORMAL",
+    mmap_size: int = 0,
+    wal_autocheckpoint: int = 1000,
+    page_size: int = 0,
+) -> None:
+    """Configure a SQLite connection with WAL mode and tunable performance PRAGMAs.
 
     Args:
         dbapi_conn: Database API connection object
         enable_wal: Whether to enable WAL mode (should be False for in-memory databases)
+        synchronous: PRAGMA synchronous level (OFF/NORMAL/FULL/EXTRA)
+        mmap_size: PRAGMA mmap_size bytes (0 = disabled)
+        wal_autocheckpoint: PRAGMA wal_autocheckpoint pages (0 = disabled; WAL only)
+        page_size: PRAGMA page_size bytes (0 = leave default; only affects new DBs)
     """
     cursor = dbapi_conn.cursor()
     try:
+        # page_size must be set before the database is written to take effect, so
+        # do it first; it is a no-op on an already-populated DB.
+        if page_size:
+            cursor.execute(f"PRAGMA page_size={int(page_size)}")
         # Enable WAL mode for better concurrency (not supported for in-memory databases)
         if enable_wal:
             cursor.execute("PRAGMA journal_mode=WAL")
         # Set busy timeout to handle locked databases
         cursor.execute("PRAGMA busy_timeout=10000")  # 10 seconds
-        # Optimize for performance
-        cursor.execute("PRAGMA synchronous=NORMAL")
+        # synchronous: OFF trades durability for write throughput. Safe here because
+        # the markdown files are the source of truth and the index DB rebuilds from
+        # them via sync — a crash means a re-sync, not data loss. Validate the token
+        # since it is interpolated into the PRAGMA.
+        sync = synchronous.upper() if synchronous.upper() in _SQLITE_SYNCHRONOUS else "NORMAL"
+        cursor.execute(f"PRAGMA synchronous={sync}")
         cursor.execute("PRAGMA cache_size=-64000")  # 64MB cache
         cursor.execute("PRAGMA temp_store=MEMORY")
+        # mmap_size: memory-map the DB for faster reads, including the lookups
+        # inside writes (link/permalink resolution, FTS).
+        if mmap_size:
+            cursor.execute(f"PRAGMA mmap_size={int(mmap_size)}")
+        # wal_autocheckpoint: checkpoint less often to avoid writer stalls under
+        # sustained write bursts (WAL only).
+        if enable_wal and wal_autocheckpoint:
+            cursor.execute(f"PRAGMA wal_autocheckpoint={int(wal_autocheckpoint)}")
         # Windows-specific optimizations
         if os.name == "nt":
             cursor.execute("PRAGMA locking_mode=NORMAL")  # Ensure normal locking on Windows
@@ -157,51 +256,78 @@ def _configure_sqlite_connection(dbapi_conn, enable_wal: bool = True) -> None:
         cursor.close()
 
 
-def _create_sqlite_engine(db_url: str, db_type: DatabaseType) -> AsyncEngine:
+def _create_sqlite_engine(
+    db_url: str, db_type: DatabaseType, config: Optional[BasicMemoryConfig] = None
+) -> AsyncEngine:
     """Create SQLite async engine with appropriate configuration.
 
     Args:
         db_url: SQLite connection URL
         db_type: Database type (MEMORY or FILESYSTEM)
+        config: Optional config supplying the tunable SQLite PRAGMAs
 
     Returns:
         Configured async engine for SQLite
     """
     # Configure connection args with Windows-specific settings
-    connect_args: dict[str, bool | float | None] = {"check_same_thread": False}
+    connect_args: dict[str, bool | float] = {"check_same_thread": False}
 
     # Add Windows-specific parameters to improve reliability
     if os.name == "nt":  # Windows
         connect_args.update(
             {
                 "timeout": 30.0,  # Increase timeout to 30 seconds for Windows
-                "isolation_level": None,  # Use autocommit mode
             }
         )
+
+    if db_type == DatabaseType.MEMORY:
+        # Trigger: an in-memory SQLite URL would default to StaticPool, which hands the
+        # same DBAPI connection to every concurrently checked-out session.
+        # Why: concurrent asyncio tasks then share one transaction scope — a rollback
+        # issued by one session (scoped_session exception handling or the pool's
+        # reset-on-return) silently destroys another session's uncommitted writes (#940).
+        # Outcome: a single-connection blocking queue pool keeps the in-memory database
+        # alive for the engine's lifetime while serializing sessions at transaction
+        # granularity, restoring the isolation the repositories assume.
+        engine = create_async_engine(
+            db_url,
+            connect_args=connect_args,
+            poolclass=AsyncAdaptedQueuePool,
+            pool_size=1,
+            max_overflow=0,
+        )
+    elif os.name == "nt":
         # Use NullPool for Windows filesystem databases to avoid connection pooling issues
-        # Important: Do NOT use NullPool for in-memory databases as it will destroy the database
-        # between connections
-        if db_type == DatabaseType.FILESYSTEM:
-            engine = create_async_engine(
-                db_url,
-                connect_args=connect_args,
-                poolclass=NullPool,  # Disable connection pooling on Windows
-                echo=False,
-            )
-        else:
-            # In-memory databases need connection pooling to maintain state
-            engine = create_async_engine(db_url, connect_args=connect_args)
+        engine = create_async_engine(
+            db_url,
+            connect_args=connect_args,
+            poolclass=NullPool,  # Disable connection pooling on Windows
+            echo=False,
+        )
     else:
         engine = create_async_engine(db_url, connect_args=connect_args)
 
     # Enable WAL mode for better concurrency and reliability
     # Note: WAL mode is not supported for in-memory databases
     enable_wal = db_type != DatabaseType.MEMORY
+    # Snapshot the tunable PRAGMAs once (config is process-stable) so the per-connect
+    # listener doesn't re-read config on every pooled connection.
+    synchronous = config.sqlite_synchronous if config else "NORMAL"
+    mmap_size = config.sqlite_mmap_size if config else 0
+    wal_autocheckpoint = config.sqlite_wal_autocheckpoint if config else 1000
+    page_size = config.sqlite_page_size if config else 0
 
     @event.listens_for(engine.sync_engine, "connect")
     def enable_wal_mode(dbapi_conn, connection_record):
-        """Enable WAL mode on each connection."""
-        _configure_sqlite_connection(dbapi_conn, enable_wal=enable_wal)
+        """Apply WAL + tunable PRAGMAs on each connection."""
+        _configure_sqlite_connection(
+            dbapi_conn,
+            enable_wal=enable_wal,
+            synchronous=synchronous,
+            mmap_size=mmap_size,
+            wal_autocheckpoint=wal_autocheckpoint,
+            page_size=page_size,
+        )
 
     return engine
 
@@ -216,12 +342,28 @@ def _create_postgres_engine(db_url: str, config: BasicMemoryConfig) -> AsyncEngi
     Returns:
         Configured async engine for Postgres
     """
-    # Use NullPool connection issues.
-    # Assume connection pooler like PgBouncer handles connection pooling.
+    # Connection pooling for direct (local / self-hosted) Postgres.
+    #
+    # Trigger: this is the default engine factory. The cloud overrides
+    # get_engine_factory with its own pooled engine (basic_memory_cloud
+    # tenant_engine_pool), so this path serves the LOCAL runtime — which has no
+    # PgBouncer in front of Postgres.
+    # Why: NullPool (a fresh connection per request) was assumed safe because a
+    # pooler would sit in front, but locally there is none. Under concurrent
+    # writes — plus each background materialization opening its own connection —
+    # that stormed max_connections and collapsed (p99 478s, 21% write failures at
+    # C=32; benchmarks/docs/write-load-benchmark.md).
+    # Outcome: a real pool bounds in-use connections to db_pool_size (+
+    # db_pool_overflow under load) and recycles them (Neon scale-to-zero).
+    # statement_cache_size=0 stays so the engine also works behind a PgBouncer
+    # transaction-mode pooler if a user runs one.
     engine = create_async_engine(
         db_url,
         echo=False,
-        poolclass=NullPool,  # No pooling - fresh connection per request
+        poolclass=AsyncAdaptedQueuePool,
+        pool_size=config.db_pool_size,
+        max_overflow=config.db_pool_overflow,
+        pool_recycle=config.db_pool_recycle,
         connect_args={
             # Disable statement cache to avoid issues with prepared statements on reconnect
             "statement_cache_size": 0,
@@ -236,7 +378,10 @@ def _create_postgres_engine(db_url: str, config: BasicMemoryConfig) -> AsyncEngi
             },
         },
     )
-    logger.debug("Created Postgres engine with NullPool (no connection pooling)")
+    logger.debug(
+        "Created Postgres engine with QueuePool "
+        f"(pool_size={config.db_pool_size}, max_overflow={config.db_pool_overflow})"
+    )
 
     return engine
 
@@ -268,7 +413,7 @@ def _create_engine_and_session(
     if db_type == DatabaseType.POSTGRES or config.database_backend == DatabaseBackend.POSTGRES:
         engine = _create_postgres_engine(db_url, config)
     else:
-        engine = _create_sqlite_engine(db_url, db_type)
+        engine = _create_sqlite_engine(db_url, db_type, config)
 
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
     return engine, session_maker
@@ -320,7 +465,15 @@ async def shutdown_db() -> None:  # pragma: no cover
     global _engine, _session_maker
 
     if _engine:
-        await _engine.dispose()
+        # Trigger: teardown can run while the surrounding task is being cancelled
+        # (e.g. lifespan shutdown, unshielded CLI cleanup).
+        # Why: a cancellation landing mid-dispose surfaces the asyncpg
+        # "IndexError: pop from an empty deque" race (#831/#877); shielding lets
+        # dispose finish atomically, and suppressing CancelledError keeps a
+        # cancelled shutdown from re-raising the underlying race.
+        # Outcome: connections always close cleanly even under cancellation.
+        with suppress(asyncio.CancelledError):
+            await asyncio.shield(_engine.dispose())
         _engine = None
         _session_maker = None
 
@@ -364,7 +517,14 @@ async def engine_session_factory(
 
         yield created_engine, created_session_maker
     finally:
-        await created_engine.dispose()
+        # Trigger: context-manager teardown can run while the surrounding task is
+        # being cancelled (e.g. a test aborting mid-fixture).
+        # Why: on the asyncpg backend a cancellation landing mid-dispose surfaces
+        # the "IndexError: pop from an empty deque" race (#831/#877); shield the
+        # dispose and suppress CancelledError to match the other dispose seams.
+        # Outcome: the per-context engine always disposes cleanly under cancellation.
+        with suppress(asyncio.CancelledError):
+            await asyncio.shield(created_engine.dispose())
 
         # Only clear module-level globals if they still point to this context's
         # engine/session. This avoids clobbering newer globals from other callers.
@@ -414,17 +574,23 @@ async def run_migrations(
         else:
             session_maker = _session_maker
 
-        # Initialize the search index schema
-        # For SQLite: Create FTS5 virtual table
-        # For Postgres: No-op (tsvector column added by migrations)
-        # The project_id is not used for init_search_index, so we pass a dummy value
-        if (
-            database_type == DatabaseType.POSTGRES
-            or app_config.database_backend == DatabaseBackend.POSTGRES
-        ):
-            await PostgresSearchRepository(session_maker, 1).init_search_index()
-        else:
-            await SQLiteSearchRepository(session_maker, 1).init_search_index()
+        # Import lazily because backend repositories import this module for session
+        # management. Startup must still use the composition factory so configured
+        # semantic-vector extensions are available during index initialization.
+        from basic_memory.repository.search_repository import create_search_repository
+
+        database_backend = (
+            DatabaseBackend.POSTGRES
+            if database_type == DatabaseType.POSTGRES
+            else app_config.database_backend
+        )
+        search_repository = create_search_repository(
+            session_maker=session_maker,
+            project_id=1,
+            app_config=app_config,
+            database_backend=database_backend,
+        )
+        await search_repository.init_search_index()
 
     except Exception as e:  # pragma: no cover
         logger.error(f"Error running migrations: {e}")
@@ -433,7 +599,11 @@ async def run_migrations(
         # Trigger: run_migrations() created a temporary engine while module-level
         # session maker was not initialized.
         # Why: temporary aiosqlite worker threads can outlive CLI command execution
-        # and block process shutdown if the engine is not disposed.
-        # Outcome: always dispose temporary engines after migration work completes.
+        # and block process shutdown if the engine is not disposed. On the asyncpg
+        # backend a cancellation landing mid-dispose surfaces the same "IndexError:
+        # pop from an empty deque" race as the other dispose seams (#831/#877), so
+        # shield the dispose and suppress CancelledError to match them.
+        # Outcome: always dispose temporary engines cleanly, even under cancellation.
         if temp_engine is not None:
-            await temp_engine.dispose()
+            with suppress(asyncio.CancelledError):
+                await asyncio.shield(temp_engine.dispose())

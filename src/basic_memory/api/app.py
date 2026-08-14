@@ -5,7 +5,6 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import JSONResponse
-from fastapi.routing import APIRouter
 from loguru import logger
 
 from basic_memory import __version__ as version
@@ -21,13 +20,10 @@ from basic_memory.api.v2.routers import (
     importer_router as v2_importer,
     schema_router as v2_schema,
 )
-from basic_memory.api.v2.routers.project_router import (
-    add_project,
-    list_projects,
-    synchronize_projects,
-)
 import logfire
+from basic_memory.index.note_content_materialization import drain_pending_materializations
 from basic_memory.config import init_api_logging
+from basic_memory.index.local_schedulers import drain_background_tasks
 from basic_memory.services.exceptions import EntityAlreadyExistsError
 from basic_memory.services.initialization import initialize_app
 from basic_memory.workspace_context import (
@@ -67,10 +63,10 @@ async def lifespan(app: FastAPI):  # pragma: no cover
         app.state.session_maker = session_maker
         logger.info("Database connections cached in app state")
 
-        # Create and start sync coordinator (lifecycle centralized in coordinator)
-        sync_coordinator = container.create_sync_coordinator()
-        await sync_coordinator.start()
-        app.state.sync_coordinator = sync_coordinator
+        # Create and start local watch coordinator (lifecycle centralized in coordinator)
+        watch_coordinator = container.create_watch_coordinator()
+        await watch_coordinator.start()
+        app.state.watch_coordinator = watch_coordinator
 
     # Proceed with startup
     yield
@@ -82,7 +78,13 @@ async def lifespan(app: FastAPI):  # pragma: no cover
         mode=container.mode.name.lower(),
     ):
         logger.info("Shutting down Basic Memory API")
-        await sync_coordinator.stop()
+        await watch_coordinator.stop()
+        # A local note write returns 202 before its markdown file is written;
+        # SIGTERM can land while that materialization (and the vector sync /
+        # relation resolution it schedules) is still queued. Drain both queues
+        # before the engine closes so an accepted write is never lost.
+        await drain_pending_materializations()
+        await drain_background_tasks()
         await container.shutdown_database()
 
 
@@ -133,14 +135,6 @@ app.include_router(v2_project, prefix="/v2")
 
 # Legacy web app proxy paths (compat with /proxy/projects/projects)
 app.include_router(v2_project, prefix="/proxy/projects")
-
-# Legacy v1 compat: older CLI versions (v0.18.0 and earlier) call /projects/...
-# Using router mount causes 307 redirect which proxy doesn't follow, so add explicit routes
-legacy_router = APIRouter(tags=["legacy"])
-legacy_router.add_api_route("/projects/projects", list_projects, methods=["GET"])
-legacy_router.add_api_route("/projects/projects", add_project, methods=["POST"])
-legacy_router.add_api_route("/projects/config/sync", synchronize_projects, methods=["POST"])
-app.include_router(legacy_router)
 
 # V2 routers are the only public API surface
 

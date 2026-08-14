@@ -6,14 +6,42 @@ from pathlib import Path
 import pytest
 from httpx import AsyncClient
 
+from basic_memory import db
+from basic_memory.config import ProjectEntry
 from basic_memory.models import Project
 from basic_memory.schemas.project_info import ProjectItem, ProjectStatusResponse
 from basic_memory.schemas.v2 import ProjectResolveResponse
+from typing import Any
 
 
 def _project_item(project: ProjectItem | None) -> ProjectItem:
     assert project is not None
     return project
+
+
+async def _find_projects(project_repository, session_maker):
+    async with db.scoped_session(session_maker) as session:
+        return await project_repository.find_all(session)
+
+
+async def _delete_project(project_repository, session_maker, project_id: int) -> bool:
+    async with db.scoped_session(session_maker) as session:
+        return await project_repository.delete(session, project_id)
+
+
+async def _get_project_by_name(project_repository, session_maker, name: str):
+    async with db.scoped_session(session_maker) as session:
+        return await project_repository.get_by_name(session, name)
+
+
+async def _get_default_project(project_repository, session_maker):
+    async with db.scoped_session(session_maker) as session:
+        return await project_repository.get_default_project(session)
+
+
+async def _update_project(project_repository, session_maker, project_id: int, data: dict[str, Any]):
+    async with db.scoped_session(session_maker) as session:
+        return await project_repository.update(session, project_id, data)
 
 
 @pytest.mark.asyncio
@@ -52,6 +80,47 @@ async def test_get_project_by_id_not_found(client: AsyncClient, v2_projects_url)
 
     assert response.status_code == 404
     assert "not found" in response.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_add_project_response_reflects_promoted_default(
+    client: AsyncClient,
+    v2_projects_url,
+    app_config,
+    config_manager,
+    config_home,
+    project_repository,
+    session_maker,
+):
+    """Regression #974/#985: POST response should echo persisted default promotion."""
+    main_home = config_home / "basic-memory"
+    main_home.mkdir(parents=True, exist_ok=True)
+    qa_path = config_home / "qa-notes"
+    qa_path.mkdir(parents=True, exist_ok=True)
+
+    fresh_config = app_config.model_copy(
+        update={
+            "projects": {"main": ProjectEntry(path=str(main_home))},
+            "default_project": "main",
+        }
+    )
+    config_manager.save_config(fresh_config)
+
+    for project in await _find_projects(project_repository, session_maker):
+        await _delete_project(project_repository, session_maker, project.id)
+
+    response = await client.post(
+        f"{v2_projects_url}/",
+        json={"name": "qa", "path": str(qa_path), "set_default": False},
+    )
+
+    assert response.status_code == 201
+    status_response = ProjectStatusResponse.model_validate(response.json())
+    assert status_response.status == "success"
+    assert status_response.default is True
+    new_project = _project_item(status_response.new_project)
+    assert new_project.name == "qa"
+    assert new_project.is_default is True
 
 
 @pytest.mark.asyncio
@@ -112,14 +181,21 @@ async def test_update_project_not_found(client: AsyncClient, v2_projects_url, tm
 
 @pytest.mark.asyncio
 async def test_set_default_project_by_id(
-    client: AsyncClient, test_project: Project, v2_projects_url, project_repository, project_service
+    client: AsyncClient,
+    test_project: Project,
+    v2_projects_url,
+    project_repository,
+    project_service,
+    session_maker,
 ):
     """Test setting a project as default by external_id."""
     # Create a second project to test setting default
     await project_service.add_project("second-project", "/tmp/second-project")
 
     # Get the created project from the repository to get its external_id
-    created_project = await project_repository.get_by_name("second-project")
+    created_project = await _get_project_by_name(
+        project_repository, session_maker, "second-project"
+    )
     assert created_project is not None
 
     # Set the second project as default
@@ -138,6 +214,37 @@ async def test_set_default_project_by_id(
 
 
 @pytest.mark.asyncio
+async def test_set_default_project_when_none_is_set(
+    client: AsyncClient, test_project: Project, v2_projects_url, project_repository, session_maker
+):
+    """Regression for #975: setting a default must succeed when none is set.
+
+    This is the bootstrap/recovery case: `bm project default <name>` is exactly
+    the command reached for when no default exists, so the endpoint must not 404.
+    """
+    # Clear any existing default so no row has is_default set.
+    await _update_project(project_repository, session_maker, test_project.id, {"is_default": None})
+    assert await _get_default_project(project_repository, session_maker) is None
+
+    response = await client.put(f"{v2_projects_url}/{test_project.external_id}/default")
+
+    assert response.status_code == 200
+    status_response = ProjectStatusResponse.model_validate(response.json())
+    assert status_response.status == "success"
+    assert status_response.default is True
+    # No previous default existed, so old_project must be None.
+    assert status_response.old_project is None
+    new_project = _project_item(status_response.new_project)
+    assert new_project.external_id == test_project.external_id
+    assert new_project.is_default is True
+
+    # A follow-up read-back must now return the newly set default.
+    default_project = await _get_default_project(project_repository, session_maker)
+    assert default_project is not None
+    assert default_project.external_id == test_project.external_id
+
+
+@pytest.mark.asyncio
 async def test_set_default_project_not_found(client: AsyncClient, v2_projects_url):
     """Test setting a non-existent project as default returns 404."""
     fake_uuid = "00000000-0000-0000-0000-000000000000"
@@ -148,14 +255,19 @@ async def test_set_default_project_not_found(client: AsyncClient, v2_projects_ur
 
 @pytest.mark.asyncio
 async def test_delete_project_by_id(
-    client: AsyncClient, test_project: Project, v2_projects_url, project_repository, project_service
+    client: AsyncClient,
+    test_project: Project,
+    v2_projects_url,
+    project_repository,
+    project_service,
+    session_maker,
 ):
     """Test deleting a project by external_id."""
     # Create a second project since we can't delete the default
     await project_service.add_project("to-delete", "/tmp/to-delete")
 
     # Get the created project from the repository to get its external_id
-    created_project = await project_repository.get_by_name("to-delete")
+    created_project = await _get_project_by_name(project_repository, session_maker, "to-delete")
     assert created_project is not None
 
     # Delete it
@@ -175,7 +287,12 @@ async def test_delete_project_by_id(
 
 @pytest.mark.asyncio
 async def test_delete_project_with_delete_notes_param(
-    client: AsyncClient, test_project: Project, v2_projects_url, project_repository, project_service
+    client: AsyncClient,
+    test_project: Project,
+    v2_projects_url,
+    project_repository,
+    project_service,
+    session_maker,
 ):
     """Test deleting a project with delete_notes parameter."""
     # Create a project in a temp directory
@@ -190,7 +307,9 @@ async def test_delete_project_with_delete_notes_param(
         await project_service.add_project("delete-with-notes", str(project_path))
 
         # Get the created project from the repository to get its external_id
-        created_project = await project_repository.get_by_name("delete-with-notes")
+        created_project = await _get_project_by_name(
+            project_repository, session_maker, "delete-with-notes"
+        )
         assert created_project is not None
 
         # Delete with delete_notes=true
@@ -238,6 +357,96 @@ async def test_v2_project_endpoints_use_id_not_name(
 
 
 @pytest.mark.asyncio
+async def test_project_index_uses_event_indexer_not_sync_service(
+    client: AsyncClient,
+    test_project: Project,
+    v2_projects_url,
+):
+    """Foreground project index should return project-index fanout counts."""
+    note_path = Path(test_project.path) / "incoming" / "project-index.md"
+    note_path.parent.mkdir(parents=True, exist_ok=True)
+    note_path.write_text("# Project Index\n\nIndexed by project fanout.\n", encoding="utf-8")
+
+    response = await client.post(
+        f"{v2_projects_url}/{test_project.external_id}/index",
+        params={"run_in_background": False},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total_files"] == 1
+    assert data["enqueued_files"] == 1
+    assert data["enqueued_batches"] == 1
+    assert data["deleted_files"] == 0
+    assert "new" not in data
+
+
+@pytest.mark.asyncio
+async def test_project_index_foreground_response_payload_snapshot(
+    client: AsyncClient,
+    test_project: Project,
+    v2_projects_url,
+):
+    """The typed response union must keep the foreground payload byte-identical."""
+    note_path = Path(test_project.path) / "incoming" / "index-snapshot.md"
+    note_path.parent.mkdir(parents=True, exist_ok=True)
+    note_path.write_text("# Index Snapshot\n\nOne indexable file.\n", encoding="utf-8")
+
+    response = await client.post(
+        f"{v2_projects_url}/{test_project.external_id}/index",
+        params={"run_in_background": False},
+    )
+
+    assert response.status_code == 200
+    assert response.content == (
+        b'{"total_files":1,"enqueued_files":1,"enqueued_batches":1,"deleted_files":0}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_project_index_background_response_payload_snapshot(
+    client: AsyncClient,
+    test_project: Project,
+    v2_projects_url,
+):
+    """The typed response union must keep the background payload byte-identical."""
+    response = await client.post(f"{v2_projects_url}/{test_project.external_id}/index")
+
+    assert response.status_code == 200
+    expected_message = f"Filesystem indexing initiated for project '{test_project.name}'"
+    assert response.content == (
+        f'{{"status":"index_started","message":"{expected_message}"}}'.encode()
+    )
+
+
+@pytest.mark.asyncio
+async def test_project_status_uses_event_index_report_not_sync_service(
+    client: AsyncClient,
+    test_project: Project,
+    v2_projects_url,
+):
+    """Project status should observe current project-index files without SyncService."""
+    note_path = Path(test_project.path) / "incoming" / "project-status.md"
+    note_path.parent.mkdir(parents=True, exist_ok=True)
+    note_content = "# Project Status\n\nVisible in status report.\n"
+    note_path.write_text(note_content, encoding="utf-8")
+
+    response = await client.post(f"{v2_projects_url}/{test_project.external_id}/status")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total_files"] == 1
+    assert data["observed_files"] == [
+        {
+            "path": "incoming/project-status.md",
+            "checksum": data["observed_files"][0]["checksum"],
+            "size": note_path.stat().st_size,
+        }
+    ]
+    assert "new" not in data
+
+
+@pytest.mark.asyncio
 async def test_project_id_stability_after_rename(
     client: AsyncClient, test_project: Project, v2_projects_url, project_repository
 ):
@@ -263,14 +472,19 @@ async def test_project_id_stability_after_rename(
 
 @pytest.mark.asyncio
 async def test_update_project_active_status(
-    client: AsyncClient, test_project: Project, v2_projects_url, project_repository, project_service
+    client: AsyncClient,
+    test_project: Project,
+    v2_projects_url,
+    project_repository,
+    project_service,
+    session_maker,
 ):
     """Test updating a project's active status by external_id."""
     # Create a non-default project
     await project_service.add_project("test-active", "/tmp/test-active")
 
     # Get the created project from the repository to get its external_id
-    created_project = await project_repository.get_by_name("test-active")
+    created_project = await _get_project_by_name(project_repository, session_maker, "test-active")
     assert created_project is not None
 
     # Update active status
@@ -374,77 +588,44 @@ async def test_resolve_project_not_found(client: AsyncClient, v2_projects_url):
 
 
 @pytest.mark.asyncio
+async def test_resolve_project_not_found_fresh_install_names_setup_command(
+    client: AsyncClient, v2_projects_url, project_repository, session_maker
+):
+    """#974 follow-up: a fresh install fails its first read with a bare not-found.
+
+    config.json bootstraps a "main" default before any reconciliation has created
+    database rows (the one-shot CLI never runs the server lifespan), so resolving
+    the configured default 404s. With an empty projects table the error must point
+    at first-run setup instead of reading like a broken install.
+    """
+    for project in await _find_projects(project_repository, session_maker):
+        await _delete_project(project_repository, session_maker, project.id)
+
+    response = await client.post(f"{v2_projects_url}/resolve", json={"identifier": "main"})
+
+    assert response.status_code == 404
+    detail = response.json()["detail"]
+    assert detail.startswith("Project not found: 'main'")
+    assert "basic-memory project add" in detail
+
+
+@pytest.mark.asyncio
+async def test_resolve_project_not_found_with_projects_keeps_plain_message(
+    client: AsyncClient, test_project: Project, v2_projects_url
+):
+    """A miss against a populated projects table stays a plain not-found."""
+    response = await client.post(
+        f"{v2_projects_url}/resolve", json={"identifier": "nonexistent-project"}
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Project not found: 'nonexistent-project'"
+
+
+@pytest.mark.asyncio
 async def test_resolve_project_empty_identifier(client: AsyncClient, v2_projects_url):
     """Test resolving with empty identifier returns 422."""
     resolve_data = {"identifier": ""}
     response = await client.post(f"{v2_projects_url}/resolve", json=resolve_data)
 
     assert response.status_code == 422  # Validation error
-
-
-# --- Legacy v1 compatibility tests ---
-
-
-@pytest.mark.asyncio
-async def test_legacy_v1_list_projects_endpoint(client: AsyncClient, test_project: Project):
-    """Test that the legacy /projects/projects endpoint still works for older CLI versions.
-
-    This endpoint was removed when we migrated to v2 but older versions of
-    basic-memory-cloud CLI still call it for `bm project list`.
-
-    Note: The route must be without trailing slash to avoid 307 redirects
-    that the cloud proxy doesn't follow.
-    """
-    # The legacy v1 endpoint was at /projects/projects (no trailing slash)
-    response = await client.get("/projects/projects")
-
-    assert response.status_code == 200
-    data = response.json()
-    assert "projects" in data
-
-    # default_project must be populated, not null
-    assert data["default_project"] == test_project.name
-
-    project_names = [p["name"] for p in data["projects"]]
-    assert test_project.name in project_names
-
-
-@pytest.mark.asyncio
-async def test_legacy_v1_add_project_endpoint(client: AsyncClient, test_project: Project):
-    """Test that the legacy POST /projects/projects endpoint still works for older CLI versions.
-
-    Older versions of basic-memory-cloud CLI call POST /projects/projects to add projects.
-    The legacy route must proxy through to the same handler as v2.
-
-    Uses the existing test project name+path to exercise the idempotent path (200 OK),
-    which proves the route is connected without needing a full config manager.
-    """
-    response = await client.post(
-        "/projects/projects",
-        json={
-            "name": test_project.name,
-            "path": test_project.path,
-            "set_default": False,
-        },
-    )
-
-    # Idempotent: same name + same path returns 200
-    assert response.status_code == 200
-    data = response.json()
-    assert data["status"] == "success"
-    assert test_project.name in data["message"]
-
-
-@pytest.mark.asyncio
-async def test_legacy_v1_sync_config_endpoint(client: AsyncClient):
-    """Test that the legacy POST /projects/config/sync endpoint still works for older CLI versions.
-
-    Older versions of basic-memory-cloud CLI call POST /projects/config/sync to synchronize
-    projects between config file and database. The route must be reachable.
-    """
-    response = await client.post("/projects/config/sync")
-
-    # The handler synchronizes config ↔ DB; should succeed in test environment
-    assert response.status_code == 200
-    data = response.json()
-    assert data["status"] == "success"

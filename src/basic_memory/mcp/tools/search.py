@@ -6,12 +6,19 @@ from typing import Annotated, List, Optional, Dict, Any, Literal, cast
 from uuid import UUID
 
 import logfire
+from httpx import HTTPStatusError
 from loguru import logger
 from fastmcp import Context
 from pydantic import AliasChoices, BeforeValidator, Field
 
 from basic_memory.config import ConfigManager, has_cloud_credentials
-from basic_memory.utils import build_canonical_permalink, coerce_dict, coerce_list
+from basic_memory.utils import (
+    build_canonical_permalink,
+    coerce_dict,
+    parse_str_list,
+    parse_tags,
+    strict_search_tags,
+)
 from basic_memory.mcp.async_client import (
     _explicit_routing,
     _force_local_mode,
@@ -24,6 +31,7 @@ from basic_memory.mcp.project_context import (
     resolve_project_and_path,
 )
 from basic_memory.mcp.server import mcp
+from basic_memory.schemas.base import normalize_note_type
 from basic_memory.schemas.search import (
     SearchItemType,
     SearchQuery,
@@ -31,6 +39,8 @@ from basic_memory.schemas.search import (
     SearchResult,
     SearchRetrievalMode,
 )
+
+_SERVICE_UNAVAILABLE_HEADING = "# Search Failed - Service Temporarily Unavailable"
 
 
 def _default_search_type() -> str:
@@ -47,6 +57,31 @@ def _default_search_type() -> str:
         return config.default_search_type
 
     return "hybrid" if config.semantic_search_enabled else "text"
+
+
+def _is_service_unavailable_error(error: BaseException) -> bool:
+    """Return whether an explicit HTTP cause marks a retryable service outage."""
+    current: BaseException | None = error
+    while current is not None:
+        if isinstance(current, HTTPStatusError):
+            return current.response.status_code == 503
+        current = current.__cause__
+    return False
+
+
+def _format_service_unavailable_response(project: str, error_message: str, query: str) -> str:
+    """Keep retryable outages distinct so fan-out never turns them into partial success."""
+    return dedent(f"""
+        {_SERVICE_UNAVAILABLE_HEADING}
+
+        Search for '{query}' in project '{project}' could not complete: {error_message}
+
+        No partial results were returned because retrying with a changing project set
+        could duplicate or skip results across pages.
+
+        ## Next step
+        Retry the same search after the service recovers.
+        """).strip()
 
 
 def _format_search_error_response(
@@ -83,6 +118,47 @@ def _format_search_error_response(
                `search_notes("{project}", "{query}", search_type="{search_type}")`
             """).strip()
 
+    # Corrupt/missing FastEmbed model cache (interrupted download leaves a partial
+    # snapshot missing model_optimized.onnx; the ONNX runtime then raises NO_SUCHFILE).
+    # Basic Memory self-heals by re-downloading on the next load, but if the user still
+    # hits this, point them at the cache dir to clear manually and offer a text fallback.
+    error_lower = error_message.lower()
+    # "load model from" is the exact ONNX phrasing ("Load model from <path>.onnx failed").
+    # The looser "load model" matched unrelated errors, so we keep only the specific phrase
+    # alongside the onnxruntime / no_suchfile / model_optimized.onnx fingerprints.
+    if (
+        "onnxruntime" in error_lower
+        or "no_suchfile" in error_lower
+        or "model_optimized.onnx" in error_lower
+        or "load model from" in error_lower
+    ):
+        # Deferred import: keeps the repository layer out of the tool's import graph
+        # (matches the SearchClient deferral below) and is only needed on this error path.
+        from basic_memory.repository.embedding_provider_factory import _resolve_cache_dir
+
+        try:
+            cache_dir = _resolve_cache_dir(get_container().config)
+        except RuntimeError:
+            cache_dir = _resolve_cache_dir(ConfigManager().config)
+        return dedent(f"""
+            # Search Failed - Embedding Model Missing or Corrupt
+
+            The local FastEmbed model could not be loaded for query '{query}': {error_message}
+
+            This usually means an earlier model download was interrupted and left an
+            incomplete file in the model cache.
+
+            ## How to fix
+            1. Delete the FastEmbed model cache so it re-downloads on the next search:
+               `{cache_dir}`
+            2. Run your search again (the model downloads automatically on first use):
+               `search_notes("{project}", "{query}", search_type="{search_type}")`
+
+            ## Workaround right now
+            - Use full-text search, which needs no embedding model:
+              `search_notes("{project}", "{query}", search_type="text")`
+            """).strip()
+
     # FTS5 syntax errors
     if "syntax error" in error_message.lower() or "fts5" in error_message.lower():
         clean_query = (
@@ -114,7 +190,7 @@ def _format_search_error_response(
             - Boolean NOT: `project NOT archived`
             - Grouped: `(project OR planning) AND notes`
             - Exact phrases: `"weekly standup meeting"`
-            - Content-specific: `tag:example` or `category:observation`
+            - Content-specific: `tag:example`
 
             ## Try again with:
             ```
@@ -181,7 +257,7 @@ def _format_search_error_response(
 
             6. **Try advanced search patterns**:
                - Tag search: `search_notes("{project}","tag:your-tag")`
-               - Category search: `search_notes("{project}","category:observation")`
+               - Observation category: `search_notes("{project}","{query}", entity_types=["observation"], categories=["requirement"])`
                - Pattern matching: `search_notes("{project}","*{query}*", search_type="permalink")`
 
             ## Explore what content exists:
@@ -258,17 +334,43 @@ Error searching for '{query}': {error_message}
 - **Boolean**: `term1 AND term2`, `term1 OR term2`, `term1 NOT term2`
 - **Phrases**: `"exact phrase"`
 - **Grouping**: `(term1 OR term2) AND term3`
-- **Patterns**: `tag:example`, `category:observation`"""
+- **Tags**: `tag:example`
+- **Observation categories**: `entity_types=["observation"], categories=["requirement"]`"""
 
 
-def _format_search_markdown(result: SearchResponse, project: str, query: str | None) -> str:
+def _format_search_markdown(
+    result: SearchResponse, project: str, query: str | None, project_id: str | None = None
+) -> str:
     """Format SearchResponse as compact markdown text.
 
     Produces a human-readable markdown representation suitable for LLM
     consumption when structured data isn't needed.
     """
     if not result.results:
-        return f"No results found for '{query or ''}' in project '{project}'."
+        # Empty search is usually "no match for this query," not "empty knowledge base," so we
+        # do not repeat the first-note offer here (that would nag established users). Point at
+        # recent_activity, which owns the getting-started guidance when the base is truly empty.
+        if project == "all projects":
+            # A bare recent_activity() is NOT force-discovery: with a configured default/cached
+            # project it resolves to that one project. So for an all-projects miss, point at the
+            # enumerator instead — suggesting recent_activity() could silently narrow to the
+            # default project and miss activity elsewhere.
+            suggestion = "call list_memory_projects() to see what exists across your projects"
+        elif project_id:
+            # Names collide across cloud workspaces; route the orientation call by external id.
+            suggestion = (
+                f'call recent_activity(project_id="{project_id}") to orient — if the project is '
+                "empty it will guide creating a first note"
+            )
+        else:
+            suggestion = (
+                f'call recent_activity(project="{project}") to orient — if the project is empty '
+                "it will guide creating a first note"
+            )
+        return (
+            f"No results found for '{query or ''}' in project '{project}'. "
+            f"Try broader or different terms, or {suggestion}."
+        )
 
     parts = []
 
@@ -284,6 +386,12 @@ def _format_search_markdown(result: SearchResponse, project: str, query: str | N
     for r in result.results:
         parts.append(f"### {r.title}")
         parts.append(f"- permalink: {r.permalink}")
+        # external_id is the note's stable identifier. Emitting it lets the hosted MCP layer
+        # deep-link each hit to the web app from the final (post-merge) result the caller sees,
+        # which matters for all-projects search where the displayed page is decided after the
+        # per-project API calls the gateway would otherwise record (#1423).
+        if r.external_id:
+            parts.append(f"- external_id: {r.external_id}")
         parts.append(f"- score: {r.score:.4f}")
         if r.matched_chunk:
             parts.append(f"- match: {r.matched_chunk[:200]}")
@@ -442,6 +550,11 @@ def _result_total(results: dict[str, Any], raw_results: list[SearchResult | dict
     return len(raw_results) + (1 if results.get("has_more") is True else 0)
 
 
+def _result_total_is_exact(results: dict[str, Any]) -> bool:
+    """Return whether a per-project payload explicitly guarantees an exact total."""
+    return results.get("total_is_exact") is True
+
+
 def _project_ref_label(project_ref: dict[str, str | None]) -> str:
     """Return a stable log label for a project search ref."""
     return project_ref.get("project") or project_ref.get("project_id") or "<unknown project>"
@@ -456,13 +569,14 @@ async def _search_all_projects(
     output_format: Literal["text", "json"],
     note_types: list[str],
     entity_types: list[str],
+    categories: list[str],
     after_date: str | None,
     metadata_filters: dict[str, Any] | None,
     tags: list[str] | None,
     status: str | None,
     min_similarity: float | None,
     context: Context | None,
-) -> dict | str:
+) -> dict[str, Any] | str:
     """Search every accessible project when the caller explicitly opts in."""
     requested_page = max(page, 1)
     requested_page_size = max(page_size, 1)
@@ -473,6 +587,7 @@ async def _search_all_projects(
             current_page=requested_page,
             page_size=requested_page_size,
             total=0,
+            total_is_exact=True,
             has_more=False,
         )
         if output_format == "json":
@@ -482,6 +597,7 @@ async def _search_all_projects(
     per_project_page_size = requested_page * requested_page_size
     merged_results: list[dict[str, Any]] = []
     total = 0
+    total_is_exact = True
     any_project_has_more = False
 
     # Trigger: caller asked for an account-wide search.
@@ -514,6 +630,7 @@ async def _search_all_projects(
                 output_format="json",
                 note_types=note_types or None,
                 entity_types=entity_types or None,
+                categories=categories or None,
                 after_date=after_date,
                 metadata_filters=metadata_filters,
                 tags=tags,
@@ -526,22 +643,30 @@ async def _search_all_projects(
             logger.warning(
                 f"Multi-project search failed for project {_project_ref_label(project_ref)}: {exc}"
             )
+            total_is_exact = False
             continue
 
         if isinstance(results, str):
+            if results.startswith(_SERVICE_UNAVAILABLE_HEADING):
+                return results
             if not results.startswith("# Search Failed"):
                 return results
             logger.warning(
                 "Multi-project search failed for project "
                 f"{_project_ref_label(project_ref)}: {results}"
             )
+            total_is_exact = False
             continue
 
         raw_results = _raw_results_from_search_payload(results)
         total += _result_total(results, raw_results)
+        total_is_exact = total_is_exact and _result_total_is_exact(results)
         any_project_has_more = any_project_has_more or results.get("has_more") is True
         merged_results.extend(_qualify_results_for_project(raw_results, project_ref))
 
+    # Each project owns retrieval and optional reranking behind its typed API client.
+    # The MCP process only merges returned scores; it must not instantiate repository
+    # providers with local credentials for content fetched through another route.
     sorted_results = sorted(merged_results, key=_result_score, reverse=True)
     start = (requested_page - 1) * requested_page_size
     end = start + requested_page_size
@@ -552,6 +677,7 @@ async def _search_all_projects(
             "current_page": requested_page,
             "page_size": requested_page_size,
             "total": total,
+            "total_is_exact": total_is_exact,
             "has_more": any_project_has_more or total > end or len(sorted_results) > end,
         }
     )
@@ -562,10 +688,17 @@ async def _search_all_projects(
 
 
 @mcp.tool(
+    title="Search Notes",
     description="Search across all content in the knowledge base with advanced syntax support.",
+    tags={"search"},
     # TODO: re-enable once MCP client rendering is working
     # meta={"ui/resourceUri": "ui://basic-memory/search-results"},
-    annotations={"readOnlyHint": True, "openWorldHint": False},
+    annotations={
+        "title": "Search Notes",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": False,
+    },
 )
 async def search_notes(
     # Accept common search-query aliases models reach for from training data.
@@ -599,18 +732,32 @@ async def search_notes(
     # Plural-vs-singular trips models constantly. Accept the singular too.
     note_types: Annotated[
         List[str] | None,
-        BeforeValidator(coerce_list),
+        # parse_str_list, not coerce_list: "note,task" must split into ["note", "task"]
+        # consistent with how tags are handled (#910/#930). coerce_list wraps the whole
+        # comma string as the single literal type ["note,task"], which matches nothing.
+        BeforeValidator(parse_str_list),
         Field(default=None, validation_alias=AliasChoices("note_types", "note_type", "types")),
         "Filter by the 'type' field in note frontmatter (e.g. 'note', 'chapter', 'person'). "
+        "Accepts a list, a comma-separated string (e.g. 'note,task'), or a JSON-array string. "
         "Case-insensitive.",
     ] = None,
     entity_types: Annotated[
         List[str] | None,
-        BeforeValidator(coerce_list),
+        BeforeValidator(parse_str_list),
         Field(default=None, validation_alias=AliasChoices("entity_types", "entity_type")),
         "Filter by knowledge graph item type: 'entity' (whole notes), 'observation', or "
         "'relation'. Defaults to 'entity'. Do NOT pass schema/frontmatter types like "
-        "'Chapter' here — use note_types instead.",
+        "'Chapter' here — use note_types instead. "
+        "Accepts a list, a comma-separated string (e.g. 'entity,observation'), or a JSON-array string.",
+    ] = None,
+    categories: Annotated[
+        List[str] | None,
+        BeforeValidator(parse_str_list),
+        Field(default=None, validation_alias=AliasChoices("categories", "category")),
+        "Filter observation results to these exact categories (e.g. ['requirement']). "
+        "Accepts a list, a comma-separated string (e.g. 'requirement,decision'), or a JSON-array string. "
+        "Pair with entity_types=['observation'] to return only observations whose "
+        "category matches exactly — not every row mentioning the word.",
     ] = None,
     # Time-filter naming varies wildly across APIs.
     after_date: Annotated[
@@ -624,9 +771,15 @@ async def search_notes(
         Dict[str, Any] | None,
         BeforeValidator(coerce_dict),
     ] = None,
+    # strict_search_tags, not coerce_list: tags="a,b" must split into ["a", "b"] to
+    # match the tag: query shorthand below and write_note's documented tags convention
+    # (#910). coerce_list would wrap the comma string as the single literal tag
+    # ["a,b"], which matches nothing. Unlike bare parse_tags, the strict wrapper only
+    # splits str/list/None and lets Pydantic reject other types (42, {"a": 1}) with a
+    # clear validation error instead of stringifying them into junk tags.
     tags: Annotated[
         List[str] | None,
-        BeforeValidator(coerce_list),
+        BeforeValidator(strict_search_tags),
     ] = None,
     status: Optional[str] = None,
     min_similarity: Annotated[
@@ -637,7 +790,7 @@ async def search_notes(
         ),
     ] = None,
     context: Context | None = None,
-) -> dict | str:
+) -> dict[str, Any] | str:
     """Search across all content in the knowledge base with comprehensive syntax support.
 
     This tool searches the knowledge base using full-text search, pattern matching,
@@ -666,7 +819,8 @@ async def search_notes(
 
     ### Content-Specific Searches
     - `search_notes("research", "tag:example")` - Search within specific tags (if supported by content)
-    - `search_notes("work-project", "category:observation")` - Filter by observation categories
+    - `search_notes("work-project", "req", entity_types=["observation"], categories=["requirement"])`
+      - Return only observations whose category is exactly "requirement"
     - `search_notes("team-docs", "author:username")` - Find content by author (if metadata available)
 
     **Note:** `tag:` shorthand is automatically converted to a `tags` filter, so it works
@@ -684,6 +838,8 @@ async def search_notes(
     - `search_notes("my-project", "query", note_types=["note"])` - Search only notes
     - `search_notes("work-docs", "query", note_types=["note", "person"])` - Multiple note types
     - `search_notes("research", "query", entity_types=["observation"])` - Filter by entity type
+    - `search_notes("research", "query", entity_types=["observation"], categories=["requirement"])`
+      - Filter observations to an exact category
     - `search_notes("team-docs", "query", after_date="2024-01-01")` - Recent content only
     - `search_notes("my-project", "query", after_date="1 week")` - Relative date filtering
     - `search_notes("my-project", "query", tags=["security"])` - Filter by frontmatter tags
@@ -735,9 +891,14 @@ async def search_notes(
             "json" returns a machine-readable dictionary payload.
         note_types: Optional list of note types to search (e.g., ["note", "person"])
         entity_types: Optional list of entity types to filter by (e.g., ["entity", "observation"])
+        categories: Optional list of observation categories for exact matching (e.g.,
+                   ["requirement"]). Pair with entity_types=["observation"] to return only
+                   observations whose category matches exactly.
         after_date: Optional date filter for recent content (e.g., "1 week", "2d", "2024-01-01")
         metadata_filters: Optional structured frontmatter filters (e.g., {"status": "in-progress"})
-        tags: Optional tag filter (frontmatter tags); shorthand for metadata_filters["tags"]
+        tags: Optional tag filter (frontmatter tags); shorthand for metadata_filters["tags"].
+              Accepts a list (["a", "b"]) or a comma-separated string ("a,b"), matching the
+              write_note tags convention and the tag: query shorthand.
         status: Optional status filter (frontmatter status); shorthand for metadata_filters["status"]
         min_similarity: Optional float to override the global semantic_min_similarity threshold
                        for this query. E.g., 0.0 to see all vector results, or 0.8 for high precision.
@@ -747,6 +908,11 @@ async def search_notes(
     Returns:
         Formatted markdown text (output_format="text"), dict (output_format="json"),
         or helpful error guidance string if search fails
+
+        Pagination note: use `total` as a count only when `total_is_exact` is true.
+        Vector and hybrid searches skip the count query (it would cost a second
+        semantic retrieval pass), report `total: 0` with `total_is_exact: false`,
+        and use `has_more` for pagination.
 
     Examples:
         # Basic text search
@@ -808,10 +974,47 @@ async def search_notes(
         # Explicit project specification
         results = await search_notes("project planning", project="my-project")
     """
+    # Validate pagination arguments before they reach the API/repository layer.
+    # Trigger: page < 1 or page_size < 1 (e.g. page_size=0 or a negative slice).
+    # Why: a non-positive page_size yields zero rows yet the router computes
+    #      has_more = offset + len(results) < total, returning a misleading
+    #      has_more=True with no reachable page; a negative page_size becomes an
+    #      uncapped SQLite LIMIT. Mirrors recent_activity's guard so all navigation
+    #      tools reject invalid pagination consistently.
+    # Outcome: caller gets an explicit ValueError instead of a silent bad payload.
+    if page < 1:
+        raise ValueError(f"page must be >= 1, got {page}")
+    if page_size < 1:
+        raise ValueError(f"page_size must be >= 1, got {page_size}")
+
+    # Trigger: list params arrived via a direct function call instead of the MCP layer.
+    # Why: the BeforeValidator annotations only run through MCP/Pydantic validation; direct
+    #      callers (e.g. `bm tool search-notes --type note,task` in cli/commands/tool.py,
+    #      which Typer collects as the one-element list ["note,task"]) would otherwise
+    #      forward the comma string as one literal type that matches nothing (#930).
+    # Outcome: comma-split/list normalization applies on every path; parse_str_list is
+    #          idempotent, so MCP-validated input passes through unchanged.
+    note_types = parse_str_list(note_types) if note_types is not None else []
+    entity_types = parse_str_list(entity_types) if entity_types is not None else []
+    categories = parse_str_list(categories) if categories is not None else []
+
     # Avoid mutable-default-argument footguns. Treat None as "no filter".
-    # Lowercase note_types so "Chapter" matches the stored "chapter".
-    note_types = [t.lower() for t in note_types] if note_types else []
+    # Note types use one snake_case identity at write and query boundaries. Lowercasing
+    # alone leaves multiword and camel-case inputs in a separate logical population.
+    note_types = [normalize_note_type(note_type) for note_type in note_types]
     entity_types = entity_types or []
+    # Categories are matched exactly against the indexed observation category,
+    # so preserve their original casing (unlike the canonicalized note_types).
+    categories = categories or []
+
+    # Trigger: tags arrived via a direct function call instead of the MCP layer.
+    # Why: the BeforeValidator above only runs through MCP/Pydantic validation; direct
+    #      callers (e.g. `bm tool search-notes --tag a,b` in cli/commands/tool.py, which
+    #      Typer collects as the one-element list ["a,b"]) would otherwise forward the
+    #      comma string as one literal tag that matches nothing (#910).
+    # Outcome: comma-split/list normalization applies on every path; parse_tags is
+    #          idempotent, so MCP-validated input passes through unchanged.
+    tags = parse_tags(tags) or None
 
     # Parse tag:<value> shorthand at tool level so it works with all search modes.
     # Handles "tag:security", "tag:coffee tag:brewing", "tag:coffee AND tag:brewing".
@@ -853,6 +1056,7 @@ async def search_notes(
             output_format=output_format,
             note_types=note_types,
             entity_types=entity_types,
+            categories=categories,
             after_date=after_date,
             metadata_filters=metadata_filters,
             tags=tags,
@@ -876,8 +1080,15 @@ async def search_notes(
         has_query=bool(query and query.strip()),
         note_type_filter_count=len(note_types),
         entity_type_filter_count=len(entity_types),
+        category_filter_count=len(categories),
         has_filters=bool(
-            metadata_filters or tags or status or note_types or entity_types or after_date
+            metadata_filters
+            or tags
+            or status
+            or note_types
+            or entity_types
+            or categories
+            or after_date
         ),
         has_tags_filter=bool(tags),
         has_status_filter=bool(status),
@@ -940,6 +1151,8 @@ async def search_notes(
                 # Add optional filters if provided (empty lists are treated as no filter)
                 if entity_types:
                     search_query.entity_types = [SearchItemType(t) for t in entity_types]
+                if categories:
+                    search_query.categories = categories
                 if note_types:
                     search_query.note_types = note_types
                 if after_date:
@@ -965,7 +1178,8 @@ async def search_notes(
                     return (
                         "# No Search Criteria\n\n"
                         "Please provide at least one of: `query`, `metadata_filters`, "
-                        "`tags`, `status`, `note_types`, `entity_types`, or `after_date`."
+                        "`tags`, `status`, `note_types`, `entity_types`, `categories`, "
+                        "or `after_date`."
                     )
 
                 # Default to entity-level results to avoid returning individual
@@ -973,7 +1187,17 @@ async def search_notes(
                 # Applied after no_criteria() so that the implicit default doesn't
                 # mask a truly empty search request.
                 if not search_query.entity_types:
-                    search_query.entity_types = [SearchItemType("entity")]
+                    # Trigger: a category filter was supplied without an explicit
+                    #          entity_types.
+                    # Why: categories only exist on observations — defaulting to "entity"
+                    #      (whose rows have NULL category) would AND a category filter against
+                    #      entity rows and return nothing, defeating a category-only search.
+                    # Outcome: scope the implicit default to observations so
+                    #          search_notes(categories=[...]) returns the matching bullets.
+                    if search_query.categories:
+                        search_query.entity_types = [SearchItemType("observation")]
+                    else:
+                        search_query.entity_types = [SearchItemType("entity")]
 
                 logger.debug(
                     f"Search request: project={active_project.name} "
@@ -1009,12 +1233,18 @@ async def search_notes(
                 if output_format == "json":
                     return result.model_dump(mode="json", exclude_none=True)
 
-                return _format_search_markdown(result, active_project.name, query)
+                return _format_search_markdown(
+                    result, active_project.name, query, project_id=active_project.external_id
+                )
 
             except Exception as e:
                 logger.error(
                     f"Search failed for query '{query or ''}': {e}, project: {active_project.name}"
                 )
+                if _is_service_unavailable_error(e):
+                    return _format_service_unavailable_response(
+                        active_project.name, str(e), query or ""
+                    )
                 # Return formatted error message as string for better user experience
                 return _format_search_error_response(
                     active_project.name, str(e), query or "", effective_search_type

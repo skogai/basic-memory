@@ -1,6 +1,7 @@
 from typing import Any, Protocol, Optional, List, Sequence
 
 import logfire
+from sqlalchemy.ext.asyncio import AsyncSession
 from basic_memory.repository.search_repository import SearchIndexRow
 from basic_memory.schemas.memory import (
     EntitySummary,
@@ -18,7 +19,13 @@ from basic_memory.services.context_service import (
 
 
 class EntityBatchLookup(Protocol):
-    async def find_by_ids_for_hydration(self, ids: List[int]) -> Sequence[Any]: ...
+    async def find_by_ids_for_hydration(
+        self,
+        session: AsyncSession,
+        ids: List[int],
+        *,
+        include_cross_project: bool = False,
+    ) -> Sequence[Any]: ...
 
 
 class EntityServiceBatchLookup(Protocol):
@@ -40,6 +47,7 @@ def _search_item_type(value: str | SearchItemType) -> SearchItemType:
 async def to_graph_context(
     context_result: ServiceContextResult,
     entity_repository: EntityBatchLookup,
+    session: AsyncSession,
     page: Optional[int] = None,
     page_size: Optional[int] = None,
 ) -> GraphContext:
@@ -88,7 +96,7 @@ async def to_graph_context(
                 result_count=len(entity_ids_needed),
             ):
                 entities = await entity_repository.find_by_ids_for_hydration(
-                    list(entity_ids_needed)
+                    session, list(entity_ids_needed), include_cross_project=True
                 )
             for e in entities:
                 entity_title_lookup[e.id] = e.title
@@ -145,6 +153,7 @@ async def to_graph_context(
                         from_entity_id=item.from_id,
                         from_entity_external_id=from_ext_id,
                         to_entity=to_title,
+                        to_name=item.to_name,
                         to_entity_id=item.to_id,
                         to_entity_external_id=to_ext_id,
                         created_at=item.created_at,
@@ -262,9 +271,14 @@ async def to_search_results(
                         permalink=result.permalink,
                         score=result.score if result.score is not None else 0.0,
                         entity=parent_entity.permalink if parent_entity else None,
+                        # Parent entity UUID, so hosted MCP can deep-link the note this hit
+                        # belongs to. Available for entity, observation, and relation results
+                        # because each row carries its owning entity's id (#1423).
+                        external_id=parent_entity.external_id if parent_entity else None,
                         content=result.content,
                         matched_chunk=result.matched_chunk_text,
                         file_path=_required_str(result.file_path, "file_path"),
+                        updated_at=result.updated_at,
                         metadata=result.metadata,
                         entity_id=entity_id,
                         observation_id=observation_id,

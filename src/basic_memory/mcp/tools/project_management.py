@@ -5,7 +5,7 @@ and manage project context during conversations.
 """
 
 import os
-from typing import Literal
+from typing import Any, Literal
 
 from fastmcp import Context
 from loguru import logger
@@ -18,6 +18,7 @@ from basic_memory.config import (
 )
 from basic_memory.mcp.async_client import (
     _explicit_routing,
+    _force_cloud_mode,
     _force_local_mode,
     get_client,
     is_factory_mode,
@@ -54,7 +55,7 @@ def _merge_projects(
     cloud_workspace_tenant_id: str | None = None,
     cloud_workspace_slug: str | None = None,
     cloud_workspace_is_default: bool = False,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Merge local and cloud project lists by permalink.
 
     Returns a sorted list of dicts with unified project metadata.
@@ -76,7 +77,7 @@ def _merge_projects(
             names_by_permalink[permalink] = project.name
             cloud_by_permalink[permalink] = project
 
-    merged: list[dict] = []
+    merged: list[dict[str, Any]] = []
     for permalink in sorted(names_by_permalink):
         name = names_by_permalink[permalink]
         local_proj = local_by_permalink.get(permalink)
@@ -207,7 +208,7 @@ def _merge_workspace_projects(
     cloud_entries: tuple[WorkspaceProjectEntry, ...],
     *,
     config: BasicMemoryConfig | None = None,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Merge local projects with cloud projects from every accessible workspace."""
     local_by_permalink: dict[str, ProjectItem] = {}
     if local_list:
@@ -234,7 +235,7 @@ def _merge_workspace_projects(
         )
 
     cloud_permalinks = {entry.project.permalink for entry in cloud_entries}
-    merged: list[dict] = []
+    merged: list[dict[str, Any]] = []
 
     for entry in sorted(
         cloud_entries,
@@ -302,7 +303,7 @@ def _merge_workspace_projects(
     return merged
 
 
-def _format_project_list_text(merged: list[dict]) -> str:
+def _format_project_list_text(merged: list[dict[str, Any]]) -> str:
     """Format merged project list as human-readable text."""
     result = "Available projects:\n"
 
@@ -343,10 +344,10 @@ def _format_project_list_text(merged: list[dict]) -> str:
 
 
 def _format_project_list_json(
-    merged: list[dict],
+    merged: list[dict[str, Any]],
     default_project: str | None,
     constrained_project: str | None,
-) -> dict:
+) -> dict[str, Any]:
     """Format merged project list as structured JSON."""
     return {
         "projects": merged,
@@ -357,12 +358,19 @@ def _format_project_list_json(
 
 @mcp.tool(
     "list_memory_projects",
-    annotations={"readOnlyHint": True, "openWorldHint": False},
+    title="List Memory Projects",
+    tags={"projects"},
+    annotations={
+        "title": "List Memory Projects",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": False,
+    },
 )
 async def list_memory_projects(
     output_format: Literal["text", "json"] = "text",
     context: Context | None = None,
-) -> str | dict:
+) -> str | dict[str, Any]:
     """List all available projects with their status.
 
     Shows projects from both local and cloud sources when cloud credentials
@@ -475,10 +483,14 @@ async def _resolve_workspace_routing(
     if workspace is None:
         return None
 
-    explicit_cloud_routing = _explicit_routing() and not _force_local_mode()
+    forced_local = _explicit_routing() and _force_local_mode()
     config = ConfigManager().config
+    # Resolve whenever credentials make workspace discovery possible — not only
+    # under explicit --cloud. A workspace selector implies cloud routing
+    # (get_client routes it to the cloud proxy, #954), and the transport needs
+    # the tenant id in X-Workspace-ID, not a slug or display name.
     should_resolve_workspace = is_factory_mode() or (
-        explicit_cloud_routing and has_cloud_credentials(config)
+        has_cloud_credentials(config) and not forced_local
     )
     if not should_resolve_workspace:
         return workspace
@@ -493,9 +505,49 @@ async def _resolve_workspace_routing(
     return resolved_workspace.tenant_id
 
 
+def _normalize_indexing_response(
+    index_response: dict[str, object],
+    *,
+    run_in_background: bool,
+) -> dict[str, object]:
+    """Add a stable lifecycle state to backend-specific indexing details."""
+    return {
+        **index_response,
+        "state": "accepted" if run_in_background else "completed",
+    }
+
+
+def _format_indexing_details(indexing: dict[str, object]) -> str:
+    """Format indexing state and the details returned by either backend."""
+    result = "Indexing:\n"
+    result += f"• State: {indexing['state']}\n"
+    if status := indexing.get("status"):
+        result += f"• Status: {status}\n"
+    if message := indexing.get("message"):
+        result += f"• Message: {message}\n"
+    if job_id := indexing.get("job_id"):
+        result += f"• Job ID: {job_id}\n"
+    for key, label in (
+        ("total_files", "Files discovered"),
+        ("enqueued_files", "Files enqueued"),
+        ("enqueued_batches", "Batches enqueued"),
+        ("deleted_files", "Orphans deleted"),
+    ):
+        if key in indexing:
+            result += f"• {label}: {indexing[key]}\n"
+    return result
+
+
 @mcp.tool(
     "create_memory_project",
-    annotations={"destructiveHint": False, "openWorldHint": False},
+    title="Create Memory Project",
+    tags={"projects"},
+    annotations={
+        "title": "Create Memory Project",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "openWorldHint": False,
+    },
 )
 async def create_memory_project(
     project_name: str,
@@ -504,7 +556,7 @@ async def create_memory_project(
     workspace: str | None = None,
     output_format: Literal["text", "json"] = "text",
     context: Context | None = None,
-) -> str | dict:
+) -> str | dict[str, Any]:
     """Create a new Basic Memory project.
 
     Creates a new project with the specified name and path. The project directory
@@ -517,8 +569,9 @@ async def create_memory_project(
         workspace: Optional cloud workspace selector to create the project in. Slug is
             preferred for AI callers, but tenant_id and unique name are also accepted.
             When omitted, the connection's default workspace is used. Discover values
-            via `list_workspaces`. In local mode the selector is passed through
-            without slug resolution.
+            via `list_workspaces`. A workspace selector implies cloud routing:
+            without cloud credentials the call fails fast instead of silently
+            creating a local project (#954).
         output_format: "text" returns the existing human-readable result text.
             "json" returns structured project creation metadata.
         context: Optional FastMCP context for progress/status logging.
@@ -577,9 +630,23 @@ async def create_memory_project(
             (p for p in existing.projects if p.name.casefold() == project_name.casefold()),
             None,
         )
+        index_in_background = _routes_to_cloud(workspace_id)
         if existing_match:
             is_default = bool(
                 existing_match.is_default or existing.default_project == existing_match.name
+            )
+            # Trigger: a previous create may have committed the project record
+            # before its indexing request failed or timed out.
+            # Why: create retries must repair that partial success instead of
+            # permanently short-circuiting on the existing project record.
+            # Outcome: idempotently request indexing again on the current backend.
+            index_response = await project_client.index(
+                existing_match.external_id,
+                run_in_background=index_in_background,
+            )
+            indexing = _normalize_indexing_response(
+                index_response,
+                run_in_background=index_in_background,
             )
             if output_format == "json":
                 return {
@@ -589,84 +656,170 @@ async def create_memory_project(
                     "is_default": is_default,
                     "created": False,
                     "already_exists": True,
+                    "indexing": indexing,
                 }
-            return (
+            result = (
                 f"✓ Project already exists: {existing_match.name}\n\n"
                 f"Project Details:\n"
                 f"• Name: {existing_match.name}\n"
                 f"• External ID: {existing_match.external_id}\n"
                 f"• Path: {existing_match.path}\n"
                 f"{'• Set as default project\n' if is_default else ''}"
-                "\nProject is already available for use in tool calls.\n"
+                "\n"
             )
+            result += _format_indexing_details(indexing)
+            if index_in_background:
+                result += (
+                    "\nProject already existed. Retained content will become readable and "
+                    "searchable when indexing completes.\n"
+                )
+            else:
+                result += (
+                    "\nProject is already available for use in tool calls; indexing completed.\n"
+                )
+            return result
 
         status_response = await project_client.create_project(project_request.model_dump())
-        from basic_memory.mcp.project_context import invalidate_workspace_project_index
+        from basic_memory.mcp.project_context import invalidate_project_caches
 
-        await invalidate_workspace_project_index(context)
+        await invalidate_project_caches(context)
+
+        new_project = status_response.new_project
+        if new_project is None:
+            raise RuntimeError("Project creation succeeded without returning the new project")
+
+        # Local indexing can finish inline, so retained files are immediately
+        # available. Cloud must use its durable background workflow; that route
+        # awaits the PGQueuer handoff before acknowledging the request (#1084).
+        index_response = await project_client.index(
+            new_project.external_id,
+            run_in_background=index_in_background,
+        )
+        indexing = _normalize_indexing_response(
+            index_response,
+            run_in_background=index_in_background,
+        )
 
         if output_format == "json":
-            new_project = status_response.new_project
             return {
-                "name": new_project.name if new_project else project_name,
-                "external_id": new_project.external_id if new_project else None,
-                "path": new_project.path if new_project else project_path,
-                "is_default": bool(
-                    (new_project.is_default if new_project else False) or set_default
-                ),
+                "name": new_project.name,
+                "external_id": new_project.external_id,
+                "path": new_project.path,
+                "is_default": bool(new_project.is_default or set_default),
                 "created": True,
                 "already_exists": False,
+                "indexing": indexing,
             }
 
         result = f"✓ {status_response.message}\n\n"
 
-        if status_response.new_project:
-            result += "Project Details:\n"
-            result += f"• Name: {status_response.new_project.name}\n"
-            result += f"• External ID: {status_response.new_project.external_id}\n"
-            result += f"• Path: {status_response.new_project.path}\n"
+        result += "Project Details:\n"
+        result += f"• Name: {new_project.name}\n"
+        result += f"• External ID: {new_project.external_id}\n"
+        result += f"• Path: {new_project.path}\n"
 
-            if set_default:
-                result += "• Set as default project\n"
+        if set_default:
+            result += "• Set as default project\n"
 
-        result += "\nProject is now available for use in tool calls.\n"
+        result += "\n"
+        result += _format_indexing_details(indexing)
+
+        if index_in_background:
+            result += (
+                "\nProject created. Retained content will become readable and searchable "
+                "when indexing completes.\n"
+            )
+        else:
+            result += "\nProject is now available for use in tool calls; indexing completed.\n"
         result += f"Use '{project_name}' as the project parameter in MCP tool calls.\n"
 
         return result
 
 
+def _routes_to_cloud(workspace_id: str | None) -> bool:
+    """Mirror get_client's non-project routing for project lifecycle operations.
+
+    Trigger: project creation and deletion need backend-specific behavior.
+    Why: cloud indexing must be asynchronous, and delete output must describe
+        whether retained files live on local disk or in cloud storage.
+    Outcome: True when get_client(workspace=...) serves the request from a
+        cloud backend (factory mode, explicit --cloud, or a workspace selector).
+    """
+    if is_factory_mode():
+        return True
+    if _explicit_routing():
+        return _force_cloud_mode()
+    return workspace_id is not None
+
+
+def _format_note_file_delete_result(
+    status: Literal["pending", "skipped", "complete", "failed"] | None,
+    *,
+    files_location: str,
+) -> str:
+    """Describe note-file deletion without overstating backend completion."""
+    if status == "pending":
+        return f"Note-file deletion {files_location} was queued and is pending.\n"
+    if status == "complete":
+        return f"Note files {files_location} were deleted along with the project.\n"
+    if status == "failed":
+        return f"Note-file deletion {files_location} failed; note files may remain.\n"
+    if status == "skipped":
+        return f"Note-file deletion {files_location} was skipped; note files remain.\n"
+    return (
+        f"Note-file deletion {files_location} did not report a completion status; "
+        "note files may remain.\n"
+    )
+
+
 @mcp.tool(
-    annotations={"destructiveHint": True, "openWorldHint": False},
+    title="Delete Project",
+    tags={"projects"},
+    annotations={
+        "title": "Delete Project",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "openWorldHint": False,
+    },
 )
 async def delete_project(
     project_name: str,
+    delete_notes: bool = False,
     workspace: str | None = None,
     context: Context | None = None,
 ) -> str:
     """Delete a Basic Memory project.
 
-    Removes a project from the configuration and database. This does NOT delete
-    the actual files on disk - only removes the project from Basic Memory's
-    configuration and database records.
+    Removes a project from Basic Memory's configuration and database records.
+    By default the project's note files are retained: local projects keep
+    their files on disk, cloud projects keep their files in cloud storage.
+    Pass delete_notes=True to also delete the note files themselves.
 
     Args:
         project_name: Name of the project to delete
+        delete_notes: Also delete the project's note files (from local disk
+            for local projects, from cloud storage for cloud projects).
+            Defaults to False, which only stops tracking the project.
         workspace: Optional cloud workspace selector to delete the project from.
             Slug is preferred for AI callers, but tenant_id and unique name are
             also accepted. When omitted, the connection's default workspace is
-            used. In local mode the selector is passed through without slug
-            resolution, matching create_memory_project behavior.
+            used. A workspace selector implies cloud routing: without cloud
+            credentials the call fails fast, matching create_memory_project
+            behavior (#954).
 
     Returns:
-        Confirmation message about project deletion
+        Confirmation message describing what was deleted and whether note
+        files were removed or retained.
 
     Example:
         delete_project("old-project")
+        delete_project("old-project", delete_notes=True)
         delete_project("team-project", workspace="team-paul")
 
     Warning:
-        This action cannot be undone. The project will need to be re-added
-        to access its content through Basic Memory again.
+        This action cannot be undone. With delete_notes=False the project must
+        be re-added to access its content through Basic Memory again; with
+        delete_notes=True the note files themselves are permanently deleted.
     """
     # Trigger: MCP server is constrained to a single project.
     # Why: constrained sessions cannot delete projects, and workspace selectors
@@ -708,10 +861,12 @@ async def delete_project(
             )
 
         # Delete project using project external_id
-        status_response = await project_client.delete_project(target_project.external_id)
-        from basic_memory.mcp.project_context import invalidate_workspace_project_index
+        status_response = await project_client.delete_project(
+            target_project.external_id, delete_notes=delete_notes
+        )
+        from basic_memory.mcp.project_context import invalidate_project_caches
 
-        await invalidate_workspace_project_index(context)
+        await invalidate_project_caches(context)
 
         result = f"✓ {status_response.message}\n\n"
 
@@ -721,7 +876,25 @@ async def delete_project(
             if hasattr(status_response.old_project, "path"):
                 result += f"• Path: {status_response.old_project.path}\n"
 
-        result += "Files remain on disk but project is no longer tracked by Basic Memory.\n"
-        result += "Re-add the project to access its content again.\n"
+        if status_response.deletion_status or status_response.job_id:
+            result += "\nDeletion tracking:\n"
+            if status_response.deletion_status:
+                result += f"• Project deletion status: {status_response.deletion_status}\n"
+            if status_response.job_id:
+                result += f"• Deletion job ID: {status_response.job_id}\n"
+
+        cloud_routed = _routes_to_cloud(workspace_id)
+        files_location = "in cloud storage" if cloud_routed else "on disk"
+        if delete_notes:
+            result += _format_note_file_delete_result(
+                status_response.file_delete_status,
+                files_location=files_location,
+            )
+        else:
+            result += (
+                f"Note files remain {files_location} but the project is no longer "
+                "tracked by Basic Memory.\n"
+            )
+            result += "Re-add the project to access its content again.\n"
 
         return result

@@ -1,232 +1,98 @@
-"""Tests for dependency injection functions in deps.py."""
-
-from datetime import datetime, timezone
-from pathlib import Path
+"""Tests for dependency injection functions in the deps package."""
 
 import pytest
-import pytest_asyncio
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException, Request
 
-from basic_memory.deps import get_project_config, get_project_id
-from basic_memory.deps.projects import validate_project_id
+from basic_memory.api import container as container_module
+from basic_memory.api.container import ApiContainer, resolve_container
+from basic_memory.deps import get_app_config, get_read_cache, validate_project_external_id
 from basic_memory.models.project import Project
 from basic_memory.repository.project_repository import ProjectRepository
+from basic_memory.runtime.mode import resolve_runtime_mode
 
 
-@pytest_asyncio.fixture
-async def project_with_spaces(project_repository: ProjectRepository) -> Project:
-    """Create a project with spaces in the name for testing permalink normalization."""
-    project_data = {
-        "name": "My Test Project",
-        "description": "A project with spaces in the name",
-        "path": "/my/test/project",
-        "is_active": True,
-        "is_default": False,
-        "created_at": datetime.now(timezone.utc),
-        "updated_at": datetime.now(timezone.utc),
-    }
-    return await project_repository.create(project_data)
+def _request_for(app: FastAPI) -> Request:
+    return Request({"type": "http", "app": app})
 
 
-@pytest_asyncio.fixture
-async def project_with_special_chars(project_repository: ProjectRepository) -> Project:
-    """Create a project with special characters for testing permalink normalization."""
-    project_data = {
-        "name": "Project: Test & Development!",
-        "description": "A project with special characters",
-        "path": "/project/test/dev",
-        "is_active": True,
-        "is_default": False,
-        "created_at": datetime.now(timezone.utc),
-        "updated_at": datetime.now(timezone.utc),
-    }
-    return await project_repository.create(project_data)
-
-
-@pytest.mark.asyncio
-async def test_get_project_config_with_spaces(
-    project_repository: ProjectRepository, project_with_spaces: Project
-):
-    """Test that get_project_config normalizes project names with spaces."""
-    # The project name has spaces: "My Test Project"
-    # The permalink should be: "my-test-project"
-    assert project_with_spaces.name == "My Test Project"
-    assert project_with_spaces.permalink == "my-test-project"
-
-    # Call get_project_config with the project name (not permalink)
-    # This simulates what happens when the project name comes from URL path
-    config = await get_project_config(
-        project="My Test Project", project_repository=project_repository
+def test_get_app_config_reads_lifespan_container(app_config):
+    """API requests get the config the lifespan stored on app.state."""
+    app = FastAPI()
+    app.state.container = ApiContainer(
+        config=app_config, mode=resolve_runtime_mode(is_test_env=True)
     )
 
-    # Verify we got the correct project config
-    assert config.name == "My Test Project"
-    assert config.home == Path("/my/test/project")
+    assert get_app_config(_request_for(app)) is app_config
 
 
-@pytest.mark.asyncio
-async def test_get_project_config_with_permalink(
-    project_repository: ProjectRepository, project_with_spaces: Project
-):
-    """Test that get_project_config works when already given a permalink."""
-    # Call with the permalink directly
-    config = await get_project_config(
-        project="my-test-project", project_repository=project_repository
+def test_get_app_config_falls_back_to_composition_root(app_config, config_manager):
+    """Requests without a lifespan (CLI/MCP local ASGI) resolve via the composition root."""
+    app = FastAPI()
+
+    resolved = get_app_config(_request_for(app))
+
+    # resolve_container() reads the config the config_manager fixture wrote to disk.
+    assert resolved.default_project == app_config.default_project
+    assert resolved.projects == app_config.projects
+
+
+def test_resolve_container_prefers_installed_container(app_config, monkeypatch):
+    """A lifespan-installed container wins over creating a fresh one."""
+    installed = ApiContainer(config=app_config, mode=resolve_runtime_mode(is_test_env=True))
+    monkeypatch.setattr(container_module, "_container", installed)
+
+    assert resolve_container() is installed
+
+
+def test_get_read_cache_reads_lifespan_container(app_config):
+    """API requests preserve the container's absent cache backend."""
+    app = FastAPI()
+    app.state.container = ApiContainer(
+        config=app_config,
+        mode=resolve_runtime_mode(is_test_env=True),
     )
 
-    # Verify we got the correct project config
-    assert config.name == "My Test Project"
-    assert config.home == Path("/my/test/project")
+    assert get_read_cache(_request_for(app)) is None
+
+
+def test_get_read_cache_falls_back_to_composition_root(app_config, monkeypatch):
+    """Off-lifespan requests preserve the composition root's absent cache backend."""
+    app = FastAPI()
+    installed = ApiContainer(
+        config=app_config,
+        mode=resolve_runtime_mode(is_test_env=True),
+    )
+    monkeypatch.setattr(container_module, "_container", installed)
+
+    assert get_read_cache(_request_for(app)) is None
 
 
 @pytest.mark.asyncio
-async def test_get_project_config_with_special_chars(
-    project_repository: ProjectRepository, project_with_special_chars: Project
+async def test_validate_project_external_id_success(
+    project_repository: ProjectRepository, test_project: Project, session_maker
 ):
-    """Test that get_project_config normalizes project names with special characters."""
-    # The project name has special chars: "Project: Test & Development!"
-    # The permalink should be: "project-test-development"
-    assert project_with_special_chars.name == "Project: Test & Development!"
-    assert project_with_special_chars.permalink == "project-test-development"
-
-    # Call get_project_config with the project name
-    config = await get_project_config(
-        project="Project: Test & Development!", project_repository=project_repository
+    """validate_project_external_id resolves the internal id from the external UUID."""
+    project_id = await validate_project_external_id(
+        session_maker=session_maker,
+        project_id=test_project.external_id,
+        project_repository=project_repository,
     )
 
-    # Verify we got the correct project config
-    assert config.name == "Project: Test & Development!"
-    assert config.home == Path("/project/test/dev")
+    assert project_id == test_project.id
 
 
 @pytest.mark.asyncio
-async def test_get_project_config_not_found(project_repository: ProjectRepository):
-    """Test that get_project_config raises HTTPException when project not found."""
+async def test_validate_project_external_id_not_found(
+    project_repository: ProjectRepository, session_maker
+):
+    """validate_project_external_id raises HTTPException when no project matches."""
+    fake_uuid = "00000000-0000-0000-0000-000000000000"
     with pytest.raises(HTTPException) as exc_info:
-        await get_project_config(
-            project="Nonexistent Project", project_repository=project_repository
+        await validate_project_external_id(
+            session_maker=session_maker,
+            project_id=fake_uuid,
+            project_repository=project_repository,
         )
 
     assert exc_info.value.status_code == 404
-    assert "Project 'Nonexistent Project' not found" in exc_info.value.detail
-
-
-@pytest.mark.asyncio
-async def test_get_project_id_with_spaces(
-    project_repository: ProjectRepository, project_with_spaces: Project
-):
-    """Test that get_project_id normalizes project names with spaces."""
-    # Call get_project_id with the project name (not permalink)
-    project_id = await get_project_id(
-        project_repository=project_repository, project="My Test Project"
-    )
-
-    # Verify we got the correct project ID
-    assert project_id == project_with_spaces.id
-
-
-@pytest.mark.asyncio
-async def test_get_project_id_with_permalink(
-    project_repository: ProjectRepository, project_with_spaces: Project
-):
-    """Test that get_project_id works when already given a permalink."""
-    # Call with the permalink directly
-    project_id = await get_project_id(
-        project_repository=project_repository, project="my-test-project"
-    )
-
-    # Verify we got the correct project ID
-    assert project_id == project_with_spaces.id
-
-
-@pytest.mark.asyncio
-async def test_get_project_id_with_special_chars(
-    project_repository: ProjectRepository, project_with_special_chars: Project
-):
-    """Test that get_project_id normalizes project names with special characters."""
-    # Call get_project_id with the project name
-    project_id = await get_project_id(
-        project_repository=project_repository, project="Project: Test & Development!"
-    )
-
-    # Verify we got the correct project ID
-    assert project_id == project_with_special_chars.id
-
-
-@pytest.mark.asyncio
-async def test_get_project_id_not_found(project_repository: ProjectRepository):
-    """Test that get_project_id raises HTTPException when project not found."""
-    with pytest.raises(HTTPException) as exc_info:
-        await get_project_id(project_repository=project_repository, project="Nonexistent Project")
-
-    assert exc_info.value.status_code == 404
-    assert "Project 'Nonexistent Project' not found" in exc_info.value.detail
-
-
-@pytest.mark.asyncio
-async def test_get_project_id_fallback_to_name(
-    project_repository: ProjectRepository, test_project: Project
-):
-    """Test that get_project_id falls back to name lookup if permalink lookup fails.
-
-    This test verifies the fallback behavior in get_project_id where it tries
-    get_by_name if get_by_permalink returns None.
-    """
-    # The test_project fixture has name "test-project" and permalink "test-project"
-    # Since both are the same, we can't easily test the fallback with existing fixtures
-    # So this test just verifies the normal path works with test_project
-    project_id = await get_project_id(project_repository=project_repository, project="test-project")
-
-    assert project_id == test_project.id
-
-
-@pytest.mark.asyncio
-async def test_get_project_config_case_sensitivity(
-    project_repository: ProjectRepository, project_with_spaces: Project
-):
-    """Test that get_project_config handles case variations correctly.
-
-    Permalink normalization should convert to lowercase, so different case
-    variations of the same name should resolve to the same project.
-    """
-    # Create project with mixed case: "My Test Project" -> permalink "my-test-project"
-
-    # Try with different case variations
-    config1 = await get_project_config(
-        project="My Test Project", project_repository=project_repository
-    )
-    config2 = await get_project_config(
-        project="my test project", project_repository=project_repository
-    )
-    config3 = await get_project_config(
-        project="MY TEST PROJECT", project_repository=project_repository
-    )
-
-    # All should resolve to the same project
-    assert config1.name == config2.name == config3.name == "My Test Project"
-    assert config1.home == config2.home == config3.home == Path("/my/test/project")
-
-
-# --- Tests for validate_project_id (v2 API) ---
-
-
-@pytest.mark.asyncio
-async def test_validate_project_id_success(
-    project_repository: ProjectRepository, test_project: Project
-):
-    """Test that validate_project_id returns project_id when project exists."""
-    project_id = await validate_project_id(
-        project_id=test_project.id, project_repository=project_repository
-    )
-
-    assert project_id == test_project.id
-
-
-@pytest.mark.asyncio
-async def test_validate_project_id_not_found(project_repository: ProjectRepository):
-    """Test that validate_project_id raises HTTPException when project not found."""
-    with pytest.raises(HTTPException) as exc_info:
-        await validate_project_id(project_id=99999, project_repository=project_repository)
-
-    assert exc_info.value.status_code == 404
-    assert "Project with ID 99999 not found" in exc_info.value.detail
+    assert f"Project with external_id '{fake_uuid}' not found" in exc_info.value.detail

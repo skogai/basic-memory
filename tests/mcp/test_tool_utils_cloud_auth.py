@@ -4,13 +4,13 @@ from typing import Any, cast
 
 import pytest
 from httpx import HTTPStatusError, Request
-from mcp.server.fastmcp.exceptions import ToolError
+from fastmcp.exceptions import ToolError
 
 from basic_memory.mcp.tools.utils import call_post
 
 
 class _MockResponse:
-    def __init__(self, status_code: int, payload: dict):
+    def __init__(self, status_code: int, payload: dict[str, Any]):
         self.status_code = status_code
         self._payload = payload
         self.is_success = status_code < 400

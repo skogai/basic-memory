@@ -3,9 +3,13 @@
 import os
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from basic_memory import db
+from basic_memory.services import project_service as project_service_module
 from basic_memory.services.project_service import ProjectService
 
 
@@ -30,19 +34,22 @@ async def test_get_project_from_database(project_service: ProjectService):
                 "is_active": True,
                 "is_default": False,
             }
-            await project_service.repository.create(project_data)
+            async with db.scoped_session(project_service.session_maker) as session:
+                await project_service.repository.create(session, project_data)
 
             # Verify we can get the project
-            project = await project_service.repository.get_by_name(test_project_name)
+            async with db.scoped_session(project_service.session_maker) as session:
+                project = await project_service.repository.get_by_name(session, test_project_name)
             assert project is not None
             assert project.name == test_project_name
             assert project.path == test_path
 
         finally:
             # Clean up
-            project = await project_service.repository.get_by_name(test_project_name)
-            if project:
-                await project_service.repository.delete(project.id)
+            async with db.scoped_session(project_service.session_maker) as session:
+                project = await project_service.repository.get_by_name(session, test_project_name)
+                if project:
+                    await project_service.repository.delete(session, project.id)
 
 
 @pytest.mark.asyncio
@@ -69,3 +76,136 @@ async def test_add_project_to_config(project_service: ProjectService, config_man
             # Clean up
             if test_project_name in project_service.projects:
                 config_manager.remove_project(test_project_name)
+
+
+@pytest.mark.asyncio
+async def test_remove_project_cleans_external_vectors_before_database_delete(
+    project_service: ProjectService,
+    monkeypatch,
+):
+    """Project removal must clean adapter storage before deleting SQL ownership."""
+    project_name = f"external-vector-project-{os.urandom(4).hex()}"
+    search_repository = SimpleNamespace(delete_project_vector_rows=AsyncMock())
+    search_repository_factory = Mock(return_value=search_repository)
+    service = ProjectService(
+        repository=project_service.repository,
+        session_maker=project_service.session_maker,
+        file_service=project_service.file_service,
+        search_repository_factory=search_repository_factory,
+    )
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        async with db.scoped_session(service.session_maker) as session:
+            project = await service.repository.create(
+                session,
+                {
+                    "name": project_name,
+                    "path": temp_dir,
+                    "permalink": project_name,
+                    "is_active": True,
+                },
+            )
+            project_id = project.id
+
+        original_delete = service.repository.delete
+
+        async def delete_after_vector_cleanup(session, entity_id: int) -> bool:
+            search_repository.delete_project_vector_rows.assert_awaited_once_with(
+                strict_adapter_cleanup=True,
+                session=session,
+            )
+            return await original_delete(session, entity_id)
+
+        monkeypatch.setattr(service.repository, "delete", delete_after_vector_cleanup)
+
+        await service.remove_project(project_name)
+
+    search_repository_factory.assert_called_once_with(project_id)
+    search_repository.delete_project_vector_rows.assert_awaited_once()
+    assert (
+        search_repository.delete_project_vector_rows.await_args.kwargs["strict_adapter_cleanup"]
+        is True
+    )
+    assert search_repository.delete_project_vector_rows.await_args.kwargs["session"] is not None
+
+
+@pytest.mark.asyncio
+async def test_project_reconciliation_cleans_vectors_before_database_delete(
+    project_service: ProjectService,
+) -> None:
+    """Config reconciliation must preserve extension ownership like explicit removal."""
+    project_name = f"reconcile-vector-project-{os.urandom(4).hex()}"
+    search_repository = SimpleNamespace(delete_project_vector_rows=AsyncMock())
+    search_repository_factory = Mock(return_value=search_repository)
+    service = ProjectService(
+        repository=project_service.repository,
+        session_maker=project_service.session_maker,
+        file_service=project_service.file_service,
+        search_repository_factory=search_repository_factory,
+    )
+
+    async with db.scoped_session(service.session_maker) as session:
+        project = await service.repository.create(
+            session,
+            {
+                "name": project_name,
+                "path": f"/tmp/{project_name}",
+                "permalink": project_name,
+                "is_active": True,
+            },
+        )
+        project_id = project.id
+
+    await service.synchronize_projects()
+
+    search_repository_factory.assert_any_call(project_id)
+    search_repository.delete_project_vector_rows.assert_awaited()
+    assert any(
+        call.kwargs["strict_adapter_cleanup"] is True and call.kwargs["session"] is not None
+        for call in search_repository.delete_project_vector_rows.await_args_list
+    )
+    async with db.scoped_session(service.session_maker) as session:
+        assert await service.repository.get_by_name(session, project_name) is None
+
+
+@pytest.mark.asyncio
+async def test_remove_project_composes_vector_cleanup_without_injected_factory(
+    project_service: ProjectService,
+    monkeypatch,
+):
+    """Legacy service construction must still preserve external vector ownership."""
+    project_name = f"fallback-vector-project-{os.urandom(4).hex()}"
+    search_repository = SimpleNamespace(delete_project_vector_rows=AsyncMock())
+    create_search_repository = Mock(return_value=search_repository)
+    monkeypatch.setattr(
+        project_service_module,
+        "create_search_repository",
+        create_search_repository,
+    )
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        async with db.scoped_session(project_service.session_maker) as session:
+            project = await project_service.repository.create(
+                session,
+                {
+                    "name": project_name,
+                    "path": temp_dir,
+                    "permalink": project_name,
+                    "is_active": True,
+                },
+            )
+            project_id = project.id
+
+        await project_service.remove_project(project_name)
+
+    create_search_repository.assert_called_once()
+    assert (
+        create_search_repository.call_args.kwargs["session_maker"] is project_service.session_maker
+    )
+    assert create_search_repository.call_args.kwargs["project_id"] == project_id
+    search_repository.delete_project_vector_rows.assert_awaited_once()
+    assert (
+        search_repository.delete_project_vector_rows.await_args.kwargs["strict_adapter_cleanup"]
+        is True
+    )
+    assert search_repository.delete_project_vector_rows.await_args.kwargs["session"] is not None

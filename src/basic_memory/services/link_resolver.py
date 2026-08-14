@@ -4,11 +4,14 @@ import uuid as uuid_mod
 from typing import Any, Optional, Tuple, Dict
 
 from loguru import logger
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from basic_memory.config import BasicMemoryConfig, ConfigManager
+from basic_memory import db
+from basic_memory.config import BasicMemoryConfig
 from basic_memory.models import Entity, Project
 from basic_memory.repository.entity_repository import EntityRepository
 from basic_memory.repository.project_repository import ProjectRepository
+from basic_memory.services.exceptions import AmbiguousIdentifierError
 from basic_memory.repository.search_repository import create_search_repository
 from basic_memory.schemas.search import SearchQuery, SearchItemType
 from basic_memory.services.search_service import SearchService
@@ -68,6 +71,20 @@ async def detect_project_from_workspace_identifier_prefix(
     return workspace_resolution.project_identifier
 
 
+def normalize_link_text(link_text: str) -> tuple[str, str | None]:
+    """Strip wikilink syntax and return the target text plus optional alias."""
+    text = link_text.strip()
+    if text.startswith("[[") and text.endswith("]]"):
+        text = text[2:-2]
+
+    alias = None
+    if "|" in text:
+        text, alias = text.split("|", 1)
+        alias = alias.strip()
+
+    return text.strip(), alias
+
+
 class LinkResolver:
     """Service for resolving markdown links to permalinks.
 
@@ -77,18 +94,72 @@ class LinkResolver:
     3. Try exact file path match
     4. Try file path with .md extension (for folder/title patterns)
     5. Fall back to search for fuzzy matching
+
+    When ``strict`` is set (the destructive edit/move paths) and a title matches more than one
+    note, resolution raises ``AmbiguousIdentifierError`` instead of guessing — the caller must pass
+    an exact permalink or external_id (issue #1148). Non-strict resolution keeps its shortest-path
+    preference.
     """
 
-    def __init__(self, entity_repository: EntityRepository, search_service: SearchService):
-        """Initialize with repositories."""
+    def __init__(
+        self,
+        entity_repository: EntityRepository,
+        search_service: SearchService,
+        session_maker: async_sessionmaker[AsyncSession],
+        app_config: BasicMemoryConfig,
+    ):
+        """Initialize with repositories and the caller's composition-root config."""
         self.entity_repository = entity_repository
         self.search_service = search_service
-        self._project_repository = ProjectRepository(entity_repository.session_maker)
-        self._app_config: BasicMemoryConfig = ConfigManager().config
+        self.session_maker = session_maker
+        self._project_repository = ProjectRepository()
+        self._app_config: BasicMemoryConfig = app_config
         self._project_permalink: Optional[str] = None
         self._project_cache_by_identifier: Dict[str, Project] = {}
         self._entity_repository_cache: Dict[int, EntityRepository] = {}
         self._search_service_cache: Dict[int, SearchService] = {}
+
+    async def resolve_entity(
+        self,
+        identifier: str,
+        *,
+        strict: bool = False,
+        source_path: Optional[str] = None,
+        load_relations: bool = True,
+        session: AsyncSession | None = None,
+    ) -> Optional[Entity]:
+        """Resolve an entity without leaving the resolver's project scope.
+
+        Unlike :meth:`resolve_link`, project-qualified identifiers do not select a different
+        repository. This is the target-project contract used by entity read and mutation flows.
+        """
+        clean_text, _ = self._normalize_link_text(identifier)
+
+        async with db.scoped_session(self.session_maker, session) as active_session:
+            try:
+                canonical_id = str(uuid_mod.UUID(clean_text))
+                entity = await self.entity_repository.get_by_external_id(
+                    active_session,
+                    canonical_id,
+                    load_relations=load_relations,
+                )
+                if entity:
+                    return entity
+            except ValueError:
+                pass
+
+            project_permalink = await self._get_current_project_permalink(active_session)
+            return await self._resolve_in_project(
+                session=active_session,
+                entity_repository=self.entity_repository,
+                search_service=self.search_service,
+                link_text=clean_text,
+                use_search=True,
+                strict=strict,
+                source_path=source_path,
+                project_permalink=project_permalink,
+                load_relations=load_relations,
+            )
 
     async def resolve_link(
         self,
@@ -97,6 +168,7 @@ class LinkResolver:
         strict: bool = False,
         source_path: Optional[str] = None,
         load_relations: bool = True,
+        session: AsyncSession | None = None,
     ) -> Optional[Entity]:
         """Resolve a markdown link to a permalink.
 
@@ -115,36 +187,83 @@ class LinkResolver:
         explicit_project_reference = "::" in clean_text
         clean_text = normalize_project_reference(clean_text)
 
-        # --- External ID Resolution ---
-        # Try external_id first if identifier looks like a UUID.
-        # Canonicalize to lowercase-hyphen form so uppercase or unhyphenated
-        # UUIDs also match the stored external_id values.
-        try:
-            canonical_id = str(uuid_mod.UUID(clean_text))
-            entity = await self.entity_repository.get_by_external_id(
-                canonical_id,
+        async with db.scoped_session(self.session_maker, session) as active_session:
+            # --- External ID Resolution ---
+            # Try external_id first if identifier looks like a UUID.
+            # Canonicalize to lowercase-hyphen form so uppercase or unhyphenated
+            # UUIDs also match the stored external_id values.
+            try:
+                canonical_id = str(uuid_mod.UUID(clean_text))
+                entity = await self.entity_repository.get_by_external_id(
+                    active_session,
+                    canonical_id,
+                    load_relations=load_relations,
+                )
+                if entity:
+                    logger.debug(f"Found entity by external_id: {entity.permalink}")
+                    return entity
+            except ValueError:
+                pass
+
+            # Trigger: link uses project namespace syntax (project::note)
+            # Why: treat it as an explicit cross-project reference
+            # Outcome: resolve only within the referenced project scope
+            if explicit_project_reference:
+                project_prefix, remainder = self._split_project_prefix(clean_text)
+                if not project_prefix:
+                    return None
+
+                project_resources = await self._get_project_resources(
+                    project_prefix, active_session
+                )
+                if not project_resources:
+                    return None
+
+                project, entity_repository, search_service = project_resources
+                return await self._resolve_in_project(
+                    session=active_session,
+                    entity_repository=entity_repository,
+                    search_service=search_service,
+                    link_text=remainder,
+                    use_search=use_search,
+                    strict=strict,
+                    source_path=None,
+                    project_permalink=project.permalink,
+                    load_relations=load_relations,
+                )
+
+            current_project_permalink = await self._get_current_project_permalink(active_session)
+            resolved = await self._resolve_in_project(
+                session=active_session,
+                entity_repository=self.entity_repository,
+                search_service=self.search_service,
+                link_text=clean_text,
+                use_search=use_search,
+                strict=strict,
+                source_path=source_path,
+                project_permalink=current_project_permalink,
                 load_relations=load_relations,
             )
-            if entity:
-                logger.debug(f"Found entity by external_id: {entity.permalink}")
-                return entity
-        except ValueError:
-            pass
+            if resolved:
+                return resolved
 
-        # Trigger: link uses project namespace syntax (project::note)
-        # Why: treat it as an explicit cross-project reference
-        # Outcome: resolve only within the referenced project scope
-        if explicit_project_reference:
+            # Trigger: local resolution failed and identifier looks like project/path
+            # Why: allow explicit project path references without namespace syntax
+            # Outcome: attempt resolution in the referenced project if it exists
             project_prefix, remainder = self._split_project_prefix(clean_text)
             if not project_prefix:
                 return None
 
-            project_resources = await self._get_project_resources(project_prefix)
+            project_resources = await self._get_project_resources(project_prefix, active_session)
             if not project_resources:
                 return None
 
             project, entity_repository, search_service = project_resources
+            if project.id == self.entity_repository.project_id:
+                return None
+
             return await self._resolve_in_project(
+                session=active_session,
                 entity_repository=entity_repository,
                 search_service=search_service,
                 link_text=remainder,
@@ -155,46 +274,6 @@ class LinkResolver:
                 load_relations=load_relations,
             )
 
-        current_project_permalink = await self._get_current_project_permalink()
-        resolved = await self._resolve_in_project(
-            entity_repository=self.entity_repository,
-            search_service=self.search_service,
-            link_text=clean_text,
-            use_search=use_search,
-            strict=strict,
-            source_path=source_path,
-            project_permalink=current_project_permalink,
-            load_relations=load_relations,
-        )
-        if resolved:
-            return resolved
-
-        # Trigger: local resolution failed and identifier looks like project/path
-        # Why: allow explicit project path references without namespace syntax
-        # Outcome: attempt resolution in the referenced project if it exists
-        project_prefix, remainder = self._split_project_prefix(clean_text)
-        if not project_prefix:
-            return None
-
-        project_resources = await self._get_project_resources(project_prefix)
-        if not project_resources:
-            return None
-
-        project, entity_repository, search_service = project_resources
-        if project.id == self.entity_repository.project_id:
-            return None
-
-        return await self._resolve_in_project(
-            entity_repository=entity_repository,
-            search_service=search_service,
-            link_text=remainder,
-            use_search=use_search,
-            strict=strict,
-            source_path=None,
-            project_permalink=project.permalink,
-            load_relations=load_relations,
-        )
-
     def _normalize_link_text(self, link_text: str) -> Tuple[str, Optional[str]]:
         """Normalize link text and extract alias if present.
 
@@ -204,28 +283,12 @@ class LinkResolver:
         Returns:
             Tuple of (normalized_text, alias or None)
         """
-        # Strip whitespace
-        text = link_text.strip()
-
-        # Remove enclosing brackets if present
-        if text.startswith("[[") and text.endswith("]]"):
-            text = text[2:-2]
-
-        # Handle wiki link aliases (format: [[actual|alias]])
-        alias = None
-        if "|" in text:
-            text, alias = text.split("|", 1)
-            text = text.strip()
-            alias = alias.strip()
-        else:
-            # Strip whitespace from text even if no alias
-            text = text.strip()
-
-        return text, alias
+        return normalize_link_text(link_text)
 
     async def _resolve_in_project(
         self,
         *,
+        session: AsyncSession,
         entity_repository: EntityRepository,
         search_service: SearchService,
         link_text: str,
@@ -282,6 +345,7 @@ class LinkResolver:
                     if not relative_path.endswith(".md"):
                         relative_path_md = f"{relative_path}.md"
                         entity = await entity_repository.get_by_file_path(
+                            session,
                             relative_path_md,
                             load_relations=load_relations,
                         )
@@ -290,6 +354,7 @@ class LinkResolver:
 
                     # Try as-is (already has extension or is a permalink)
                     entity = await entity_repository.get_by_file_path(
+                        session,
                         relative_path,
                         load_relations=load_relations,
                     )
@@ -307,6 +372,7 @@ class LinkResolver:
             # Check permalink match
             for candidate_permalink in permalink_candidates:
                 permalink_entity = await entity_repository.get_by_permalink(
+                    session,
                     candidate_permalink,
                     load_relations=load_relations,
                 )
@@ -315,6 +381,7 @@ class LinkResolver:
 
             # Check title matches
             title_entities = await entity_repository.get_by_title(
+                session,
                 clean_text,
                 load_relations=load_relations,
             )
@@ -330,30 +397,65 @@ class LinkResolver:
                     # Multiple candidates - pick closest to source
                     return self._find_closest_entity(candidates, source_path)
 
-        # Standard resolution (no source context): permalink first, then title
+        # Standard resolution (no source context): permalink first, then title.
+        #
+        # A destructive (strict) resolve must not silently guess between several same-title notes
+        # — e.g. an original plus a `-1` duplicate — which is how edit/move landed on the wrong
+        # entity (issue #1148). The trap is that the permalink step also matches the *slug* of the
+        # title (`build_permalink_resolution_candidates` slugifies the input), so a duplicated title
+        # whose original owns the title-derived permalink would still resolve silently. Pre-read the
+        # title matches so the permalink loop can tell a caller-supplied exact permalink (input is
+        # already in slug form) from the slug of a shared title. Non-strict resolution keeps the
+        # fast path — the title is read only if the permalink loop misses.
+        strict_title_matches = (
+            await entity_repository.get_by_title(session, clean_text, load_relations=load_relations)
+            if strict
+            else None
+        )
+        strict_ambiguous_title = strict_title_matches is not None and len(strict_title_matches) > 1
+        # The caller supplied an exact permalink when their verbatim (project-normalized) identifier
+        # matches a stored permalink. That is the first, un-slugified candidate the builder emits,
+        # so it also accepts explicit custom permalinks (e.g. "API_V2") that are not slug-shaped —
+        # inferring exactness from slug shape would wrongly reject them. Only this bypasses the
+        # duplicate-title guard below (#1148).
+        exact_identifier = normalize_project_reference(clean_text).strip("/")
+
         # 1. Try exact permalink match first (most efficient)
         for candidate_permalink in permalink_candidates:
             entity = await entity_repository.get_by_permalink(
+                session,
                 candidate_permalink,
                 load_relations=load_relations,
             )
             if entity:
+                # The slugified form of a shared title must not silently win for a destructive op;
+                # only the caller's exact (verbatim) permalink candidate may bypass the guard.
+                if strict_ambiguous_title and candidate_permalink != exact_identifier:
+                    break
                 logger.debug(f"Found exact permalink match: {entity.permalink}")
                 return entity
 
-        # 2. Try exact title match
-        found = await entity_repository.get_by_title(
-            clean_text,
-            load_relations=load_relations,
+        # 2. Try exact title match. An exact file-path match below is more precise than a title and
+        # can still disambiguate, so defer any ambiguity rejection until the path lookups have run.
+        found = (
+            strict_title_matches
+            if strict
+            else await entity_repository.get_by_title(
+                session, clean_text, load_relations=load_relations
+            )
         )
+        ambiguous_title_candidates: list[Entity] = []
         if found:
-            # Return first match (shortest path) if no source context
-            entity = found[0]
-            logger.debug(f"Found title match: {entity.title}")
-            return entity
+            if strict and len(found) > 1:
+                ambiguous_title_candidates = list(found)
+            else:
+                entity = found[0]
+                logger.debug(f"Found title match: {entity.title}")
+                return entity
 
         # 3. Try file path
         found_path = await entity_repository.get_by_file_path(
+            session,
             clean_text,
             load_relations=load_relations,
         )
@@ -365,12 +467,21 @@ class LinkResolver:
         if not clean_text.endswith(".md") and "/" in clean_text:
             file_path_with_md = f"{clean_text}.md"
             found_path_md = await entity_repository.get_by_file_path(
+                session,
                 file_path_with_md,
                 load_relations=load_relations,
             )
             if found_path_md:
                 logger.debug(f"Found entity with path (with .md): {found_path_md.file_path}")
                 return found_path_md
+
+        # No exact permalink or file path matched. If the only thing that matched was a title
+        # shared by several notes under a strict resolve, refuse to guess (#1148).
+        if ambiguous_title_candidates:
+            raise AmbiguousIdentifierError(
+                clean_text,
+                [(entity.permalink, entity.file_path) for entity in ambiguous_title_candidates],
+            )
 
         # In strict mode, don't try fuzzy search - return None if no exact match found
         if strict:
@@ -380,6 +491,7 @@ class LinkResolver:
         if use_search and "*" not in clean_text:
             results = await search_service.search(
                 query=SearchQuery(text=clean_text, entity_types=[SearchItemType.ENTITY]),
+                session=session,
             )
 
             if results:
@@ -392,6 +504,7 @@ class LinkResolver:
                 )
                 if best_match.permalink:
                     return await entity_repository.get_by_permalink(
+                        session,
                         best_match.permalink,
                         load_relations=load_relations,
                     )
@@ -403,7 +516,7 @@ class LinkResolver:
         """Return True when permalinks should include the project slug."""
         return self._app_config.permalinks_include_project
 
-    async def _get_current_project_permalink(self) -> Optional[str]:
+    async def _get_current_project_permalink(self, session: AsyncSession) -> Optional[str]:
         """Get and cache the current project's permalink."""
         if self._project_permalink is not None:
             return self._project_permalink
@@ -412,23 +525,27 @@ class LinkResolver:
         if project_id is None:  # pragma: no cover
             return None  # pragma: no cover
 
-        project = await self._project_repository.get_by_id(project_id)
+        project = await self._project_repository.get_by_id(session, project_id)
         if project:
             self._project_permalink = project.permalink
         return self._project_permalink
 
-    async def _get_project_by_identifier(self, identifier: str) -> Optional[Project]:
+    async def _get_project_by_identifier(
+        self, identifier: str, session: AsyncSession
+    ) -> Optional[Project]:
         """Resolve project by name or permalink."""
         cache_key = identifier.strip().lower()
         if cache_key in self._project_cache_by_identifier:
             return self._project_cache_by_identifier[cache_key]
 
-        project = await self._project_repository.get_by_name(identifier)
+        project = await self._project_repository.get_by_name(session, identifier)
         if not project:
-            project = await self._project_repository.get_by_name_case_insensitive(identifier)
+            project = await self._project_repository.get_by_name_case_insensitive(
+                session, identifier
+            )
         if not project:
             project = await self._project_repository.get_by_permalink(
-                generate_permalink(identifier)
+                session, generate_permalink(identifier)
             )
 
         if project:
@@ -436,31 +553,30 @@ class LinkResolver:
         return project
 
     async def _get_project_resources(
-        self, project_identifier: str
+        self, project_identifier: str, session: AsyncSession
     ) -> Optional[Tuple[Project, EntityRepository, SearchService]]:
         """Fetch repositories and services scoped to a project."""
-        project = await self._get_project_by_identifier(project_identifier)
+        project = await self._get_project_by_identifier(project_identifier, session)
         if not project:
             return None
 
         entity_repository = self._entity_repository_cache.get(project.id)
         if not entity_repository:
-            entity_repository = EntityRepository(
-                self.entity_repository.session_maker, project_id=project.id
-            )
+            entity_repository = EntityRepository(project_id=project.id)
             self._entity_repository_cache[project.id] = entity_repository
 
         search_service = self._search_service_cache.get(project.id)
         if not search_service:
             search_repository = create_search_repository(
-                self.entity_repository.session_maker,
+                self.session_maker,
                 project_id=project.id,
-                database_backend=self._app_config.database_backend,
+                app_config=self._app_config,
             )
             search_service = SearchService(
                 search_repository,
                 entity_repository,
                 self.search_service.file_service,
+                self.session_maker,
             )
             self._search_service_cache[project.id] = search_service
 

@@ -47,14 +47,14 @@ Use `(enum)` with a list of allowed values:
 
 ```yaml
 schema:
-  status(enum): [active, blocked, done, abandoned], current state
+  status(enum, current state): [active, blocked, done, abandoned]
 ```
 
 Optional enum:
 
 ```yaml
 schema:
-  priority?(enum): [low, medium, high, critical], task priority
+  priority?(enum, task priority): [low, medium, high, critical]
 ```
 
 ### Arrays
@@ -83,8 +83,10 @@ Relations create edges in the knowledge graph, linking notes together.
 
 ```yaml
 settings:
-  validation: warn    # warn (log issues) or error (strict)
+  validation: warn    # warn (log issues) or strict (errors)
 ```
+
+Use `strict` as the canonical enforcing mode. `error` is accepted only as a compatibility alias.
 
 ### Complete Example
 
@@ -100,7 +102,7 @@ schema:
   attendees?(array): Person, who attended
   decisions?(array): string, decisions made
   action_items?(array): string, follow-up tasks
-  status?(enum): [scheduled, completed, cancelled], meeting state
+  status?(enum, meeting state): [scheduled, completed, cancelled]
 settings:
   validation: warn
 ---
@@ -183,7 +185,7 @@ Validation reports:
 ### Handling Validation Results
 
 - **`warn` mode**: Review warnings periodically. Fix notes that are clearly wrong; add optional fields to the schema for legitimate new patterns.
-- **`error` mode**: Use for strict schemas where conformance matters (e.g., automated pipelines consuming notes).
+- **`strict` mode**: Use where conformance matters (e.g., automated pipelines consuming notes).
 
 ## Detecting Drift
 

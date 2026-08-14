@@ -11,12 +11,13 @@ import logfire
 import pytest
 
 from basic_memory.repository.search_index_row import SearchIndexRow
+from typing import Any
 
 utils_module = importlib.import_module("basic_memory.api.v2.utils")
 
 
 def _capture_spans():
-    spans: list[tuple[str, dict]] = []
+    spans: list[tuple[str, dict[str, Any]]] = []
 
     @contextmanager
     def fake_span(name: str, **attrs):
@@ -34,8 +35,8 @@ async def test_to_search_results_emits_hydration_spans(monkeypatch) -> None:
     class FakeEntityService:
         async def get_entities_by_id(self, ids):
             return [
-                SimpleNamespace(id=1, permalink="notes/root"),
-                SimpleNamespace(id=2, permalink="notes/child"),
+                SimpleNamespace(id=1, permalink="notes/root", external_id="uuid-root"),
+                SimpleNamespace(id=2, permalink="notes/child", external_id="uuid-child"),
             ]
 
     now = datetime.now(timezone.utc)

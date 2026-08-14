@@ -17,13 +17,17 @@ Basic Memory provides the MCP server — tools like `write_note`, `search_notes`
 | **memory-tasks** | Structured task tracking that survives context compaction. Creates typed `Task` notes with steps, status, and context. | Multi-step work (3+ steps), anything that might outlast a context window, or after compaction to resume. |
 | **memory-schema** | Schema lifecycle management — discover unschemaed notes, infer schemas, create/edit definitions, validate, and detect drift. | When structured note types emerge (Task, Person, Meeting, etc.) and you want consistency. |
 | **memory-reflect** | Sleep-time memory reflection. Reviews recent conversations and daily notes, extracts insights, consolidates into long-term memory. Inspired by [sleep-time compute](https://www.letta.com/blog/sleep-time-compute). | Schedule via cron (1-2x daily), trigger from heartbeat, or run on demand. |
+| **memory-capture** | Capture the current state of a working thread into a single coherent note — synthesize where it landed, not an append-log. Re-captures rewrite the same note in place via a `thread_id` key. | Mid-thread or end-of-thread, when decisions, insights, or context are worth preserving. |
 | **memory-notes** | How to write well-structured notes — frontmatter, observations with semantic categories, relations with wiki-links, and best practices. | When creating or improving notes, or when you need a reference for the note format. |
 | **memory-metadata-search** | Structured metadata search — query notes by custom frontmatter fields using equality, range, array, and nested filters. | When finding notes by status, priority, confidence, or any custom YAML field. |
 | **memory-defrag** | Memory defragmentation — split bloated files, merge duplicates, remove stale information, restructure the hierarchy. | Run weekly/biweekly via cron, or on demand when memory feels messy. |
+| **memory-curate** | Knowledge-graph curation — find orphan notes and suggest links, propose typed relations, merge duplicates, audit tags and folders, build hub notes. | When organizing, connecting, or improving a knowledge base as notes accumulate. |
 | **memory-lifecycle** | Entity lifecycle management — status transitions through folder-based organization, archiving completed work. Core principle: archive, never delete. | When marking items complete, archiving old entities, or managing folder-based status workflows. |
 | **memory-ingest** | Process unstructured external input into structured entities. Parses meeting transcripts, conversation logs, and pasted documents. | When pasting a transcript, conversation log, or external document that should become structured knowledge. |
 | **memory-research** | Web research synthesized into Basic Memory entities. Researches a subject, checks for existing knowledge, presents findings, and creates entity notes. | When asked to research a company, person, technology, or topic. |
 | **memory-literary-analysis** | Analyze a complete literary work into a structured knowledge graph — characters, themes, chapters, locations, symbols, and literary devices. | Full-text literary analysis, book club companions, teaching resources, or research projects. |
+| **memory-continue** | Resume prior work by rebuilding context from the knowledge graph — `build_context` via `memory://` URLs, recent activity, and search, then read the key notes. | Starting a session, or when the user says "continue with...", "back to...", or "where were we?" |
+| **memory-onboarding** | Guided onboarding for people new to Basic Memory — interview, blueprint, approval gate, then build a full system: schemas, templates, instruction notes, a startup router, indexes, and real seed notes, plus assistant setup so the rules load every session. | When a user is new to Basic Memory, doesn't know what to use it for, wants structure in an empty or messy project, or wants their assistant to follow consistent rules across sessions. |
 
 ## Basic Memory Cloud
 
@@ -44,16 +48,16 @@ Install or update skills using the [Skills CLI](https://github.com/vercel-labs/s
 
 ```bash
 # Install all skills
-npx skills add basicmachines-co/basic-memory --path skills
+npx skills add basicmachines-co/basic-memory/skills
 
 # Install a specific skill
-npx skills add basicmachines-co/basic-memory --path skills --skill memory-tasks
+npx skills add basicmachines-co/basic-memory/skills --skill memory-tasks
 
 # Install all skills for a specific agent
-npx skills add basicmachines-co/basic-memory --path skills --agent claude
+npx skills add basicmachines-co/basic-memory/skills --agent claude
 
 # List available skills without installing
-npx skills add basicmachines-co/basic-memory --path skills --list
+npx skills add basicmachines-co/basic-memory/skills --list
 
 # Check for updates
 npx skills check
@@ -64,7 +68,7 @@ npx skills update
 
 Skills are installed to your agent's skills directory (e.g., `~/.claude/skills/` for Claude Code global, or `.claude/skills/` for project-scoped).
 
-If your installed Skills CLI does not support `--path`, copy the `memory-*` directories manually for now. Phase 2 will add a first-class Codex/package install path.
+If your installed Skills CLI cannot load `basicmachines-co/basic-memory/skills`, update the CLI or copy the `memory-*` directories manually.
 
 ### Claude Desktop (claude.ai)
 

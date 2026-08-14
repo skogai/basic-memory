@@ -13,6 +13,7 @@ from typing import Any, cast
 
 import pytest
 
+from basic_memory import db
 from basic_memory.config import DatabaseBackend
 from basic_memory.schemas.search import SearchItemType, SearchQuery, SearchRetrievalMode
 
@@ -108,16 +109,18 @@ async def seed_diagnostic_notes(search_service):
 
     entities = []
     for note in notes:
-        entity = await search_service.entity_repository.create(
-            {
-                "title": note["title"],
-                "note_type": "note",
-                "entity_metadata": {"tags": note.get("tags", [])},
-                "content_type": "text/markdown",
-                "permalink": note["permalink"],
-                "file_path": f"{note['permalink']}.md",
-            }
-        )
+        async with db.scoped_session(search_service.session_maker) as session:
+            entity = await search_service.entity_repository.create(
+                session,
+                {
+                    "title": note["title"],
+                    "note_type": "note",
+                    "entity_metadata": {"tags": note.get("tags", [])},
+                    "content_type": "text/markdown",
+                    "permalink": note["permalink"],
+                    "file_path": f"{note['permalink']}.md",
+                },
+            )
         await search_service.index_entity_data(entity, content=note["content"])
         await search_service.sync_entity_vectors(entity.id)
         entities.append(entity)
@@ -310,12 +313,10 @@ async def test_score_fusion_preserves_strong_vector_match(sqlite_engine_factory,
 @pytest.mark.semantic
 @pytest.mark.benchmark
 async def test_similarity_formula_analysis(sqlite_engine_factory, tmp_path):
-    """Analyze the raw distance-to-similarity mapping for real queries.
+    """Analyze normalized similarities returned by the configured vector index.
 
-    Production formulas are backend-specific:
-    - SQLite: similarity = max(0, 1 - L2²/2) for normalized embeddings
-    - Postgres: similarity = max(0, 1 - cosine_distance)
-    This test compares old and new mappings for diagnostics.
+    Distance metrics are backend-specific and remain inside each vector adapter.
+    The repository boundary exposes normalized cosine similarity in ``[0, 1]``.
     """
     skip_if_needed(DIAG_COMBO)
     provider = _create_fastembed_provider()
@@ -332,7 +333,8 @@ async def test_similarity_formula_analysis(sqlite_engine_factory, tmp_path):
     ]
 
     for query_text in queries:
-        # Get raw vector distances by querying at the repository level
+        # Query through the repository boundary so this diagnostic verifies the
+        # normalized contract rather than reaching into sqlite-vec internals.
         query_embedding = await provider.embed_query(query_text.strip())
 
         from basic_memory import db as bm_db
@@ -340,16 +342,18 @@ async def test_similarity_formula_analysis(sqlite_engine_factory, tmp_path):
         repo = cast(Any, service.repository)
         async with bm_db.scoped_session(repo.session_maker) as session:
             await repo._prepare_vector_session(session)
-            raw_rows = await repo._run_vector_query(session, query_embedding, candidate_limit=20)
+            vector_rows = await repo._run_vector_query(
+                session,
+                query_embedding,
+                candidate_limit=20,
+            )
 
         print(f"\nQuery: '{query_text}'")
-        print(f"  {'chunk_key':<40} {'distance':>10} {'sim_old':>12} {'sim_new':>12}")
-        for row in raw_rows[:10]:
-            dist = float(row["best_distance"])
-            sim_old = 1.0 / (1.0 + max(dist, 0.0))
-            # New formula: L2 distance → cosine similarity for normalized embeddings
-            sim_new = repo._distance_to_similarity(dist)
-            print(f"  {row['chunk_key']:<40} {dist:>10.4f} {sim_old:>12.4f} {sim_new:>12.4f}")
+        print(f"  {'chunk_key':<40} {'similarity':>12}")
+        for row in vector_rows[:10]:
+            similarity = float(row["best_similarity"])
+            assert 0.0 <= similarity <= 1.0
+            print(f"  {row['chunk_key']:<40} {similarity:>12.4f}")
 
 
 # --- Test: min_similarity threshold effectiveness ---

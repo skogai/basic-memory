@@ -1,9 +1,10 @@
 """Knowledge graph models."""
 
+import hashlib
 import uuid
 from datetime import datetime
 from basic_memory.utils import ensure_timezone_aware
-from typing import Optional
+from typing import Any, override, Optional
 
 from sqlalchemy import (
     BigInteger,
@@ -19,9 +20,10 @@ from sqlalchemy import (
     Float,
     text,
 )
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from basic_memory.models.base import Base
+from basic_memory.runtime.storage import RUNTIME_MARKDOWN_CONTENT_TYPE
 from basic_memory.utils import generate_permalink
 
 
@@ -67,7 +69,7 @@ class Entity(Base):
     external_id: Mapped[str] = mapped_column(String, unique=True, default=lambda: str(uuid.uuid4()))
     title: Mapped[str] = mapped_column(String)
     note_type: Mapped[str] = mapped_column(String)
-    entity_metadata: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    entity_metadata: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
     content_type: Mapped[str] = mapped_column(String)
 
     # Project reference
@@ -93,7 +95,6 @@ class Entity(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now().astimezone(),
-        onupdate=lambda: datetime.now().astimezone(),
     )
 
     # Who created this entity (cloud user_profile_id UUID, null for local/CLI usage)
@@ -125,6 +126,12 @@ class Entity(Base):
         uselist=False,
     )
 
+    @validates("created_at", "updated_at")
+    def _normalize_semantic_timestamp(self, attribute_name: str, value: datetime) -> datetime:
+        """Keep SQLite's timezone-naive storage faithful to the represented instant."""
+        del attribute_name
+        return ensure_timezone_aware(value).astimezone()
+
     @property
     def relations(self):
         """Get all relations (incoming and outgoing) for this entity."""
@@ -133,8 +140,9 @@ class Entity(Base):
     @property
     def is_markdown(self):
         """Check if the entity is a markdown file."""
-        return self.content_type == "text/markdown"
+        return self.content_type == RUNTIME_MARKDOWN_CONTENT_TYPE
 
+    @override
     def __getattribute__(self, name):
         """Override attribute access to ensure datetime fields are timezone-aware."""
         value = super().__getattribute__(name)
@@ -145,6 +153,7 @@ class Entity(Base):
 
         return value
 
+    @override
     def __repr__(self) -> str:
         return f"Entity(id={self.id}, external_id='{self.external_id}', name='{self.title}', type='{self.note_type}', checksum='{self.checksum}')"
 
@@ -210,10 +219,59 @@ class NoteContent(Base):
 
     entity = relationship("Entity", back_populates="note_content")
 
+    @override
     def __repr__(self) -> str:  # pragma: no cover
         return (
             f"NoteContent(entity_id={self.entity_id}, external_id='{self.external_id}', "
             f"file_path='{self.file_path}', file_write_status='{self.file_write_status}')"
+        )
+
+
+class NoteFileVacate(Base):
+    """A source path vacated by a move whose physical object is pending cleanup.
+
+    A ``move_note`` is DB-first: the entity's ``file_path`` flips to the destination while the
+    physical source object is deleted out of band. This row is the durable, index-time-queryable
+    proof that the source path was vacated *by a move* — so the indexer can tell a move's lingering
+    source object (a ghost source: skip re-import) from a legitimate byte-identical copy (index as
+    new). Written atomically with the move; cleared when the source object is deleted
+    (basic-memory-cloud#1601).
+    """
+
+    __tablename__ = "note_file_vacate"
+    __table_args__ = (
+        # One outstanding vacate per source path; the index-time lookup keys on it.
+        UniqueConstraint("project_id", "file_path", name="uix_note_file_vacate_project_file_path"),
+        Index("ix_note_file_vacate_project_id", "project_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)  # pyright: ignore [reportIncompatibleVariableOverride]
+    project_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("project.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # The moved entity now living at the destination. Preserve the marker as a checksum-backed
+    # tombstone if that entity is deleted before the physical source cleanup finishes.
+    entity_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        ForeignKey("entity.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    # The vacated source path (project-relative POSIX), the key the indexer checks.
+    file_path: Mapped[str] = mapped_column(String, nullable=False)
+    # Guard for the physical delete; may be None when the source was never materialized.
+    file_checksum: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now().astimezone(),
+    )
+
+    @override
+    def __repr__(self) -> str:  # pragma: no cover
+        return (
+            f"NoteFileVacate(project_id={self.project_id}, entity_id={self.entity_id}, "
+            f"file_path='{self.file_path}')"
         )
 
 
@@ -252,12 +310,23 @@ class Observation(Base):
         Content is truncated to 200 chars to stay under PostgreSQL's
         btree index limit of 2704 bytes.
         """
-        # Truncate content to avoid exceeding PostgreSQL's btree index limit
-        content_for_permalink = self.content[:200] if len(self.content) > 200 else self.content
+        if len(self.content) > 200:
+            # Trigger: content exceeds the 200-char budget imposed by PostgreSQL's
+            # 2704-byte btree index row limit, so the permalink can only carry a prefix.
+            # Why: two distinct observations with the same category and an identical
+            # 200-char prefix would collide on the same synthetic permalink, and the
+            # search index (permalink-keyed upsert) silently drops the second one.
+            # Outcome: a short stable digest of the FULL content disambiguates
+            # truncated permalinks while staying well under the index limit.
+            digest = hashlib.sha256(self.content.encode("utf-8")).hexdigest()[:12]
+            content_for_permalink = f"{self.content[:200]}-{digest}"
+        else:
+            content_for_permalink = self.content
         return generate_permalink(
             f"{self.entity.permalink}/observations/{self.category}/{content_for_permalink}"
         )
 
+    @override
     def __repr__(self) -> str:  # pragma: no cover
         return f"Observation(id={self.id}, entity_id={self.entity_id}, content='{self.content}')"
 
@@ -274,6 +343,12 @@ class Relation(Base):
         Index("ix_relation_type", "relation_type"),
         Index("ix_relation_from_id", "from_id"),  # Add FK indexes
         Index("ix_relation_to_id", "to_id"),
+        Index(
+            "ix_relation_project_from_generation",
+            "project_id",
+            "from_id",
+            "generation",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)  # pyright: ignore [reportIncompatibleVariableOverride]
@@ -285,6 +360,14 @@ class Relation(Base):
     to_name: Mapped[str] = mapped_column(String)
     relation_type: Mapped[str] = mapped_column(String)
     context: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Relation rows are a projection of one accepted note-content generation.
+    # Zero is reserved for rows written by pre-generation binaries during a rolling deploy.
+    generation: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+    )
 
     # Relationships
     from_entity = relationship(
@@ -307,5 +390,6 @@ class Relation(Base):
             return generate_permalink(f"{from_permalink}/{self.relation_type}/{to_permalink}")
         return generate_permalink(f"{from_permalink}/{self.relation_type}/{self.to_name}")
 
+    @override
     def __repr__(self) -> str:
         return f"Relation(id={self.id}, from_id={self.from_id}, to_id={self.to_id}, to_name={self.to_name}, type='{self.relation_type}')"  # pragma: no cover

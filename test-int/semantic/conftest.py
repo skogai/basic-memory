@@ -26,7 +26,7 @@ from sqlalchemy.pool import NullPool
 from testcontainers.postgres import PostgresContainer
 
 from basic_memory import db
-from basic_memory.config import BasicMemoryConfig, DatabaseBackend
+from basic_memory.config import BasicMemoryConfig, DatabaseBackend, default_fastembed_cache_dir
 from basic_memory.db import DatabaseType, engine_session_factory
 from basic_memory.markdown import EntityParser
 from basic_memory.markdown.markdown_processor import MarkdownProcessor
@@ -220,7 +220,11 @@ async def postgres_engine_factory(postgres_engine):
 def _create_fastembed_provider() -> EmbeddingProvider:
     from basic_memory.repository.fastembed_provider import FastEmbedEmbeddingProvider
 
-    return FastEmbedEmbeddingProvider(model_name="bge-small-en-v1.5", batch_size=64)
+    return FastEmbedEmbeddingProvider(
+        model_name="bge-small-en-v1.5",
+        batch_size=64,
+        cache_dir=default_fastembed_cache_dir(),
+    )
 
 
 def _create_openai_provider() -> EmbeddingProvider:
@@ -237,21 +241,25 @@ async def create_search_service(
     combo: SearchCombo,
     tmp_path: Path,
     embedding_provider: EmbeddingProvider | None = None,
+    *,
+    reranker_enabled: bool = False,
 ) -> SearchService:
     """Build a fully wired SearchService for a given combo."""
     engine, session_maker = engine_factory_result
 
     # Create test project
-    project_repo = ProjectRepository(session_maker)
-    project = await project_repo.create(
-        {
-            "name": "bench-project",
-            "description": "Semantic benchmark project",
-            "path": str(tmp_path),
-            "is_active": True,
-            "is_default": True,
-        }
-    )
+    project_repo = ProjectRepository()
+    async with db.scoped_session(session_maker) as session:
+        project = await project_repo.create(
+            session,
+            {
+                "name": "bench-project",
+                "description": "Semantic benchmark project",
+                "path": str(tmp_path),
+                "is_active": True,
+                "is_default": True,
+            },
+        )
 
     # Build app config
     semantic_enabled = combo.provider_name is not None
@@ -262,6 +270,7 @@ async def create_search_service(
         database_backend=combo.backend,
         semantic_search_enabled=semantic_enabled,
         semantic_min_similarity=BENCHMARK_MIN_SIMILARITY,
+        reranker_enabled=reranker_enabled,
     )
 
     # Create search repository (backend-specific)
@@ -290,11 +299,16 @@ async def create_search_service(
             repo._vector_tables_initialized = False
         search_repo = repo
 
-    entity_repo = EntityRepository(session_maker, project_id=project.id)
+    entity_repo = EntityRepository(project_id=project.id)
     entity_parser = EntityParser(tmp_path)
     markdown_processor = MarkdownProcessor(entity_parser)
     file_service = FileService(tmp_path, markdown_processor)
 
-    service = SearchService(search_repo, entity_repo, file_service)
+    service = SearchService(
+        search_repo,
+        entity_repo,
+        file_service,
+        session_maker=session_maker,
+    )
     await service.init_search_index()
     return service

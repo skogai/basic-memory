@@ -1,5 +1,137 @@
 # Changelog
 
+## Unreleased — v0.4 bridge redesign (Phases 1–4)
+
+The plugin is reframed as the **bridge between Claude's working memory and Basic
+Memory's durable graph**, rather than a memory layer of its own. See
+[DESIGN.md](./DESIGN.md) for the full rationale and roadmap.
+
+### Added
+
+- **`/basic-memory:bm-orient`** (`skills/bm-orient/`) — deliberate mid-session
+  orientation: reads active tasks, open decisions, and recent checkpoints
+  (repository-scoped `coding_session` recall for coding setups — never an
+  unscoped query) and presents an evidence-backed summary with permalinks.
+  Ported from the Codex plugin for parity.
+- **`/basic-memory:bm-decide`** (`skills/bm-decide/`) — deliberate decision
+  capture: rationale, alternatives, consequences, and affected work as a
+  `type: decision` note, written to the `bm-writing` standard. Works whether or
+  not the output style's inline capture reflex is enabled. Ported from the
+  Codex plugin for parity.
+- **`bm-writing` writing standard** (`skills/bm-writing/`) — the user-customizable
+  standard for how Claude writes project memory (voice, narrative spine, git
+  anchors, observations, relations, evidence boundary), ported from the Codex
+  plugin so both hosts share one contract. Applied by `bm-remember` and the
+  output style's capture reflexes; edit the SKILL.md to change how memory is
+  written.
+- **`/basic-memory:bm-checkpoint`** (`skills/bm-checkpoint/`) — deliberate,
+  high-signal checkpoints: the story (problem → approach → impact), the durable
+  lesson (`## Project Memory`), verification actually run, decisions, blockers,
+  and the next action, written to the standard. The deliberate counterpart to
+  the automatic PreCompact checkpoint.
+- **Coding setup (`sessionProfile: "coding"`)** — `bm-setup` asks whether the
+  project should capture Git and pull-request context, resolves a stable
+  `repository` identifier (`owner/name`) and confirms it with the user, and
+  seeds a `coding_session` schema whose repository, repo-root, working-directory,
+  branch, and Git SHA frontmatter are **required** — evidence-proven from git
+  itself, never inferred from conversation. Typed pull-request fields are added
+  when a PR exists. Coding checkpoints become queryable by structured filters
+  (`metadata_filters={"repository": ..., "pull_request_number": ...}`) instead
+  of prose search. Mirrors the Codex plugin's coding-session design for parity.
+- **Team workspace support** (Phase 4). SessionStart now reads **across** the primary
+  project plus configured shared/team projects — `secondaryProjects` (read-only recall
+  sources) and `teamProjects` (share targets) — querying open decisions from each in
+  parallel and folding them into the brief. Team refs use workspace-qualified names
+  (`my-team/notes`) or `external_id` UUIDs, since project names collide across
+  workspaces. Reads route over the user's OAuth session; capture **never** writes to a
+  shared project.
+- **`/basic-memory:bm-share <note>`** (`skills/bm-share/`) — the deliberate personal→team
+  write: copies a note from the primary project into a configured `teamProjects`
+  target's `promoteFolder`, with `shared_from` attribution and a confirmation step.
+  Preserves the note's type so shared decisions stay findable in the team's structured
+  recall. (Phase 4)
+- **`/basic-memory:bm-setup`** (`skills/bm-setup/`) — a short guided interview that
+  configures the project for the plugin: maps it to a Basic Memory project (picking
+  an existing one or creating a new one), seeds the `session`/`decision`/`task`
+  schemas into the project, installs the shared `memory-*` skills via
+  `npx skills add basicmachines-co/basic-memory/skills` (the plugin doesn't
+  vendor its own copies — `skills/` is the single source of truth, shared with
+  OpenClaw), optionally learns the project's placement conventions, and enables the
+  capture reflexes. Writes the `basicMemory` block to
+  `.claude/settings.json` (or `settings.local.json`). The SessionStart hook nudges
+  toward this on first run; running it (writing the config) stops the nudge. (Phase 3)
+- **`/basic-memory:bm-remember <text>`** (`skills/bm-remember/`) — quick deliberate
+  capture. Writes the text verbatim to the `rememberFolder` (default `bm-remember`)
+  with a first-line title and a `manual-capture` tag, via the connected Basic Memory
+  MCP server. Also fires when the user says "remember that…". (Phase 2)
+- **`/basic-memory:bm-status`** (`skills/bm-status/`) — diagnostic that reports the active
+  project, capture/remember folders, output-style state, recent session checkpoints,
+  and active-task count. User-invoked only (`disable-model-invocation`). (Phase 2)
+
+  Both verified discoverable via `claude plugin details` — they surface as
+  plugin-namespaced commands (`/basic-memory:<name>`).
+
+
+- **SessionStart hook** (`hooks/session_start.py`) — briefs Claude at session
+  start with active tasks from the graph (one structured `type: task` query) plus
+  an always-on recall prompt. Works against the default project with zero config;
+  pin a project via `basicMemory.primaryProject`. Plain-stdout output, capped well
+  under the 10k limit, and silent if Basic Memory isn't installed.
+- **PreCompact hook** (`hooks/pre_compact.py`) — writes a `type: session`
+  checkpoint to the graph before context compaction (extractive in this phase;
+  LLM-summarized capture is the next step). Only writes when a `primaryProject` is
+  configured, so it never touches a graph the user hasn't opted in.
+- **Output style** (`output-styles/basic-memory.md`) — opt-in reflexes: search
+  before recalling, capture decisions as typed `decision` notes, cite permalinks.
+  Sets `keep-coding-instructions: true` so it composes with normal dev work.
+- **Seed schemas** (`schemas/{session,decision,task}.md`) — picoschema for the
+  note types the plugin writes, so recall via `search_notes` metadata filters is
+  precise. `task` mirrors the framework-agnostic `memory-tasks` skill. Validation
+  mode `warn` — advisory, never blocking.
+- **`settings.example.json`** — copyable configuration with sensible defaults.
+
+### Changed
+
+- **Hooks are now zero-logic uv scripts** (SPEC-55, #997). `session_start.py`
+  and `pre_compact.py` are self-contained PEP 723 scripts run via
+  `uv run --quiet --script`: uv resolves `basic-memory>=<floor>` (floor bumped
+  by release tooling) and the script invokes
+  `basic-memory hook <event> --harness claude` in-process with the hook JSON
+  on stdin. `BM_BIN` overrides the uv-managed environment for development.
+  The brief/checkpoint logic lives in the released package; lifecycle envelopes
+  containing bounded metadata are captured by default and can be disabled with
+  `captureEvents: false`. uv is the required prerequisite; the first run fetches
+  from PyPI, later runs use uv's cache.
+- **SessionStart hook now nudges toward `/basic-memory:bm-setup` on first run** — when
+  no `basicMemory` config block is present in either settings file. The nudge
+  survives a failed/empty task query (so a brand-new user with no project yet still
+  sees it), and stops once setup writes the config. (Phase 3)
+
+### Removed (clean break)
+
+- Hook-specific secret scanning and the `redactKeys` / `redactPaths` settings.
+  Lifecycle envelopes now stay small by construction instead of carrying a
+  general-purpose redaction subsystem.
+- The six bundled skills (`placement`, `knowledge-capture`, `knowledge-organize`,
+  `continue-conversation`, `research`, `edit-note`). Equivalent, framework-agnostic
+  workflows live in the top-level [`skills/`](../../skills) package
+  (`memory-notes`, `memory-research`, `memory-tasks`, `memory-schema`, …); install
+  those for the old capabilities.
+- The `basic-memory-manager` agent. The plugin ships no agent in v0.4 — memory is
+  handled in the main context via hooks and the output style, not delegated.
+- The `PreToolUse`/`PostToolUse` `write_note` hooks (placement advisory + save
+  confirmation). Placement guidance now lives in the `basicMemory` settings block
+  and the output style.
+- The `basic-memory` config-note convention, superseded by `.claude/settings.json`.
+- `PLUGIN.md`, replaced by a bridge-framed `README.md` and `DESIGN.md`.
+
+### Notes
+
+- Slash commands shipped by later phases (`/basic-memory:bm-setup`,
+  `:remember`, `:status`) will be **plugin-namespaced** — Claude Code namespaces
+  all plugin skills as `/<plugin>:<skill>`.
+- Requires `basic-memory >= 0.19.0` (for `metadata_filters` / structured recall).
+
 ## 0.3.13
 
 ### Fixed

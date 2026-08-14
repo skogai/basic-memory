@@ -8,7 +8,7 @@ Verifies that the fusion formula (max + FUSION_BONUS * min):
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Optional, cast
+from typing import override, Any, Optional, cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -56,12 +56,15 @@ class ConcreteSearchRepo(SearchRepositoryBase):
         self.session_maker = None
         self.project_id = 1
 
+    @override
     async def init_search_index(self):
         pass  # pragma: no cover
 
+    @override
     def _prepare_search_term(self, term, is_prefix=True):
         return term  # pragma: no cover
 
+    @override
     async def search(
         self,
         search_text: Optional[str] = None,
@@ -71,32 +74,47 @@ class ConcreteSearchRepo(SearchRepositoryBase):
         note_types: Optional[list[str]] = None,
         after_date: Optional[datetime] = None,
         search_item_types: Optional[list[SearchItemType]] = None,
+        categories: Optional[list[str]] = None,
         metadata_filters: Optional[dict[str, Any]] = None,
         retrieval_mode: SearchRetrievalMode = SearchRetrievalMode.FTS,
         min_similarity: Optional[float] = None,
         limit: int = 10,
         offset: int = 0,
+        allow_relaxed: bool = False,
     ) -> list[SearchIndexRow]:
         return []  # pragma: no cover
 
+    @override
     async def _ensure_vector_tables(self):
         pass  # pragma: no cover
 
+    @override
     async def _run_vector_query(self, session, query_embedding, candidate_limit):
         return []  # pragma: no cover
 
+    @override
     async def _write_embeddings(self, session, jobs, embeddings):
         pass  # pragma: no cover
 
-    async def _delete_entity_chunks(self, session, entity_id):
-        pass  # pragma: no cover
+    @override
+    async def _delete_entity_chunks(self, session, entity_id, *, expected_deletions=None):
+        return []  # pragma: no cover
 
-    async def _delete_stale_chunks(self, session, stale_ids, entity_id):
-        pass  # pragma: no cover
+    @override
+    async def _delete_stale_chunks(
+        self,
+        session,
+        stale_ids,
+        entity_id,
+        *,
+        expected_deletions=None,
+    ):
+        return []  # pragma: no cover
 
     async def _update_timestamp_sql(self):
         return "CURRENT_TIMESTAMP"  # pragma: no cover
 
+    @override
     def _distance_to_similarity(self, distance: float) -> float:
         return 1.0 / (1.0 + max(distance, 0.0))  # pragma: no cover
 
@@ -126,6 +144,7 @@ HYBRID_KWARGS: dict[str, Any] = dict(
     note_types=None,
     after_date=None,
     search_item_types=None,
+    categories=None,
     metadata_filters=None,
     limit=10,
     offset=0,
@@ -224,6 +243,34 @@ async def test_zero_score_produces_zero_fused():
     assert len(results) == 1
     # Zero FTS score, no vector → fused = max(0, 0) + 0.3 * min(0, 0) = 0.0
     assert results[0].score == pytest.approx(0.0, rel=1e-6)
+
+
+@pytest.mark.asyncio
+async def test_cross_type_id_collision_keeps_both_results():
+    """An entity and a relation sharing the same numeric id stay distinct (#982).
+
+    search_index row types have independent id sequences, so fusing on a bare
+    row id merged unrelated rows into one result and dropped the other.
+    """
+    repo = ConcreteSearchRepo()
+
+    fts_results = [FakeRow(id=1, type="entity", score=5.0, title="entity-row")]
+    vector_results = [FakeRow(id=1, type="relation", score=0.8, title="relation-row")]
+
+    with (
+        patch.object(repo, "search", new_callable=AsyncMock, return_value=fts_results),
+        patch.object(
+            repo, "_search_vector_only", new_callable=AsyncMock, return_value=vector_results
+        ),
+    ):
+        results = await repo._search_hybrid(**HYBRID_KWARGS)
+
+    assert {(r.type, r.id) for r in results} == {("entity", 1), ("relation", 1)}
+    # Single-source scores must not earn the dual-source fusion bonus across types.
+    entity_result = next(r for r in results if r.type == "entity")
+    relation_result = next(r for r in results if r.type == "relation")
+    assert entity_result.score == pytest.approx(1.0, rel=1e-6)
+    assert relation_result.score == pytest.approx(0.8, rel=1e-6)
 
 
 @pytest.mark.asyncio

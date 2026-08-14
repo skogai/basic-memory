@@ -3,8 +3,8 @@
 Tests the integration layer where ORM entities are converted to NoteData
 and passed through the schema engine (infer, validate, diff).
 
-Note: EntityType uses BeforeValidator(to_snake_case) so "Person" becomes "person"
-in the database. All query params must use the stored (snake_case) form.
+Note types use one snake_case identity at write and query boundaries. Legacy stored
+spellings remain part of the same logical population.
 """
 
 from pathlib import Path
@@ -12,8 +12,9 @@ from textwrap import dedent
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import update
 
-from basic_memory.models import Project
+from basic_memory.models import Entity, Project
 from basic_memory.schemas.base import Entity as EntitySchema
 from basic_memory.services.file_service import FileService
 
@@ -223,6 +224,45 @@ async def test_validate_with_inline_schema(
 
 
 @pytest.mark.asyncio
+async def test_validate_invalid_mode_returns_client_error(
+    client: AsyncClient,
+    test_project: Project,
+    v2_project_url: str,
+    entity_service,
+    search_service,
+):
+    """Invalid inline schema modes are configuration errors, not HTTP 500s."""
+    entity, _ = await entity_service.create_or_update_entity(
+        EntitySchema(
+            title="Invalid Mode Note",
+            directory="people",
+            note_type="invalid_mode",
+            entity_metadata={
+                "schema": {"name": "string"},
+                "settings": {"validation": "banana"},
+            },
+            content="## Observations\n- [name] Invalid Mode\n",
+        )
+    )
+    await search_service.index_entity(entity)
+
+    responses = [
+        await client.post(
+            f"{v2_project_url}/schema/validate",
+            params={"identifier": entity.permalink},
+        ),
+        await client.post(
+            f"{v2_project_url}/schema/validate",
+            params={"note_type": "invalid_mode"},
+        ),
+    ]
+
+    for response in responses:
+        assert response.status_code == 400
+        assert "Invalid settings.validation value 'banana'" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
 async def test_validate_with_explicit_schema_reference_by_permalink_slug(
     client: AsyncClient,
     test_project: Project,
@@ -364,6 +404,287 @@ async def test_validate_total_entities_without_schema(
     # But entities of this type do exist
     assert data["total_entities"] == 3
     assert data["results"] == []
+
+
+@pytest.mark.asyncio
+async def test_validate_note_type_includes_canonical_and_legacy_spellings(
+    client: AsyncClient,
+    test_project: Project,
+    v2_project_url: str,
+    entity_service,
+    session_maker,
+):
+    """One explicit type validates canonical rows and legacy camel-case rows."""
+    canonical_entity, _ = await entity_service.create_or_update_entity(
+        EntitySchema(
+            title="Canonical Task Item",
+            directory="tasks",
+            note_type="Task Item",
+            entity_metadata={"schema": {"status": "string"}},
+            content="## Observations\n- [status] active\n",
+        )
+    )
+    legacy_entity, _ = await entity_service.create_or_update_entity(
+        EntitySchema(
+            title="Legacy Task Item",
+            directory="tasks",
+            note_type="task_item",
+            entity_metadata={"schema": {"status": "string"}},
+            content="## Observations\n- [status] complete\n",
+        )
+    )
+
+    # Simulate a row indexed by an older version before write-side canonicalization.
+    async with session_maker() as session:
+        await session.execute(
+            update(Entity).where(Entity.id == legacy_entity.id).values(note_type="TaskItem")
+        )
+        await session.commit()
+
+    response = await client.post(
+        f"{v2_project_url}/schema/validate",
+        params={"note_type": "task-item"},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["note_type"] == "task_item"
+    assert data["total_entities"] == 2
+    assert data["total_notes"] == 2
+    assert {result["note_identifier"] for result in data["results"]} == {
+        canonical_entity.title,
+        legacy_entity.title,
+    }
+
+
+# --- All-Types Validation Tests (#1013) ---
+
+
+@pytest.mark.asyncio
+async def test_validate_all_types_with_schemas(
+    client: AsyncClient,
+    test_project: Project,
+    v2_project_url: str,
+    entity_service,
+    search_service,
+):
+    """Validate with no params covers every note type that has a schema defined."""
+    person_schema, _ = await entity_service.create_or_update_entity(
+        EntitySchema(
+            title="Person Schema",
+            directory="schemas",
+            note_type="schema",
+            entity_metadata={
+                "entity": "person",
+                "schema": {"name": "string", "role": "string"},
+            },
+            content=dedent("""\
+                ## Observations
+                - [note] Schema definition for person entities
+            """),
+        )
+    )
+    await search_service.index_entity(person_schema)
+
+    # Second schema whose target type has no notes yet
+    meeting_schema, _ = await entity_service.create_or_update_entity(
+        EntitySchema(
+            title="Meeting Schema",
+            directory="schemas",
+            note_type="schema",
+            entity_metadata={
+                "entity": "meeting",
+                "schema": {"date": "string"},
+            },
+            content=dedent("""\
+                ## Observations
+                - [note] Schema definition for meeting entities
+            """),
+        )
+    )
+    await search_service.index_entity(meeting_schema)
+
+    await create_person_entities(entity_service, search_service)
+
+    response = await client.post(f"{v2_project_url}/schema/validate")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["note_type"] is None
+    assert data["total_entities"] == 3
+    assert data["total_notes"] == 3
+    assert data["valid_count"] == 3
+    assert len(data["results"]) == 3
+
+    summaries = {s["note_type"]: s for s in data["type_summaries"]}
+    assert set(summaries) == {"person", "meeting"}
+    assert summaries["person"]["total_entities"] == 3
+    assert summaries["person"]["total_notes"] == 3
+    assert summaries["person"]["valid_count"] == 3
+    assert summaries["meeting"]["total_entities"] == 0
+    assert summaries["meeting"]["total_notes"] == 0
+
+
+@pytest.mark.asyncio
+async def test_validate_all_types_no_schemas(
+    client: AsyncClient,
+    test_project: Project,
+    v2_project_url: str,
+    entity_service,
+    search_service,
+):
+    """Validate with no params returns an empty report when no schemas are defined."""
+    # Notes exist, but nothing covers them
+    await create_person_entities(entity_service, search_service)
+
+    response = await client.post(f"{v2_project_url}/schema/validate")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["note_type"] is None
+    assert data["total_notes"] == 0
+    assert data["total_entities"] == 0
+    assert data["results"] == []
+    assert data["type_summaries"] == []
+
+
+@pytest.mark.asyncio
+async def test_validate_all_types_normalizes_target_type(
+    client: AsyncClient,
+    test_project: Project,
+    v2_project_url: str,
+    entity_service,
+    search_service,
+):
+    """Schema declaring entity 'Person' still covers snake_case 'person' notes."""
+    schema_entity, _ = await entity_service.create_or_update_entity(
+        EntitySchema(
+            title="Person Schema",
+            directory="schemas",
+            note_type="schema",
+            entity_metadata={
+                "entity": "Person",
+                "schema": {"name": "string", "role": "string"},
+            },
+            content=dedent("""\
+                ## Observations
+                - [note] Schema with capitalized target type
+            """),
+        )
+    )
+    await search_service.index_entity(schema_entity)
+
+    await create_person_entities(entity_service, search_service)
+
+    response = await client.post(f"{v2_project_url}/schema/validate")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total_entities"] == 3
+    assert data["total_notes"] == 3
+
+    summaries = {s["note_type"]: s for s in data["type_summaries"]}
+    # The summary carries the type label as the schema author wrote it
+    assert set(summaries) == {"Person"}
+    assert summaries["Person"]["total_entities"] == 3
+    assert summaries["Person"]["valid_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_validate_all_types_discovers_inline_schema(
+    client: AsyncClient,
+    test_project: Project,
+    v2_project_url: str,
+    entity_service,
+    search_service,
+):
+    """No-argument validation includes types covered only by inline schemas."""
+    entity, _ = await entity_service.create_or_update_entity(
+        EntitySchema(
+            title="Inline Task",
+            directory="tasks",
+            note_type="task",
+            entity_metadata={"schema": {"status": "string"}},
+            content=dedent("""\
+                ## Observations
+                - [status] active
+            """),
+        )
+    )
+    await search_service.index_entity(entity)
+
+    response = await client.post(f"{v2_project_url}/schema/validate")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total_entities"] == 1
+    assert data["total_notes"] == 1
+    assert data["valid_count"] == 1
+    assert data["type_summaries"] == [
+        {
+            "note_type": "task",
+            "total_notes": 1,
+            "total_entities": 1,
+            "valid_count": 1,
+            "warning_count": 0,
+            "error_count": 0,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_validate_all_types_discovers_cross_type_explicit_schema_reference(
+    client: AsyncClient,
+    test_project: Project,
+    v2_project_url: str,
+    entity_service,
+    search_service,
+):
+    """Explicit schema references cover a type even when entity targets differ."""
+    schema_entity, _ = await entity_service.create_or_update_entity(
+        EntitySchema(
+            title="Reusable Work Schema",
+            directory="schemas",
+            note_type="schema",
+            entity_metadata={
+                "entity": "work_item",
+                "schema": {"status": "string"},
+            },
+            content=dedent("""\
+                ## Observations
+                - [note] Shared schema for work records
+            """),
+        )
+    )
+    await search_service.index_entity(schema_entity)
+
+    task_entity, _ = await entity_service.create_or_update_entity(
+        EntitySchema(
+            title="Referenced Task",
+            directory="tasks",
+            note_type="task",
+            entity_metadata={"schema": "reusable-work-schema"},
+            content=dedent("""\
+                ## Observations
+                - [status] active
+            """),
+        )
+    )
+    await search_service.index_entity(task_entity)
+
+    response = await client.post(f"{v2_project_url}/schema/validate")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total_entities"] == 1
+    assert data["total_notes"] == 1
+    assert data["valid_count"] == 1
+
+    summaries = {summary["note_type"]: summary for summary in data["type_summaries"]}
+    assert set(summaries) == {"task", "work_item"}
+    assert summaries["task"]["total_entities"] == 1
+    assert summaries["task"]["valid_count"] == 1
+    assert summaries["work_item"]["total_entities"] == 0
 
 
 # --- Frontmatter Validation Tests ---
@@ -626,6 +947,36 @@ async def test_diff_with_schema_note(
     assert isinstance(data["new_fields"], list)
     assert isinstance(data["dropped_fields"], list)
     assert isinstance(data["cardinality_changes"], list)
+
+
+@pytest.mark.asyncio
+async def test_diff_invalid_mode_returns_client_error(
+    client: AsyncClient,
+    test_project: Project,
+    v2_project_url: str,
+    entity_service,
+    search_service,
+):
+    """Invalid file-backed schema modes return their actionable parser error."""
+    schema_entity, _ = await entity_service.create_or_update_entity(
+        EntitySchema(
+            title="Invalid Diff Schema",
+            directory="schemas",
+            note_type="schema",
+            entity_metadata={
+                "entity": "invalid_diff",
+                "schema": {"name": "string"},
+                "settings": {"validation": "banana"},
+            },
+            content="## Observations\n- [note] Invalid mode fixture\n",
+        )
+    )
+    await search_service.index_entity(schema_entity)
+
+    response = await client.get(f"{v2_project_url}/schema/diff/invalid_diff")
+
+    assert response.status_code == 400
+    assert "Invalid settings.validation value 'banana'" in response.json()["detail"]
 
 
 # --- File-based schema frontmatter tests ---

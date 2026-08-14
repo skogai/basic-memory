@@ -8,8 +8,11 @@ from typing import Any
 from httpx import AsyncClient
 
 import logfire
-from basic_memory.mcp.tools.utils import call_post
-from basic_memory.schemas.search import SearchResponse
+
+# call_* helpers live in basic_memory.mcp.tools.utils; importing that at module
+# level executes the whole tools package (fastmcp + mcp SDK) during CLI startup,
+# so each method defers the import to call time instead (#886).
+from basic_memory.schemas.search import SearchResponse, SearchRetrievalMode
 
 
 class SearchClient:
@@ -57,6 +60,8 @@ class SearchClient:
         Raises:
             ToolError: If the request fails
         """
+        from basic_memory.mcp.tools.utils import call_query
+
         with logfire.span(
             "mcp.client.search.search",
             client_name="search",
@@ -64,7 +69,7 @@ class SearchClient:
             page=page,
             page_size=page_size,
         ):
-            response = await call_post(
+            response = await call_query(
                 self.http_client,
                 f"{self._base_path}/",
                 json=query,
@@ -73,4 +78,13 @@ class SearchClient:
                 operation="search",
                 path_template="/v2/projects/{project_id}/search/",
             )
-        return SearchResponse.model_validate(response.json())
+        payload = response.json()
+
+        # Trigger: an older API server omits the exactness field.
+        # Why: the request mode still identifies whether that server used an exact count.
+        # Outcome: legacy semantic responses stay unknown instead of becoming exact zeroes.
+        if "total_is_exact" not in payload:
+            retrieval_mode = query.get("retrieval_mode", SearchRetrievalMode.FTS)
+            payload["total_is_exact"] = retrieval_mode == SearchRetrievalMode.FTS
+
+        return SearchResponse.model_validate(payload)

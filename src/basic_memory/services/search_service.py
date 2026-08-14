@@ -3,66 +3,38 @@
 import asyncio
 import ast
 import re
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import List, Optional, Set, Dict, Any
+from typing import Any, List, Optional, Set, Dict
 
 from dateparser import parse
 from fastapi import BackgroundTasks
 from loguru import logger
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import logfire
 
+from basic_memory import db
 from basic_memory.models import Entity
 from basic_memory.repository import EntityRepository
 from basic_memory.repository.search_repository import (
     SearchIndexRow,
     SearchRepository,
+)
+from basic_memory.repository.search_query import relaxed_query_words
+from basic_memory.schemas.base import normalize_note_type
+from basic_memory.schemas.search import SearchQuery, SearchItemType, SearchRetrievalMode
+from basic_memory.runtime.vector_sync import (
+    VECTOR_SYNC_SAMPLE_ERROR_LIMIT,
     VectorSyncBatchResult,
 )
-from basic_memory.schemas.search import SearchQuery, SearchItemType, SearchRetrievalMode
 from basic_memory.services import FileService
 
 # Maximum size for content_stems field to stay under Postgres's 8KB index row limit.
 # We use 6000 characters to leave headroom for other indexed columns and overhead.
 MAX_CONTENT_STEMS_SIZE = 6000
-
-# Common glue words used to relax natural-language FTS queries after strict misses.
-FTS_RELAXED_STOPWORDS = {
-    "a",
-    "an",
-    "and",
-    "are",
-    "as",
-    "at",
-    "be",
-    "by",
-    "for",
-    "from",
-    "how",
-    "in",
-    "is",
-    "it",
-    "of",
-    "on",
-    "or",
-    "our",
-    "the",
-    "their",
-    "this",
-    "to",
-    "was",
-    "we",
-    "what",
-    "when",
-    "where",
-    "who",
-    "why",
-    "with",
-    "you",
-    "your",
-}
 
 
 @dataclass(frozen=True)
@@ -75,6 +47,7 @@ class _PreparedSearchQuery:
     title: str | None
     note_types: list[str] | None
     search_item_types: list[SearchItemType] | None
+    categories: list[str] | None
     after_date: datetime | None
     metadata_filters: dict[str, Any] | None
     retrieval_mode: SearchRetrievalMode
@@ -88,17 +61,6 @@ def _strip_nul(value: str) -> str:
     can pad files with \\x00 bytes. See: rclone/rclone#6801
     """
     return value.replace("\x00", "")
-
-
-def _mtime_to_datetime(entity: Entity) -> datetime:
-    """Convert entity mtime (file modification time) to datetime.
-
-    Returns the file's actual modification time, falling back to updated_at
-    if mtime is not available.
-    """
-    if entity.mtime:
-        return datetime.fromtimestamp(entity.mtime).astimezone()
-    return entity.updated_at
 
 
 class SearchService:
@@ -115,10 +77,12 @@ class SearchService:
         search_repository: SearchRepository,
         entity_repository: EntityRepository,
         file_service: FileService,
+        session_maker: async_sessionmaker[AsyncSession],
     ):
         self.repository = search_repository
         self.entity_repository = entity_repository
         self.file_service = file_service
+        self.session_maker = session_maker
 
     async def init_search_index(self):
         """Create FTS5 virtual table if it doesn't exist."""
@@ -126,28 +90,19 @@ class SearchService:
 
     async def reindex_all(self, background_tasks: Optional[BackgroundTasks] = None) -> None:
         """Reindex all content from database."""
-        from basic_memory.repository.sqlite_search_repository import SQLiteSearchRepository
-
         logger.info("Starting full reindex")
-        # Clear and recreate search index
+        # Trigger: a full search rebuild removes every derived row.
+        # Why: vector storage may live outside SQL, so cleanup must cross the
+        # repository boundary before the full-text table is recreated.
+        # Outcome: built-in and extension indexes follow the same lifecycle.
+        await self.repository.delete_project_vector_rows()
         await self.repository.execute_query(text("DROP TABLE IF EXISTS search_index"), params={})
-        if isinstance(self.repository, SQLiteSearchRepository):
-            await self.repository.drop_vector_tables()
-        else:
-            await self.repository.execute_query(
-                text("DROP TABLE IF EXISTS search_vector_embeddings"), params={}
-            )
-            await self.repository.execute_query(
-                text("DROP TABLE IF EXISTS search_vector_chunks"), params={}
-            )
-            await self.repository.execute_query(
-                text("DROP TABLE IF EXISTS search_vector_index"), params={}
-            )
         await self.init_search_index()
 
         # Reindex all entities
         logger.debug("Indexing entities")
-        entities = await self.entity_repository.find_all()
+        async with db.scoped_session(self.session_maker) as session:
+            entities = await self.entity_repository.find_all(session)
         for entity in entities:
             await self.index_entity(entity, background_tasks)
 
@@ -192,8 +147,13 @@ class SearchService:
             permalink=query.permalink,
             permalink_match=query.permalink_match,
             title=query.title,
-            note_types=query.note_types,
+            note_types=(
+                [normalize_note_type(note_type) for note_type in query.note_types]
+                if query.note_types
+                else None
+            ),
             search_item_types=query.entity_types,
+            categories=query.categories,
             after_date=after_date,
             metadata_filters=metadata_filters,
             retrieval_mode=query.retrieval_mode or SearchRetrievalMode.FTS,
@@ -207,6 +167,7 @@ class SearchService:
             or prepared.title
             or prepared.note_types
             or prepared.search_item_types
+            or prepared.categories
             or prepared.after_date
             or prepared.metadata_filters
         )
@@ -221,8 +182,38 @@ class SearchService:
             prepared.metadata_filters
             or prepared.note_types
             or prepared.search_item_types
+            or prepared.categories
             or prepared.after_date
         )
+
+    async def _include_legacy_note_type_spellings(
+        self,
+        prepared: _PreparedSearchQuery,
+        *,
+        session: AsyncSession | None = None,
+    ) -> _PreparedSearchQuery:
+        """Expand canonical note-type filters to exact legacy entity spellings."""
+        if not prepared.note_types:
+            return prepared
+
+        canonical_note_types = set(prepared.note_types)
+        async with db.scoped_session(self.session_maker, session) as active_session:
+            stored_types_query = self.entity_repository.select(Entity.note_type).distinct()
+            stored_types_result = await self.entity_repository.execute_query(
+                active_session,
+                stored_types_query,
+                use_query_options=False,
+            )
+
+        # Search rows written before canonicalization preserve the owning entity's
+        # exact type spelling. Include those spellings alongside canonical values
+        # so an upgrade remains searchable without requiring an eager full reindex.
+        compatible_note_types = canonical_note_types | {
+            stored_type
+            for stored_type in stored_types_result.scalars().all()
+            if stored_type and normalize_note_type(stored_type) in canonical_note_types
+        }
+        return replace(prepared, note_types=sorted(compatible_note_types))
 
     async def _search_repository(
         self,
@@ -231,6 +222,8 @@ class SearchService:
         search_text: str | None,
         limit: int,
         offset: int,
+        allow_relaxed: bool = False,
+        session: AsyncSession | None = None,
     ) -> List[SearchIndexRow]:
         return await self.repository.search(
             search_text=search_text,
@@ -239,12 +232,15 @@ class SearchService:
             title=prepared.title,
             note_types=prepared.note_types,
             search_item_types=prepared.search_item_types,
+            categories=prepared.categories,
             after_date=prepared.after_date,
             metadata_filters=prepared.metadata_filters,
             retrieval_mode=prepared.retrieval_mode,
             min_similarity=prepared.min_similarity,
             limit=limit,
             offset=offset,
+            allow_relaxed=allow_relaxed,
+            session=session,
         )
 
     async def _count_repository(
@@ -252,6 +248,7 @@ class SearchService:
         prepared: _PreparedSearchQuery,
         *,
         search_text: str | None,
+        allow_relaxed: bool = False,
     ) -> int:
         return await self.repository.count(
             search_text=search_text,
@@ -260,13 +257,21 @@ class SearchService:
             title=prepared.title,
             note_types=prepared.note_types,
             search_item_types=prepared.search_item_types,
+            categories=prepared.categories,
             after_date=prepared.after_date,
             metadata_filters=prepared.metadata_filters,
             retrieval_mode=prepared.retrieval_mode,
             min_similarity=prepared.min_similarity,
+            allow_relaxed=allow_relaxed,
         )
 
-    async def search(self, query: SearchQuery, limit=10, offset=0) -> List[SearchIndexRow]:
+    async def search(
+        self,
+        query: SearchQuery,
+        limit=10,
+        offset=0,
+        session: AsyncSession | None = None,
+    ) -> List[SearchIndexRow]:
         """Search across all indexed content.
 
         Supports three modes:
@@ -277,6 +282,10 @@ class SearchService:
         prepared = self._prepare_query(query)
         if prepared is None:
             return []
+        prepared = await self._include_legacy_note_type_spellings(
+            prepared,
+            session=session,
+        )
 
         strict_search_text = prepared.search_text
         has_query = bool(
@@ -293,51 +302,30 @@ class SearchService:
             offset=offset,
         ):
             logger.trace(f"Searching with query: {query}")
+            # Repository backends own relaxed FTS rendering because SQLite and
+            # Postgres use different prefix syntax. Passing a service-built
+            # boolean OR string would be treated as explicit boolean input and
+            # lose the prefix matching that rescues compound CJK tokens.
+            allow_relaxed = self._is_relaxed_fts_fallback_eligible(
+                query, strict_search_text, prepared.retrieval_mode
+            )
             results = await self._search_repository(
                 prepared,
                 search_text=strict_search_text,
                 limit=limit,
                 offset=offset,
+                allow_relaxed=allow_relaxed,
+                session=session,
             )
 
-        # Trigger: strict FTS with plain multi-term text returned no results.
-        # Why: natural-language queries often include stopwords that over-constrain implicit AND.
-        # Outcome: retry once with relaxed OR terms while preserving explicit boolean intent.
-        if results:
-            return results
-        if not self._is_relaxed_fts_fallback_eligible(
-            query, strict_search_text, prepared.retrieval_mode
-        ):
-            return results
-
-        assert strict_search_text is not None
-        relaxed_search_text = self._build_relaxed_fts_query(strict_search_text)
-        if relaxed_search_text == strict_search_text:
-            return results
-
-        logger.debug(
-            "Strict FTS returned 0 results; retrying relaxed FTS query "
-            f"strict='{strict_search_text}' relaxed='{relaxed_search_text}'"
-        )
-        with logfire.span(
-            "search.relaxed_fts_retry",
-            retrieval_mode=prepared.retrieval_mode.value,
-            token_count=len(self._tokenize_fts_text(strict_search_text)),
-            limit=limit,
-            offset=offset,
-        ):
-            return await self._search_repository(
-                prepared,
-                search_text=relaxed_search_text,
-                limit=limit,
-                offset=offset,
-            )
+        return results
 
     async def count(self, query: SearchQuery) -> int:
         """Count all indexed rows matching a query."""
         prepared = self._prepare_query(query)
         if prepared is None:
             return 0
+        prepared = await self._include_legacy_note_type_spellings(prepared)
 
         strict_search_text = prepared.search_text
         has_query = bool(
@@ -351,50 +339,14 @@ class SearchService:
             has_query=has_query,
             has_filters=has_filters,
         ):
-            total = await self._count_repository(prepared, search_text=strict_search_text)
-
-        if total > 0:
-            return total
-        if not self._is_relaxed_fts_fallback_eligible(
-            query, strict_search_text, prepared.retrieval_mode
-        ):
-            return total
-
-        assert strict_search_text is not None
-        relaxed_search_text = self._build_relaxed_fts_query(strict_search_text)
-        if relaxed_search_text == strict_search_text:
-            return total
-
-        with logfire.span(
-            "search.count.relaxed_fts_retry",
-            retrieval_mode=prepared.retrieval_mode.value,
-            token_count=len(self._tokenize_fts_text(strict_search_text)),
-        ):
-            return await self._count_repository(prepared, search_text=relaxed_search_text)
-
-    @staticmethod
-    def _tokenize_fts_text(search_text: str) -> list[str]:
-        """Tokenize text into alphanumeric terms for relaxed FTS fallback."""
-        return re.findall(r"[A-Za-z0-9]+", search_text.lower())
-
-    @classmethod
-    def _build_relaxed_fts_query(cls, search_text: str) -> str:
-        """Build a less strict OR query from natural-language input."""
-        normalized_terms = cls._tokenize_fts_text(search_text)
-        if not normalized_terms:
-            return search_text
-
-        deduped_terms: list[str] = []
-        seen_terms: set[str] = set()
-        for term in normalized_terms:
-            if term in seen_terms:
-                continue
-            seen_terms.add(term)
-            deduped_terms.append(term)
-
-        pruned_terms = [term for term in deduped_terms if term not in FTS_RELAXED_STOPWORDS]
-        relaxed_terms = pruned_terms or deduped_terms
-        return " OR ".join(relaxed_terms)
+            allow_relaxed = self._is_relaxed_fts_fallback_eligible(
+                query, strict_search_text, prepared.retrieval_mode
+            )
+            return await self._count_repository(
+                prepared,
+                search_text=strict_search_text,
+                allow_relaxed=allow_relaxed,
+            )
 
     @classmethod
     def _is_relaxed_fts_fallback_eligible(
@@ -412,18 +364,12 @@ class SearchService:
             return False
         if query.has_boolean_operators():
             return False
-        tokens = cls._tokenize_fts_text(search_text)
-        # Trigger: query has only one or two terms (e.g., link titles like "New Feature").
-        # Why: OR-relaxing short queries can over-broaden and produce false positives.
-        # Outcome: require at least three tokens before enabling relaxed fallback.
-        if len(tokens) < 3:
-            return False
-        # Trigger: query contains explicit numeric identifiers (e.g., "root note 1").
-        # Why: OR-relaxing identifier-like queries can over-broaden and create false positives.
-        # Outcome: preserve strict matching for these targeted queries.
-        if any(token.isdigit() for token in tokens):
-            return False
-        return True
+        # Trigger: query has too few safe relaxed terms, explicit numeric identifiers,
+        # or only terms that would over-broaden under OR.
+        # Why: the shared helper preserves the old English guard while allowing
+        # whitespace-separated CJK terms that ASCII tokenization cannot see.
+        # Outcome: retry only when there is a backend-safe relaxed OR query.
+        return relaxed_query_words(search_text) is not None
 
     @staticmethod
     def _generate_variants(text: str) -> Set[str]:
@@ -494,6 +440,26 @@ class SearchService:
         else:
             await self.index_entity_data(entity, content)
 
+    async def index_entities(
+        self,
+        entities: Sequence[Entity],
+        *,
+        content_by_entity_id: Mapping[int, str],
+    ) -> None:
+        """Refresh a group of entity search rows through one batch entry point.
+
+        Index writes stay sequential because local SQLite connections cannot
+        safely run these mutations concurrently. Callers still avoid reopening
+        repository sessions and dispatching one indexing API call per entity.
+        Accepted content bypasses the disk read while its Markdown projection
+        remains pending.
+        """
+        for entity in entities:
+            await self.index_entity_data(
+                entity,
+                content=content_by_entity_id.get(entity.id),
+            )
+
     async def index_entity_data(
         self,
         entity: Entity,
@@ -505,10 +471,17 @@ class SearchService:
         )
         try:
             with logfire.span("search.index_entity_data", entity_id=entity.id):
+                replacement_content = content
+                if entity.is_markdown and replacement_content is None:
+                    # Trigger: synchronized and legacy notes source search text from storage.
+                    # Why: a transient read failure must preserve the last valid projection.
+                    # Outcome: storage errors remain visible before any search rows are deleted.
+                    replacement_content = await self.file_service.read_entity_content(entity)
+
                 await self.repository.delete_by_entity_id(entity_id=entity.id)
 
                 if entity.is_markdown:
-                    await self.index_entity_markdown(entity, content)
+                    await self.index_entity_markdown(entity, replacement_content)
                 else:
                     await self.index_entity_file(entity)
 
@@ -527,7 +500,8 @@ class SearchService:
 
     async def sync_entity_vectors(self, entity_id: int) -> None:
         """Refresh vector chunks for one entity in repositories that support semantic indexing."""
-        entity = await self.entity_repository.find_by_id(entity_id)
+        async with db.scoped_session(self.session_maker) as session:
+            entity = await self.entity_repository.find_by_id(session, entity_id)
         if entity is None:
             await self._clear_entity_vectors(entity_id)
             return
@@ -545,15 +519,13 @@ class SearchService:
     ) -> VectorSyncBatchResult:
         """Refresh vector chunks for a batch of entities."""
         if not entity_ids:
-            return VectorSyncBatchResult(
-                entities_total=0,
-                entities_synced=0,
-                entities_failed=0,
-            )
+            return await self.repository.sync_entity_vectors_batch([])
 
-        entities_by_id = {
-            entity.id: entity for entity in await self.entity_repository.find_by_ids(entity_ids)
-        }
+        async with db.scoped_session(self.session_maker) as session:
+            entities_by_id = {
+                entity.id: entity
+                for entity in await self.entity_repository.find_by_ids(session, entity_ids)
+            }
         unknown_ids = [entity_id for entity_id in entity_ids if entity_id not in entities_by_id]
         opted_out_ids = [
             entity_id
@@ -577,30 +549,18 @@ class SearchService:
         cleanup_task = (
             self.repository.sync_entity_vectors_batch(unknown_ids) if unknown_ids else None
         )
-        eligible_task = (
-            self.repository.sync_entity_vectors_batch(
-                eligible_entity_ids,
-                progress_callback=progress_callback,
-            )
-            if eligible_entity_ids
-            else None
+        eligible_task = self.repository.sync_entity_vectors_batch(
+            eligible_entity_ids,
+            progress_callback=progress_callback,
         )
         repository_results = [
             result
             for result in await asyncio.gather(
                 cleanup_task if cleanup_task is not None else asyncio.sleep(0, result=None),
-                eligible_task if eligible_task is not None else asyncio.sleep(0, result=None),
+                eligible_task,
             )
             if result is not None
         ]
-
-        if not repository_results:
-            return VectorSyncBatchResult(
-                entities_total=len(entity_ids),
-                entities_synced=0,
-                entities_failed=0,
-                entities_skipped=len(opted_out_ids),
-            )
 
         batch_result = VectorSyncBatchResult(
             entities_total=len(entity_ids),
@@ -612,11 +572,30 @@ class SearchService:
                 + sum(result.entities_skipped for result in repository_results)
                 - len(unknown_ids)
             ),
-            failed_entity_ids=[
+            failed_entity_ids=tuple(
                 failed_entity_id
                 for result in repository_results
                 for failed_entity_id in result.failed_entity_ids
-            ],
+            ),
+            sample_errors=tuple(
+                dict.fromkeys(
+                    error
+                    for result in repository_results
+                    for error in result.sample_errors
+                )
+            )[:VECTOR_SYNC_SAMPLE_ERROR_LIMIT],
+            vector_index=next(
+                (result.vector_index for result in repository_results if result.vector_index),
+                "",
+            ),
+            embedding_model=next(
+                (
+                    result.embedding_model
+                    for result in repository_results
+                    if result.embedding_model
+                ),
+                "",
+            ),
             chunks_total=sum(result.chunks_total for result in repository_results),
             chunks_skipped=sum(result.chunks_skipped for result in repository_results),
             embedding_jobs_total=sum(result.embedding_jobs_total for result in repository_results),
@@ -631,7 +610,9 @@ class SearchService:
         )
         return batch_result
 
-    async def reindex_vectors(self, progress_callback=None, force_full: bool = False) -> dict:
+    async def reindex_vectors(
+        self, progress_callback=None, force_full: bool = False
+    ) -> dict[str, Any]:
         """Rebuild vector embeddings for all entities.
 
         Args:
@@ -641,9 +622,10 @@ class SearchService:
                 eligible entity re-embeds from scratch.
 
         Returns:
-            dict with stats: total_entities, embedded, skipped, errors
+            dict with counts, sampled errors, and the active vector index/model identity
         """
-        entities = await self.entity_repository.find_all()
+        async with db.scoped_session(self.session_maker) as session:
+            entities = await self.entity_repository.find_all(session)
         entity_ids = [entity.id for entity in entities]
 
         # Clean up stale rows in search_index and search_vector_chunks
@@ -656,11 +638,15 @@ class SearchService:
             entity_ids,
             progress_callback=progress_callback,
         )
+        await self.repository.reconcile_vector_index()
         stats = {
             "total_entities": batch_result.entities_total,
             "embedded": batch_result.entities_synced,
             "skipped": batch_result.entities_skipped,
             "errors": batch_result.entities_failed,
+            "sample_errors": batch_result.sample_errors,
+            "vector_index": batch_result.vector_index,
+            "embedding_model": batch_result.embedding_model,
         }
 
         for failed_entity_id in batch_result.failed_entity_ids:
@@ -677,60 +663,16 @@ class SearchService:
         we need to clear the derived vector state first to force fresh embeddings.
         Outcome: the next batch sync recreates every eligible entity's vectors.
         """
-        from basic_memory.repository.sqlite_search_repository import SQLiteSearchRepository
-
         project_id = self.repository.project_id
-        params = {"project_id": project_id}
-
-        # Constraint: sqlite-vec stores embeddings in a separate rowid table with
-        # no cascade delete, so embeddings must be removed before chunk rows.
-        if isinstance(self.repository, SQLiteSearchRepository):
-            await self.repository.delete_project_vector_rows()
-        else:
-            await self.repository.execute_query(
-                text("DELETE FROM search_vector_chunks WHERE project_id = :project_id"),
-                params,
-            )
+        await self.repository.delete_project_vector_rows()
         logger.info("Cleared project vectors for full reindex", project_id=project_id)
 
     async def _purge_stale_search_rows(self) -> None:
-        """Remove rows from search_index and search_vector_chunks for deleted entities.
-
-        Trigger: entities are deleted but their derived search rows remain
-        Why: stale rows inflate embedding coverage stats in project info
-        Outcome: search tables only contain rows for entities that still exist
-        """
-        from basic_memory.repository.sqlite_search_repository import SQLiteSearchRepository
-        from sqlalchemy import text
-
-        project_id = self.repository.project_id
-        stale_entity_filter = (
-            "entity_id NOT IN (SELECT id FROM entity WHERE project_id = :project_id)"
+        purged = await self.repository.purge_stale_search_rows()
+        await self.repository.delete_stale_vector_rows()
+        logger.info(
+            "Purged stale search rows", project_id=self.repository.project_id, purged=purged
         )
-        params = {"project_id": project_id}
-
-        # Delete stale search_index rows
-        await self.repository.execute_query(
-            text(
-                f"DELETE FROM search_index WHERE project_id = :project_id AND {stale_entity_filter}"
-            ),
-            params,
-        )
-
-        # SQLite vec has no CASCADE — must delete embeddings before chunks
-        if isinstance(self.repository, SQLiteSearchRepository):
-            await self.repository.delete_stale_vector_rows()
-        else:
-            # Postgres CASCADE handles embedding deletion automatically
-            await self.repository.execute_query(
-                text(
-                    f"DELETE FROM search_vector_chunks "
-                    f"WHERE project_id = :project_id AND {stale_entity_filter}"
-                ),
-                params,
-            )
-
-        logger.info("Purged stale search rows for deleted entities", project_id=project_id)
 
     @staticmethod
     def _entity_embeddings_enabled(entity: Entity) -> bool:
@@ -785,10 +727,10 @@ class SearchService:
                 permalink=entity.permalink,  # Required for Postgres NOT NULL constraint
                 file_path=entity.file_path,
                 metadata={
-                    "note_type": entity.note_type,
+                    "note_type": normalize_note_type(entity.note_type),
                 },
                 created_at=entity.created_at,
-                updated_at=_mtime_to_datetime(entity),
+                updated_at=entity.updated_at,
                 project_id=entity.project_id,
             )
         )
@@ -867,10 +809,10 @@ class SearchService:
                     file_path=entity.file_path,
                     entity_id=entity.id,
                     metadata={
-                        "note_type": entity.note_type,
+                        "note_type": normalize_note_type(entity.note_type),
                     },
                     created_at=entity.created_at,
-                    updated_at=_mtime_to_datetime(entity),
+                    updated_at=entity.updated_at,
                     project_id=entity.project_id,
                 )
             )
@@ -905,7 +847,7 @@ class SearchService:
                             "tags": obs.tags,
                         },
                         created_at=entity.created_at,
-                        updated_at=_mtime_to_datetime(entity),
+                        updated_at=entity.updated_at,
                         project_id=entity.project_id,
                     )
                 )
@@ -933,7 +875,7 @@ class SearchService:
                         to_id=rel.to_id,
                         relation_type=rel.relation_type,
                         created_at=entity.created_at,
-                        updated_at=_mtime_to_datetime(entity),
+                        updated_at=entity.updated_at,
                         project_id=entity.project_id,
                     )
                 )

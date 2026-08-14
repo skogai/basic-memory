@@ -1,9 +1,9 @@
 from textwrap import dedent
-from typing import Annotated, Optional, Literal
+from typing import Any, Annotated, Optional, Literal
 
 from loguru import logger
 from fastmcp import Context
-from mcp.server.fastmcp.exceptions import ToolError
+from fastmcp.exceptions import ToolError
 from pydantic import AliasChoices, Field
 
 from basic_memory.config import ConfigManager
@@ -182,8 +182,15 @@ def _directory_path_for_delete(
 
 
 @mcp.tool(
+    title="Delete Note",
     description="Delete a note or directory by title, permalink, or path",
-    annotations={"destructiveHint": True, "openWorldHint": False},
+    tags={"notes"},
+    annotations={
+        "title": "Delete Note",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "openWorldHint": False,
+    },
 )
 async def delete_note(
     identifier: str,
@@ -195,7 +202,7 @@ async def delete_note(
     project_id: Optional[str] = None,
     output_format: Literal["text", "json"] = "text",
     context: Context | None = None,
-) -> bool | str | dict:
+) -> bool | str | dict[str, Any]:
     """Delete a note or directory from the knowledge base.
 
     Permanently removes a note or directory from the specified project. For single notes,
@@ -295,6 +302,8 @@ async def delete_note(
             identifier,
             active_project.name,
             context,
+            strict_project_routing=True,
+            allow_missing_project_fallback=True,
         )
 
         # Handle directory deletes
@@ -315,14 +324,32 @@ async def delete_note(
                 )
                 result = await knowledge_client.delete_directory(directory_identifier)
                 if output_format == "json":
-                    return {
-                        "deleted": result.failed_deletes == 0,
+                    response = {
+                        "deleted": result.total_files > 0 and result.failed_deletes == 0,
                         "is_directory": True,
                         "identifier": identifier,
                         "total_files": result.total_files,
                         "successful_deletes": result.successful_deletes,
                         "failed_deletes": result.failed_deletes,
+                        "deleted_files": result.deleted_files,
+                        "errors": [error.model_dump() for error in result.errors],
                     }
+                    if result.total_files == 0:
+                        response["error"] = "Directory not found or empty: no files matched"
+                    elif result.failed_deletes > 0:
+                        response["error"] = (
+                            "Directory delete incomplete: "
+                            f"{result.failed_deletes} of {result.total_files} file(s) failed"
+                        )
+                    return response
+
+                if result.total_files == 0:
+                    return f"""# Directory Delete Failed - No Files Found
+
+No files found for directory `{identifier}`.
+Total files: 0.
+
+<!-- Project: {active_project.name} -->"""
 
                 # Build success message for directory delete
                 result_lines = [

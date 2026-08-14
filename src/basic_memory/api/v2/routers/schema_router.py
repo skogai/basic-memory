@@ -11,15 +11,18 @@ Flow: Entity loaded with eager observations/relations -> convert to tuples -> co
 from pathlib import Path as FilePath
 
 import frontmatter
-from fastapi import APIRouter, Path, Query
+from fastapi import APIRouter, HTTPException, Path, Query, status
 from loguru import logger
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from basic_memory.deps import (
     EntityRepositoryV2ExternalDep,
     FileServiceV2ExternalDep,
     LinkResolverV2ExternalDep,
+    SessionDep,
 )
 from basic_memory.models.knowledge import Entity
+from basic_memory.schemas.base import normalize_note_type
 from basic_memory.schemas.schema import (
     ValidationReport,
     InferenceReport,
@@ -28,12 +31,15 @@ from basic_memory.schemas.schema import (
     FieldResultResponse,
     FieldFrequencyResponse,
     DriftFieldResponse,
+    TypeValidationSummary,
 )
-from basic_memory.schema.resolver import resolve_schema
-from basic_memory.schema.validator import validate_note
-from basic_memory.schema.inference import infer_schema, NoteData, ObservationData, RelationData
-from basic_memory.schema.diff import diff_schema
+from basic_memory.picoschema.resolver import SchemaSearchFn, resolve_schema
+from basic_memory.picoschema.parser import SchemaDefinition
+from basic_memory.picoschema.validator import validate_note
+from basic_memory.picoschema.inference import infer_schema, NoteData, ObservationData, RelationData
+from basic_memory.picoschema.diff import diff_schema
 from basic_memory.utils import generate_permalink
+from typing import Any
 
 # Note: No prefix here -- it's added during registration as /v2/{project_id}/schema
 router = APIRouter(tags=["schema"])
@@ -72,7 +78,7 @@ def _entity_to_note_data(entity: Entity) -> NoteData:
     )
 
 
-def _entity_frontmatter(entity: Entity) -> dict:
+def _entity_frontmatter(entity: Entity) -> dict[str, Any]:
     """Build a frontmatter dict from an entity's database metadata.
 
     Used for the notes being validated — their type and schema ref are
@@ -87,7 +93,7 @@ def _entity_frontmatter(entity: Entity) -> dict:
 async def _schema_frontmatter_from_file(
     file_service: FileServiceV2ExternalDep,
     entity: Entity,
-) -> dict:
+) -> dict[str, Any]:
     """Read a schema entity's frontmatter directly from its file.
 
     Schema definitions (field declarations, validation mode) are the source
@@ -126,18 +132,35 @@ async def _schema_frontmatter_from_file(
 # --- Validation ---
 
 
+async def _resolve_schema_for_api(
+    frontmatter: dict[str, Any],
+    search_fn: SchemaSearchFn,
+) -> SchemaDefinition | None:
+    """Resolve a schema and expose authoring errors as client errors."""
+    try:
+        return await resolve_schema(frontmatter, search_fn)
+    except ValueError as exc:
+        # Trigger: user-authored schema frontmatter contains an invalid definition
+        # Why: the configuration error is actionable by the caller, not a server failure
+        # Outcome: API and MCP clients receive the parser's precise message as HTTP 400
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
 @router.post("/schema/validate", response_model=ValidationReport)
 async def validate_schema(
     entity_repository: EntityRepositoryV2ExternalDep,
     file_service: FileServiceV2ExternalDep,
     link_resolver: LinkResolverV2ExternalDep,
+    session: SessionDep,
     project_id: str = Path(..., description="Project external UUID"),
     note_type: str | None = Query(None, description="Note type to validate"),
     identifier: str | None = Query(None, description="Specific note identifier"),
 ):
     """Validate notes against their resolved schemas.
 
-    Validates a specific note (by identifier) or all notes of a given type.
+    Validates a specific note (by identifier), all notes of a given type, or —
+    when neither is provided — all notes of every type that has a schema
+    defined, with a per-type breakdown in type_summaries.
     Returns warnings/errors based on the schema's validation mode.
 
     Schema definitions are read directly from their files to ensure the
@@ -150,22 +173,23 @@ async def validate_schema(
     if identifier:
         # Resolve identifier flexibly (permalink, title, path, fuzzy)
         # to match how read_note and other tools resolve identifiers
-        entity = await link_resolver.resolve_link(identifier)
+        entity = await link_resolver.resolve_link(identifier, session=session)
         if not entity:
             return ValidationReport(note_type=note_type, total_notes=0, total_entities=0)
 
         frontmatter = _entity_frontmatter(entity)
         schema_ref = frontmatter.get("schema")
 
-        async def search_fn(query: str) -> list[dict]:
+        async def search_fn(query: str) -> list[dict[str, Any]]:
             entities = await _find_schema_entities(
+                session,
                 entity_repository,
                 query,
                 allow_reference_match=isinstance(schema_ref, str) and query == schema_ref,
             )
             return [await _schema_frontmatter_from_file(file_service, e) for e in entities]
 
-        schema_def = await resolve_schema(frontmatter, search_fn)
+        schema_def = await _resolve_schema_for_api(frontmatter, search_fn)
         if schema_def:
             result = validate_note(
                 entity.title or entity.permalink or identifier,
@@ -187,40 +211,56 @@ async def validate_schema(
         )
 
     # --- Batch validation by note type ---
-    entities = await _find_by_note_type(entity_repository, note_type) if note_type else []
+    if note_type:
+        canonical_note_type = normalize_note_type(note_type)
+        entities = await _find_by_note_type(session, entity_repository, canonical_note_type)
+        results = await _validate_note_entities(session, entity_repository, file_service, entities)
+        return ValidationReport(
+            note_type=canonical_note_type,
+            total_notes=len(results),
+            total_entities=len(entities),
+            valid_count=sum(1 for r in results if r.passed),
+            warning_count=sum(len(r.warnings) for r in results),
+            error_count=sum(len(r.errors) for r in results),
+            results=results,
+        )
 
-    for entity in entities:
-        frontmatter = _entity_frontmatter(entity)
-        schema_ref = frontmatter.get("schema")
+    # --- All-types validation ---
+    # Trigger: neither identifier nor note_type was provided
+    # Why: schema_validate() with no arguments should check every note type that
+    #   has a schema defined instead of returning an empty report (#1013)
+    # Outcome: aggregated report with a per-type breakdown in type_summaries
+    covered_types = await _schema_covered_note_types(session, entity_repository)
 
-        async def search_fn(query: str) -> list[dict]:
-            entities = await _find_schema_entities(
-                entity_repository,
-                query,
-                allow_reference_match=isinstance(schema_ref, str) and query == schema_ref,
+    type_summaries: list[TypeValidationSummary] = []
+    total_entities = 0
+    for target_type in covered_types:
+        entities = await _find_by_note_type(session, entity_repository, target_type)
+        type_results = await _validate_note_entities(
+            session, entity_repository, file_service, entities
+        )
+        type_summaries.append(
+            TypeValidationSummary(
+                note_type=target_type,
+                total_notes=len(type_results),
+                total_entities=len(entities),
+                valid_count=sum(1 for r in type_results if r.passed),
+                warning_count=sum(len(r.warnings) for r in type_results),
+                error_count=sum(len(r.errors) for r in type_results),
             )
-            return [await _schema_frontmatter_from_file(file_service, e) for e in entities]
+        )
+        results.extend(type_results)
+        total_entities += len(entities)
 
-        schema_def = await resolve_schema(frontmatter, search_fn)
-        if schema_def:
-            result = validate_note(
-                entity.title or entity.permalink or entity.file_path,
-                schema_def,
-                _entity_observations(entity),
-                _entity_relations(entity),
-                frontmatter=frontmatter,
-            )
-            results.append(_to_note_validation_response(result))
-
-    valid = sum(1 for r in results if r.passed)
     return ValidationReport(
-        note_type=note_type,
+        note_type=None,
         total_notes=len(results),
-        total_entities=len(entities),
-        valid_count=valid,
+        total_entities=total_entities,
+        valid_count=sum(1 for r in results if r.passed),
         warning_count=sum(len(r.warnings) for r in results),
         error_count=sum(len(r.errors) for r in results),
         results=results,
+        type_summaries=type_summaries,
     )
 
 
@@ -230,6 +270,7 @@ async def validate_schema(
 @router.post("/schema/infer", response_model=InferenceReport)
 async def infer_schema_endpoint(
     entity_repository: EntityRepositoryV2ExternalDep,
+    session: SessionDep,
     project_id: str = Path(..., description="Project external UUID"),
     note_type: str = Query(..., description="Note type to analyze"),
     threshold: float = Query(0.25, description="Minimum frequency for optional fields"),
@@ -239,10 +280,11 @@ async def infer_schema_endpoint(
     Examines observation categories and relation types across all notes
     of the given type. Returns frequency analysis and suggested Picoschema.
     """
-    entities = await _find_by_note_type(entity_repository, note_type)
+    canonical_note_type = normalize_note_type(note_type)
+    entities = await _find_by_note_type(session, entity_repository, canonical_note_type)
     notes_data = [_entity_to_note_data(entity) for entity in entities]
 
-    result = infer_schema(note_type, notes_data, optional_threshold=threshold)
+    result = infer_schema(canonical_note_type, notes_data, optional_threshold=threshold)
 
     return InferenceReport(
         note_type=result.note_type,
@@ -274,6 +316,7 @@ async def infer_schema_endpoint(
 async def diff_schema_endpoint(
     entity_repository: EntityRepositoryV2ExternalDep,
     file_service: FileServiceV2ExternalDep,
+    session: SessionDep,
     note_type: str = Path(..., description="Note type to check for drift"),
     project_id: str = Path(..., description="Project external UUID"),
 ):
@@ -284,19 +327,20 @@ async def diff_schema_endpoint(
     fields, and cardinality changes.
     """
 
-    async def search_fn(query: str) -> list[dict]:
-        entities = await _find_schema_entities(entity_repository, query)
+    async def search_fn(query: str) -> list[dict[str, Any]]:
+        entities = await _find_schema_entities(session, entity_repository, query)
         return [await _schema_frontmatter_from_file(file_service, e) for e in entities]
 
     # Resolve schema by note type
-    schema_frontmatter = {"type": note_type}
-    schema_def = await resolve_schema(schema_frontmatter, search_fn)
+    canonical_note_type = normalize_note_type(note_type)
+    schema_frontmatter = {"type": canonical_note_type}
+    schema_def = await _resolve_schema_for_api(schema_frontmatter, search_fn)
 
     if not schema_def:
-        return DriftReport(note_type=note_type, schema_found=False)
+        return DriftReport(note_type=canonical_note_type, schema_found=False)
 
     # Collect all notes of this type
-    entities = await _find_by_note_type(entity_repository, note_type)
+    entities = await _find_by_note_type(session, entity_repository, canonical_note_type)
     notes_data = [_entity_to_note_data(entity) for entity in entities]
 
     result = diff_schema(schema_def, notes_data)
@@ -330,17 +374,131 @@ async def diff_schema_endpoint(
 # --- Helpers ---
 
 
+async def _validate_note_entities(
+    session: AsyncSession,
+    entity_repository: EntityRepositoryV2ExternalDep,
+    file_service: FileServiceV2ExternalDep,
+    entities: list[Entity],
+) -> list[NoteValidationResponse]:
+    """Validate a batch of note entities against their resolved schemas.
+
+    Entities whose frontmatter resolves to no schema are skipped, which is why
+    a report's total_notes can be lower than its total_entities.
+    """
+    results: list[NoteValidationResponse] = []
+
+    for entity in entities:
+        frontmatter = _entity_frontmatter(entity)
+        schema_ref = frontmatter.get("schema")
+
+        async def search_fn(query: str) -> list[dict[str, Any]]:
+            found = await _find_schema_entities(
+                session,
+                entity_repository,
+                query,
+                allow_reference_match=isinstance(schema_ref, str) and query == schema_ref,
+            )
+            return [await _schema_frontmatter_from_file(file_service, e) for e in found]
+
+        schema_def = await _resolve_schema_for_api(frontmatter, search_fn)
+        if schema_def:
+            result = validate_note(
+                entity.title or entity.permalink or entity.file_path,
+                schema_def,
+                _entity_observations(entity),
+                _entity_relations(entity),
+                frontmatter=frontmatter,
+            )
+            results.append(_to_note_validation_response(result))
+
+    return results
+
+
+async def _schema_covered_note_types(
+    session: AsyncSession,
+    entity_repository: EntityRepositoryV2ExternalDep,
+) -> dict[str, list[str]]:
+    """Map each schema-covered target type to the stored note_type values it covers.
+
+    Coverage comes from both standalone schema notes and notes that carry inline
+    schemas or explicit schema references. Schema authors and legacy database rows
+    may use different spellings, so both sides use the same note-type canonicalizer
+    as the write boundary. Standalone targets with no matching notes map to an empty
+    list so they still appear in the report.
+    """
+    schema_query = entity_repository.select().where(Entity.note_type == "schema")
+    schema_result = await entity_repository.execute_query(session, schema_query)
+
+    # normalized target -> (display label, stored note types); first label wins
+    targets: dict[str, tuple[str, set[str]]] = {}
+    for schema_entity in schema_result.scalars().all():
+        target = (schema_entity.entity_metadata or {}).get("entity")
+        if isinstance(target, str) and target:
+            targets.setdefault(normalize_note_type(target), (target, set()))
+
+    # Column-only select: skip eager-load options, which apply only to full entities.
+    # Reading metadata here also discovers inline schemas and explicit references;
+    # those notes are covered even when their type differs from a schema's entity.
+    note_query = entity_repository.select(Entity.note_type, Entity.entity_metadata).where(
+        Entity.note_type != "schema"
+    )
+    note_result = await entity_repository.execute_query(
+        session, note_query, use_query_options=False
+    )
+    for stored_type, metadata in note_result.all():
+        if not stored_type:
+            continue
+
+        normalized_type = normalize_note_type(stored_type)
+        if normalized_type in targets:
+            targets[normalized_type][1].add(stored_type)
+
+        schema_value = (metadata or {}).get("schema")
+        has_direct_schema = isinstance(schema_value, dict) or (
+            isinstance(schema_value, str) and bool(schema_value)
+        )
+        if has_direct_schema:
+            _, stored_types = targets.setdefault(normalized_type, (stored_type, set()))
+            stored_types.add(stored_type)
+
+    return {
+        display_label: sorted(stored_types)
+        for _, (display_label, stored_types) in sorted(targets.items())
+    }
+
+
 async def _find_by_note_type(
+    session: AsyncSession,
     entity_repository: EntityRepositoryV2ExternalDep,
     note_type: str,
 ) -> list[Entity]:
-    """Find all entities of a given type using the repository's select pattern."""
-    query = entity_repository.select().where(Entity.note_type == note_type)
-    result = await entity_repository.execute_query(query)
+    """Find canonical and legacy spellings that represent one logical note type."""
+    canonical_note_type = normalize_note_type(note_type)
+
+    # Legacy databases may contain values written before note types were canonicalized.
+    # Resolve their exact stored spellings in Python, where the shared normalizer can
+    # handle camel-case as well as case and punctuation without backend-specific SQL.
+    stored_types_query = entity_repository.select(Entity.note_type).distinct()
+    stored_types_result = await entity_repository.execute_query(
+        session,
+        stored_types_query,
+        use_query_options=False,
+    )
+    stored_types = {
+        stored_type
+        for stored_type in stored_types_result.scalars().all()
+        if stored_type and normalize_note_type(stored_type) == canonical_note_type
+    }
+    if not stored_types:
+        return []
+
+    query = entity_repository.select().where(Entity.note_type.in_(stored_types))
+    result = await entity_repository.execute_query(session, query)
     return list(result.scalars().all())
 
 
 async def _find_schema_entities(
+    session: AsyncSession,
     entity_repository: EntityRepositoryV2ExternalDep,
     target_note_type: str,
     *,
@@ -355,17 +513,17 @@ async def _find_schema_entities(
        exact reference matching by title/permalink (explicit schema references)
     """
     query = entity_repository.select().where(Entity.note_type == "schema")
-    result = await entity_repository.execute_query(query)
+    result = await entity_repository.execute_query(session, query)
     entities = list(result.scalars().all())
 
-    normalized_target = generate_permalink(target_note_type)
+    normalized_target_type = normalize_note_type(target_note_type)
 
     entity_matches = [
         e
         for e in entities
         if e.entity_metadata
         and isinstance(e.entity_metadata.get("entity"), str)
-        and generate_permalink(e.entity_metadata["entity"]) == normalized_target
+        and normalize_note_type(e.entity_metadata["entity"]) == normalized_target_type
     ]
     if entity_matches:
         return entity_matches
@@ -373,6 +531,7 @@ async def _find_schema_entities(
     if not allow_reference_match:
         return []
 
+    normalized_target_reference = generate_permalink(target_note_type)
     reference_matches: list[Entity] = []
     for entity in entities:
         candidate_refs: list[str] = []
@@ -382,7 +541,7 @@ async def _find_schema_entities(
             candidate_refs.append(entity.permalink)
             candidate_refs.append(FilePath(entity.permalink).name)
 
-        if any(generate_permalink(ref) == normalized_target for ref in candidate_refs):
+        if any(generate_permalink(ref) == normalized_target_reference for ref in candidate_refs):
             reference_matches.append(entity)
 
     return reference_matches
