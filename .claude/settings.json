@@ -17,5 +17,23 @@
     ],
     "deny": []
   },
-  "enableAllProjectMcpServers": true
+  "enableAllProjectMcpServers": true,
+  "enabledPlugins": {
+    "claude-memory@skogai-market": true
+  },
+  "basicMemory": {
+    "primaryProject": "skogai",
+    "secondaryProjects": [],
+    "captureFolder": "sessions",
+    "rememberFolder": ".inbox",
+    "recallTimeframe": "3d",
+    "preCompactCapture": "extractive",
+    "checkpointOnCompact": true,
+    "sessionProfile": "coding",
+    "repository": "skogai/basic-memory",
+    "captureEvents": true,
+    "placementConventions": "CAPSLOCK.md files at root (SKOGAI.md, CLAUDE.md, CORE.md, DECISIONS.md, NOTATION.md, WORKSTATION.md) are hand-maintained router/index files, not generated content. knowledge/memory/ holds atomic fact notes indexed by knowledge/memory/MEMORY.md. .inbox/ is the quick-capture dumping ground; tmp/ is repo-local scratch space. Coding-session checkpoints go in sessions/; schemas/ holds Picoschema definitions. DECISIONS.md is a hand-curated running log -- the Decision schema is additive for new granular decisions, not a replacement for it.",
+    "teamProjects": {}
+  },
+  "outputStyle": "basic-memory"
 }
