@@ -11,7 +11,6 @@ from typing import Any, List, Optional, Set, Dict
 from dateparser import parse
 from fastapi import BackgroundTasks
 from loguru import logger
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import logfire
@@ -24,6 +23,7 @@ from basic_memory.repository.search_repository import (
     SearchRepository,
 )
 from basic_memory.repository.search_query import relaxed_query_words
+from basic_memory.repository.search_trace import SearchTraceCollector
 from basic_memory.schemas.base import normalize_note_type
 from basic_memory.schemas.search import SearchQuery, SearchItemType, SearchRetrievalMode
 from basic_memory.runtime.vector_sync import (
@@ -38,7 +38,7 @@ MAX_CONTENT_STEMS_SIZE = 6000
 
 
 @dataclass(frozen=True)
-class _PreparedSearchQuery:
+class PreparedSearchQuery:
     """Normalized query inputs shared by search and count."""
 
     search_text: str | None
@@ -52,6 +52,64 @@ class _PreparedSearchQuery:
     metadata_filters: dict[str, Any] | None
     retrieval_mode: SearchRetrievalMode
     min_similarity: float | None
+
+
+def entity_embeddings_enabled(entity: Entity) -> bool:
+    """Return whether semantic embeddings should be generated for this entity.
+
+    Shared policy: sync uses it to clear and skip opted-out notes, and the retrieval
+    inspector uses it so an opt-out is never reported as missing vector coverage.
+    """
+    if not entity.entity_metadata:
+        return True
+
+    embed_value = entity.entity_metadata.get("embed")
+    if embed_value is None:
+        return True
+    if isinstance(embed_value, bool):
+        return embed_value
+    if isinstance(embed_value, str):
+        normalized = embed_value.strip().lower()
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+    if isinstance(embed_value, (int, float)):
+        return bool(embed_value)
+
+    # Default unknown values to enabled so malformed metadata does not silently
+    # remove notes from semantic search.
+    return True
+
+
+def describe_search_criteria(prepared: PreparedSearchQuery) -> str:
+    """Render the criteria the repository actually executed.
+
+    The prepared query is the execution-native source: shorthand like ``text="tag:x"``
+    normalizes into metadata filters, convenience fields fold into their canonical
+    forms, and note-type filters expand to legacy spellings, so describing the raw
+    request would misreport what ran.
+    """
+
+    def quoted(value: str | None) -> str | None:
+        return f'"{value}"' if value else None
+
+    criteria: dict[str, object | None] = {
+        "text": quoted(prepared.search_text),
+        "title": quoted(prepared.title),
+        "permalink": quoted(prepared.permalink),
+        "permalink_match": quoted(prepared.permalink_match),
+        "note_types": list(prepared.note_types) if prepared.note_types else None,
+        # SearchItemType is a str-backed Enum whose str() is "SearchItemType.ENTITY";
+        # the executed repository filter uses the plain value.
+        "entity_types": [item.value for item in prepared.search_item_types]
+        if prepared.search_item_types
+        else None,
+        "after_date": prepared.after_date,
+        "categories": list(prepared.categories) if prepared.categories else None,
+        "metadata_filters": dict(prepared.metadata_filters) if prepared.metadata_filters else None,
+    }
+    return " ".join(f"{name}={value}" for name, value in criteria.items() if value is not None)
 
 
 def _strip_nul(value: str) -> str:
@@ -93,11 +151,20 @@ class SearchService:
         logger.info("Starting full reindex")
         # Trigger: a full search rebuild removes every derived row.
         # Why: vector storage may live outside SQL, so cleanup must cross the
-        # repository boundary before the full-text table is recreated.
+        # repository boundary before the full-text rows are rebuilt.
         # Outcome: built-in and extension indexes follow the same lifecycle.
         await self.repository.delete_project_vector_rows()
-        await self.repository.execute_query(text("DROP TABLE IF EXISTS search_index"), params={})
+        # Trigger: this service reindexes exactly one project, but search_index
+        # is shared by every project in the database (local SQLite consolidated
+        # into one memory.db; cloud tenants share one Postgres DB across
+        # projects). The historical DROP TABLE here dated from the one-database-
+        # per-project era and destroyed sibling projects' rows — on Postgres it
+        # also left nothing behind, since only migrations recreate the table.
+        # Why: a project-scoped DELETE clears only rows this rebuild will
+        # repopulate, and on Postgres the FTS chunk rows cascade with them.
+        # Outcome: sibling projects keep serving search while this one rebuilds.
         await self.init_search_index()
+        await self.repository.delete_project_search_rows()
 
         # Reindex all entities
         logger.debug("Indexing entities")
@@ -108,7 +175,7 @@ class SearchService:
 
         logger.info("Reindex complete")
 
-    def _prepare_query(self, query: SearchQuery) -> _PreparedSearchQuery | None:
+    def prepare_query(self, query: SearchQuery) -> PreparedSearchQuery | None:
         """Normalize a SearchQuery into repository arguments."""
         search_text = query.text
         tags = query.tags
@@ -142,7 +209,7 @@ class SearchService:
             if query.status:
                 metadata_filters.setdefault("status", query.status)
 
-        prepared = _PreparedSearchQuery(
+        prepared = PreparedSearchQuery(
             search_text=search_text,
             permalink=query.permalink,
             permalink_match=query.permalink_match,
@@ -177,7 +244,7 @@ class SearchService:
         return prepared
 
     @staticmethod
-    def _prepared_has_filters(prepared: _PreparedSearchQuery) -> bool:
+    def _prepared_has_filters(prepared: PreparedSearchQuery) -> bool:
         return bool(
             prepared.metadata_filters
             or prepared.note_types
@@ -188,10 +255,10 @@ class SearchService:
 
     async def _include_legacy_note_type_spellings(
         self,
-        prepared: _PreparedSearchQuery,
+        prepared: PreparedSearchQuery,
         *,
         session: AsyncSession | None = None,
-    ) -> _PreparedSearchQuery:
+    ) -> PreparedSearchQuery:
         """Expand canonical note-type filters to exact legacy entity spellings."""
         if not prepared.note_types:
             return prepared
@@ -217,14 +284,33 @@ class SearchService:
 
     async def _search_repository(
         self,
-        prepared: _PreparedSearchQuery,
+        prepared: PreparedSearchQuery,
         *,
         search_text: str | None,
         limit: int,
         offset: int,
         allow_relaxed: bool = False,
         session: AsyncSession | None = None,
+        trace: SearchTraceCollector | None = None,
     ) -> List[SearchIndexRow]:
+        if trace is None:
+            return await self.repository.search(
+                search_text=search_text,
+                permalink=prepared.permalink,
+                permalink_match=prepared.permalink_match,
+                title=prepared.title,
+                note_types=prepared.note_types,
+                search_item_types=prepared.search_item_types,
+                categories=prepared.categories,
+                after_date=prepared.after_date,
+                metadata_filters=prepared.metadata_filters,
+                retrieval_mode=prepared.retrieval_mode,
+                min_similarity=prepared.min_similarity,
+                limit=limit,
+                offset=offset,
+                allow_relaxed=allow_relaxed,
+                session=session,
+            )
         return await self.repository.search(
             search_text=search_text,
             permalink=prepared.permalink,
@@ -241,11 +327,12 @@ class SearchService:
             offset=offset,
             allow_relaxed=allow_relaxed,
             session=session,
+            trace=trace,
         )
 
     async def _count_repository(
         self,
-        prepared: _PreparedSearchQuery,
+        prepared: PreparedSearchQuery,
         *,
         search_text: str | None,
         allow_relaxed: bool = False,
@@ -271,6 +358,8 @@ class SearchService:
         limit=10,
         offset=0,
         session: AsyncSession | None = None,
+        *,
+        trace: SearchTraceCollector | None = None,
     ) -> List[SearchIndexRow]:
         """Search across all indexed content.
 
@@ -279,13 +368,17 @@ class SearchService:
         2. Pattern match: handles * wildcards in paths
         3. Text search: full-text search across title/content
         """
-        prepared = self._prepare_query(query)
+        prepared = self.prepare_query(query)
         if prepared is None:
             return []
         prepared = await self._include_legacy_note_type_spellings(
             prepared,
             session=session,
         )
+        if trace is not None:
+            # The trace must describe this execution's criteria, not a re-preparation:
+            # the legacy note-type expansion above depends on stored entity spellings.
+            trace.executed_query_description = describe_search_criteria(prepared)
 
         strict_search_text = prepared.search_text
         has_query = bool(
@@ -316,13 +409,14 @@ class SearchService:
                 offset=offset,
                 allow_relaxed=allow_relaxed,
                 session=session,
+                trace=trace,
             )
 
         return results
 
     async def count(self, query: SearchQuery) -> int:
         """Count all indexed rows matching a query."""
-        prepared = self._prepare_query(query)
+        prepared = self.prepare_query(query)
         if prepared is None:
             return 0
         prepared = await self._include_legacy_note_type_spellings(prepared)
@@ -506,7 +600,7 @@ class SearchService:
             await self._clear_entity_vectors(entity_id)
             return
 
-        if not self._entity_embeddings_enabled(entity):
+        if not entity_embeddings_enabled(entity):
             await self._clear_entity_vectors(entity_id)
             return
 
@@ -532,7 +626,7 @@ class SearchService:
             for entity_id in entity_ids
             if (
                 (entity := entities_by_id.get(entity_id)) is not None
-                and not self._entity_embeddings_enabled(entity)
+                and not entity_embeddings_enabled(entity)
             )
         ]
         if opted_out_ids:
@@ -579,9 +673,7 @@ class SearchService:
             ),
             sample_errors=tuple(
                 dict.fromkeys(
-                    error
-                    for result in repository_results
-                    for error in result.sample_errors
+                    error for result in repository_results for error in result.sample_errors
                 )
             )[:VECTOR_SYNC_SAMPLE_ERROR_LIMIT],
             vector_index=next(
@@ -589,11 +681,7 @@ class SearchService:
                 "",
             ),
             embedding_model=next(
-                (
-                    result.embedding_model
-                    for result in repository_results
-                    if result.embedding_model
-                ),
+                (result.embedding_model for result in repository_results if result.embedding_model),
                 "",
             ),
             chunks_total=sum(result.chunks_total for result in repository_results),
@@ -673,30 +761,6 @@ class SearchService:
         logger.info(
             "Purged stale search rows", project_id=self.repository.project_id, purged=purged
         )
-
-    @staticmethod
-    def _entity_embeddings_enabled(entity: Entity) -> bool:
-        """Return whether semantic embeddings should be generated for this entity."""
-        if not entity.entity_metadata:
-            return True
-
-        embed_value = entity.entity_metadata.get("embed")
-        if embed_value is None:
-            return True
-        if isinstance(embed_value, bool):
-            return embed_value
-        if isinstance(embed_value, str):
-            normalized = embed_value.strip().lower()
-            if normalized in {"false", "0", "no", "off"}:
-                return False
-            if normalized in {"true", "1", "yes", "on"}:
-                return True
-        if isinstance(embed_value, (int, float)):
-            return bool(embed_value)
-
-        # Default unknown values to enabled so malformed metadata does not silently
-        # remove notes from semantic search.
-        return True
 
     async def _clear_entity_vectors(self, entity_id: int) -> None:
         """Delete derived vector rows for one entity."""

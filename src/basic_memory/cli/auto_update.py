@@ -27,6 +27,10 @@ UV_UPGRADE_TIMEOUT_SECONDS = 180
 BREW_UPGRADE_TIMEOUT_SECONDS = 600
 
 
+class HomebrewCheckError(RuntimeError):
+    """Raised when `brew outdated` could not determine whether an update exists."""
+
+
 class InstallSource(str, Enum):
     """How the running CLI appears to have been installed."""
 
@@ -127,19 +131,56 @@ def _version_from_pypi() -> str:
 
 
 def _check_homebrew_update_available(silent: bool) -> tuple[bool, str | None]:
-    """Check whether Homebrew reports an outdated basic-memory formula."""
-    result = _run_subprocess(
-        ["brew", "outdated", "--quiet", PACKAGE_NAME],
-        timeout_seconds=BREW_OUTDATED_TIMEOUT_SECONDS,
-        silent=silent,
-        capture_output=True,
-    )
-    # Trigger: brew outdated exits 1 when the formula IS outdated (with name on stdout).
-    # Why: non-zero exit here means "outdated", not "error".
-    # Outcome: check stdout for the package name to determine outdated status.
+    """Check whether Homebrew reports an outdated basic-memory formula.
+
+    Raises:
+        HomebrewCheckError: brew could not answer the question (brew missing,
+            untrusted or stale tap, network failure, timeout).
+    """
+    try:
+        result = _run_subprocess(
+            ["brew", "outdated", "--json=v2", PACKAGE_NAME],
+            timeout_seconds=BREW_OUTDATED_TIMEOUT_SECONDS,
+            silent=silent,
+            capture_output=True,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise HomebrewCheckError(f"could not run `brew outdated`: {exc}") from exc
+
     stdout = (result.stdout or "").strip()
-    is_outdated = PACKAGE_NAME in stdout
-    return is_outdated, None
+    stderr = (result.stderr or "").strip()
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise HomebrewCheckError(
+            stderr or f"`brew outdated --json=v2` returned invalid JSON: {exc}"
+        ) from exc
+
+    formulae = payload.get("formulae") if isinstance(payload, dict) else None
+    if not isinstance(formulae, list):
+        raise HomebrewCheckError("`brew outdated --json=v2` omitted the formulae list")
+
+    # Trigger: brew outdated exits 1 both when the formula IS outdated (a JSON
+    # entry is present) and when the check failed outright (non-JSON error text).
+    # Why: JSON supplies Homebrew's actual target version without consulting a
+    # potentially-ahead package registry, while the exit code alone is ambiguous.
+    # Outcome: a matching formula is outdated, an empty successful list is current,
+    # and every other response remains unanswered for the caller's fallback path.
+    for formula in formulae:
+        if not isinstance(formula, dict):
+            raise HomebrewCheckError("`brew outdated --json=v2` returned a malformed formula")
+        name = formula.get("name")
+        if isinstance(name, str) and name.rsplit("/", maxsplit=1)[-1] == PACKAGE_NAME:
+            latest = formula.get("current_version")
+            if not isinstance(latest, str) or not latest:
+                raise HomebrewCheckError(
+                    "`brew outdated --json=v2` omitted the formula current_version"
+                )
+            return True, latest
+
+    if result.returncode == 0 and not formulae:
+        return False, None
+    raise HomebrewCheckError(stderr or f"`brew outdated` exited {result.returncode}")
 
 
 def _check_pypi_update_available() -> tuple[bool, str]:
@@ -180,6 +221,38 @@ def _preload_lazy_console_modules() -> None:
     """
     import rich._emoji_codes  # noqa: F401
     import typer.rich_utils  # noqa: F401
+    from rich.cells import cell_len
+
+    # Trigger: rich defers its Unicode cell-width table (`rich._unicode_data.
+    # unicode<version>`) until the first character it cannot measure with the
+    # ASCII fast path in `_cell_len`.
+    # Why: status messages echo captured `brew`/`uv` output, which carries
+    # non-ASCII characters (curly quotes, em dashes, warning glyphs), so the
+    # deferred import lands after the upgrade removed our files. Importing the
+    # module by name would hard-code a table version; calling `cell_len` uses
+    # rich's own resolution and honors UNICODE_VERSION like the print path does.
+    # Outcome: the table rich will reach for is resolved and cached up front.
+    cell_len("\u2500\u2018\u2713")
+
+
+def print_update_status(console: Console, text: str, style: str) -> None:
+    """Print an update status line that cannot fail the command.
+
+    Trigger: the line is printed after an in-place upgrade may already have
+    replaced this installation on disk.
+    Why: `_preload_lazy_console_modules` can only preload the deferred imports
+    we know about today, and rich/typer are free to add more. By the time this
+    prints, the upgrade has already succeeded -- a status line must never be
+    what turns it into a traceback and a non-zero exit.
+    Outcome: fall back to a plain, unstyled write that needs no new imports.
+    """
+    try:
+        console.print(f"[{style}]{text}[/{style}]")
+    except Exception as exc:
+        logger.warning(
+            f"Rich console print failed after update, falling back to plain output: {exc}"
+        )
+        print(text)
 
 
 def _save_last_checked_timestamp(config_manager: ConfigManager, checked_at: datetime) -> None:
@@ -246,8 +319,21 @@ def run_auto_update(
     try:
         # --- Availability check ---
         latest_version: str | None = None
+        homebrew_check_error: str | None = None
         if source == InstallSource.HOMEBREW:
-            update_available, latest_version = _check_homebrew_update_available(silent=silent)
+            try:
+                update_available, latest_version = _check_homebrew_update_available(silent=silent)
+            except HomebrewCheckError as exc:
+                # Trigger: brew cannot answer (missing/untrusted tap, no brew, network).
+                # Why: an unanswered check must never be reported as up to date. PyPI is
+                # sound for the negative answer -- the tap can only lag PyPI, so "nothing
+                # newer exists" holds. It is NOT sound for installing: release.yml
+                # publishes to PyPI in `release`, and the homebrew formula job `needs:
+                # release`, so a newer PyPI version may not be installable via brew yet.
+                # Outcome: ask PyPI, but remember the answer came from there.
+                homebrew_check_error = str(exc)
+                logger.warning(f"Homebrew update check failed, falling back to PyPI: {exc}")
+                update_available, latest_version = _check_pypi_update_available()
         else:
             update_available, latest_version = _check_pypi_update_available()
 
@@ -286,6 +372,26 @@ def run_auto_update(
                 latest_version=latest_version,
                 message=(
                     f"Update available (latest: {latest_version or 'unknown'}). "
+                    f"{_manual_update_hint(source)}"
+                ),
+            )
+
+        if homebrew_check_error is not None:
+            # Trigger: availability was inferred from PyPI because brew could not answer.
+            # Why: the tap may not carry this version yet, and whatever hid the brew
+            # answer (untrusted tap, brew missing) will also block `brew upgrade`.
+            # Outcome: report the update and the reason instead of running a doomed
+            # upgrade; the user resolves the brew problem and upgrades deliberately.
+            return AutoUpdateResult(
+                status=AutoUpdateStatus.UPDATE_AVAILABLE,
+                source=source,
+                checked=True,
+                update_available=True,
+                updated=False,
+                latest_version=latest_version,
+                message=(
+                    f"Update available (latest: {latest_version or 'unknown'}), but the "
+                    f"Homebrew check failed: {homebrew_check_error} "
                     f"{_manual_update_hint(source)}"
                 ),
             )
@@ -394,11 +500,11 @@ def maybe_run_periodic_auto_update(
     }:
         out = console or Console()
         if result.status == AutoUpdateStatus.UPDATED:
-            out.print(f"[green]{result.message}[/green]")
+            print_update_status(out, f"{result.message}", "green")
         elif result.status == AutoUpdateStatus.FAILED:
             error_detail = f" {result.error}" if result.error else ""
-            out.print(f"[yellow]{result.message}{error_detail}[/yellow]")
+            print_update_status(out, f"{result.message}{error_detail}", "yellow")
         elif result.message:
-            out.print(f"[cyan]{result.message}[/cyan]")
+            print_update_status(out, f"{result.message}", "cyan")
 
     return result

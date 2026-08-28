@@ -2,6 +2,7 @@
 
 import asyncio
 import re
+import time
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -28,6 +29,10 @@ from basic_memory.repository.rerank_provider_factory import create_rerank_provid
 from basic_memory.repository.search_index_row import SearchIndexRow
 from basic_memory.repository.search_query import relaxed_query_words
 from basic_memory.repository.search_repository_base import SearchRepositoryBase
+from basic_memory.repository.search_trace import (
+    SearchTraceCollector,
+    build_fts_page_stage,
+)
 from basic_memory.repository.metadata_filters import parse_metadata_filters, build_sqlite_json_path
 from basic_memory.repository.semantic_errors import SemanticDependenciesMissingError
 from basic_memory.repository.semantic_vector_index import SemanticVectorIndex
@@ -393,12 +398,78 @@ class SQLiteSearchRepository(SearchRepositoryBase):
         return self._prepare_single_term(term, is_prefix)
 
     @staticmethod
+    def _relaxed_fts_term(word: str) -> str:
+        """Render one relaxed word as an FTS5-safe prefix expression.
+
+        A word token can contain an apostrophe ("об'єкт", "don't"). Interpolated
+        bare it is FTS5 syntax, not text: the whole expression fails to parse, the
+        caller swallows the syntax error, and the relaxed retry returns nothing —
+        the exact silent-empty-FTS failure this fallback exists to prevent.
+        """
+        if "'" in word or '"' in word:
+            return '"{}"*'.format(word.replace('"', '""'))
+        return f"{word}*"
+
+    @staticmethod
     def _relaxed_fts_text(search_text: Optional[str]) -> Optional[str]:
         """OR-relaxed FTS5 expression for a failed strict query, or None."""
         words = relaxed_query_words(search_text)
         if not words:
             return None
-        return " OR ".join(f"{word}*" for word in words)
+        return " OR ".join(SQLiteSearchRepository._relaxed_fts_term(word) for word in words)
+
+    @override
+    async def semantic_effectively_enabled(self) -> bool:
+        """Probe the sqlite-vec runtime instead of trusting still-enabled config.
+
+        init_search_index() disables semantics only on the startup repository
+        instance; per-request instances are rebuilt from config, so they must
+        re-check the runtime to honor the keyword-only fallback (#711).
+        """
+        if not self._semantic_enabled:
+            return False
+        async with db.scoped_session(self.session_maker) as session:
+            try:
+                await self._ensure_sqlite_vec_loaded(session)
+            except SemanticDependenciesMissingError:
+                return False
+        return True
+
+    @override
+    async def get_entity_physical_chunk_keys(self, entity_id: int) -> set[str] | None:
+        """Return chunk keys whose sqlite-vec physical row is live for this entity."""
+        # Trigger: semantic search is off, or the configured index is external.
+        # Why: a disabled config expects no physical rows, and external adapters expose
+        # no portable storage-inspection contract (same rule as get_embedding_status()).
+        # Outcome: None — chunk status stays manifest-only.
+        if not self._semantic_enabled or self._semantic_vector_index_name != "sqlite-vec":
+            return None
+        async with db.scoped_session(self.session_maker) as session:
+            tables_result = await session.execute(
+                text(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' "
+                    "AND name IN ('search_vector_chunks', 'search_vector_embeddings')"
+                )
+            )
+            table_names = {str(name) for name in tables_result.scalars().all()}
+            if not {"search_vector_chunks", "search_vector_embeddings"} <= table_names:
+                return set()
+            try:
+                await self._ensure_sqlite_vec_loaded(session)
+            except SemanticDependenciesMissingError:
+                # Runtime fallback: tables remain from a working install but this host
+                # cannot load sqlite-vec, so physical storage is not inspectable here.
+                return None
+            result = await session.execute(
+                text(
+                    "SELECT c.chunk_key FROM search_vector_chunks c "
+                    "JOIN search_vector_embeddings e "
+                    "ON e.rowid = c.id AND e.source_hash = c.source_hash "
+                    "WHERE c.project_id = :project_id AND c.entity_id = :entity_id"
+                ),
+                {"project_id": self.project_id, "entity_id": entity_id},
+            )
+            return {str(chunk_key) for chunk_key in result.scalars().all()}
 
     # ------------------------------------------------------------------
     # sqlite-vec extension loading (SQLite-specific)
@@ -455,7 +526,24 @@ class SQLiteSearchRepository(SearchRepositoryBase):
                     "to silence this and use keyword-only search."
                 )
 
-            await driver_connection.enable_load_extension(True)
+            try:
+                await driver_connection.enable_load_extension(True)
+            except AttributeError as exc:
+                # Trigger: aiosqlite exposes its wrapper method, but the wrapped
+                # sqlite3.Connection was built without extension-loading support.
+                # Why: hasattr() above can only inspect the wrapper, so invoking the
+                # method is the authoritative capability probe on these interpreters.
+                # Outcome: preserve the same keyword-only fallback as a directly
+                # unsupported driver connection instead of leaking AttributeError.
+                raise SemanticDependenciesMissingError(
+                    "This Python build does not support SQLite extension loading "
+                    "(no enable_load_extension on sqlite3.Connection). "
+                    "Common cause: python.org Python on macOS. "
+                    "Reinstall basic-memory under a Python that ships extension "
+                    "support (uv-managed CPython, Homebrew Python, or the official "
+                    "Docker image), or set semantic_search_enabled=false in config "
+                    "to silence this and use keyword-only search."
+                ) from exc
             await driver_connection.load_extension(sqlite_vec.loadable_path())
             await driver_connection.enable_load_extension(False)
             await session.execute(text("SELECT vec_version()"))
@@ -545,8 +633,15 @@ class SQLiteSearchRepository(SearchRepositoryBase):
         session: AsyncSession,
         query_embedding: list[float],
         candidate_limit: int,
+        *,
+        trace: SearchTraceCollector | None = None,
     ) -> list[dict[str, Any]]:
-        return await super()._run_vector_query(session, query_embedding, candidate_limit)
+        return await super()._run_vector_query(
+            session,
+            query_embedding,
+            candidate_limit,
+            trace=trace,
+        )
 
     @override
     async def _delete_entity_chunks(
@@ -907,6 +1002,8 @@ class SQLiteSearchRepository(SearchRepositoryBase):
         offset: int = 0,
         allow_relaxed: bool = False,
         session: AsyncSession | None = None,
+        *,
+        trace: SearchTraceCollector | None = None,
     ) -> List[SearchIndexRow]:
         """Search across all indexed content using SQLite FTS5.
 
@@ -930,6 +1027,7 @@ class SQLiteSearchRepository(SearchRepositoryBase):
             min_similarity=min_similarity,
             limit=limit,
             offset=offset,
+            trace=trace,
         )
         if dispatched is not None:
             return dispatched
@@ -977,10 +1075,12 @@ class SQLiteSearchRepository(SearchRepositoryBase):
         """
 
         logger.trace(f"Search {sql} params: {params}")
+        fts_started_at = time.perf_counter() if trace is not None else None
 
         async def run_search(active_session: AsyncSession):
             result = await active_session.execute(text(sql), params)
             rows = result.fetchall()
+            relaxed_fallback_used = False
             # Trigger: multi-word natural-language query matched nothing
             # under the default all-terms-AND semantics.
             # Why: questions ("when did X do Y") rarely have every word in
@@ -991,6 +1091,7 @@ class SQLiteSearchRepository(SearchRepositoryBase):
             # ranks multi-term matches first.
             relaxed = self._relaxed_fts_text(search_text) if allow_relaxed and not rows else None
             if relaxed and params.get("text"):
+                relaxed_fallback_used = True
                 params["text"] = relaxed
                 logger.debug(
                     "Strict SQLite FTS returned 0 results; retrying relaxed FTS query "
@@ -1005,19 +1106,29 @@ class SQLiteSearchRepository(SearchRepositoryBase):
                 ):
                     result = await active_session.execute(text(sql), params)
                     rows = result.fetchall()
-            return rows
+            return rows, relaxed_fallback_used
 
         try:
             if session is not None:
-                rows = await run_search(session)
+                rows, relaxed_fallback_used = await run_search(session)
             else:
                 async with db.scoped_session(self.session_maker) as owned_session:
-                    rows = await run_search(owned_session)
+                    rows, relaxed_fallback_used = await run_search(owned_session)
         except Exception as e:
             # Handle FTS5 syntax errors and provide user-friendly feedback
             if self._is_fts5_syntax_error(e):  # pragma: no cover
                 logger.warning(f"FTS5 syntax error for search term: {search_text}, error: {e}")
                 # Return empty results rather than crashing
+                if trace is not None:
+                    trace.fts = build_fts_page_stage(
+                        [],
+                        relaxed_fallback_used=False,
+                        fts_ms=(
+                            (time.perf_counter() - fts_started_at) * 1000
+                            if fts_started_at is not None
+                            else None
+                        ),
+                    )
                 return []
             else:
                 # Re-raise other database errors
@@ -1025,6 +1136,16 @@ class SQLiteSearchRepository(SearchRepositoryBase):
                 raise
 
         results = [SearchIndexRow.from_mapping(row._asdict()) for row in rows]
+        if trace is not None:
+            trace.fts = build_fts_page_stage(
+                [((row.type, row.id), row.score or 0.0) for row in results],
+                relaxed_fallback_used=relaxed_fallback_used,
+                fts_ms=(
+                    (time.perf_counter() - fts_started_at) * 1000
+                    if fts_started_at is not None
+                    else None
+                ),
+            )
 
         logger.trace(f"Found {len(results)} search results")
         for r in results:

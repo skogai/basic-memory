@@ -521,7 +521,6 @@ doctor:
     TMP_HOME=$(mktemp -d)
     TMP_CONFIG=$(mktemp -d)
     HOME="$TMP_HOME" \
-    BASIC_MEMORY_ENV=test \
     BASIC_MEMORY_HOME="$TMP_HOME/basic-memory" \
     BASIC_MEMORY_CONFIG_DIR="$TMP_CONFIG" \
     ./.venv/bin/python -m basic_memory.cli.main doctor --local
@@ -706,6 +705,8 @@ release version:
         .claude-plugin/marketplace.json \
         plugins/claude-code/.claude-plugin/plugin.json \
         plugins/claude-code/.claude-plugin/marketplace.json \
+        plugins/claude-code/hooks/session_start.py \
+        plugins/claude-code/hooks/pre_compact.py \
         plugins/codex/.codex-plugin/plugin.json \
         plugins/codex/hooks/session_start.py \
         plugins/codex/hooks/pre_compact.py \
@@ -826,6 +827,8 @@ beta version:
         .claude-plugin/marketplace.json \
         plugins/claude-code/.claude-plugin/plugin.json \
         plugins/claude-code/.claude-plugin/marketplace.json \
+        plugins/claude-code/hooks/session_start.py \
+        plugins/claude-code/hooks/pre_compact.py \
         plugins/codex/.codex-plugin/plugin.json \
         plugins/codex/hooks/session_start.py \
         plugins/codex/hooks/pre_compact.py \

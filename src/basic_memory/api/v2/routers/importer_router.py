@@ -191,6 +191,15 @@ async def import_memory_json(
             )
     except HTTPException:
         raise
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        # Trigger: a line in the upload is not valid JSON, or the bytes are not
+        #   UTF-8 (truncated archive, wrong file, binary upload).
+        # Why: this is a client-input problem, not a server fault (#1276).
+        # Outcome: a 400 with the parse position instead of an opaque 500.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Import file is not valid JSON: {e}",
+        )
     except Exception as e:
         logger.exception("V2 Import failed")
         raise HTTPException(
@@ -244,6 +253,15 @@ async def import_file[ImportResultT: ImportResult](
 
     except HTTPException:
         raise
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        # Trigger: the upload is not valid JSON, or the bytes are not UTF-8
+        #   (truncated archive, wrong file, binary upload).
+        # Why: this is a client-input problem, not a server fault (#1276).
+        # Outcome: a 400 with the parse position instead of an opaque 500.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Import file is not valid JSON: {e}",
+        )
     except Exception as e:
         logger.exception("V2 Import failed")
         raise HTTPException(

@@ -18,6 +18,8 @@ from basic_memory.repository.embedding_provider_factory import create_embedding_
 from basic_memory.repository.rerank_provider_factory import create_rerank_provider
 from basic_memory.repository.postgres_search_repository import PostgresSearchRepository
 from basic_memory.repository.search_index_row import SearchIndexRow
+from basic_memory.repository.search_repository_base import ChunkManifestRow
+from basic_memory.repository.search_trace import SearchTraceCollector
 from basic_memory.repository.semantic_vector_index_factory import (
     create_semantic_vector_index,
     resolve_semantic_vector_index_name,
@@ -33,11 +35,37 @@ class SearchRepository(Protocol):
     Both SQLite and Postgres implementations must satisfy this protocol.
     """
 
+    session_maker: async_sessionmaker[AsyncSession]
+
     @property
     def project_id(self) -> int: ...
 
+    @property
+    def configured_embedding_model(self) -> str: ...
+
+    @property
+    def configured_vector_index(self) -> str: ...
+
+    @property
+    def configured_min_similarity(self) -> float: ...
+
+    @property
+    def configured_reranker_model(self) -> str | None: ...
+
+    @property
+    def configured_reranker_candidates(self) -> int: ...
+
     async def init_search_index(self) -> None:
         """Initialize the search index schema."""
+        ...
+
+    async def get_entity_physical_chunk_keys(self, entity_id: int) -> set[str] | None:
+        """Return chunk keys with a live physical vector row, or None when
+        physical storage is not inspectable."""
+        ...
+
+    async def semantic_effectively_enabled(self) -> bool:
+        """Return whether semantic retrieval can actually run right now."""
         ...
 
     async def search(
@@ -57,6 +85,8 @@ class SearchRepository(Protocol):
         offset: int = 0,
         allow_relaxed: bool = False,
         session: AsyncSession | None = None,
+        *,
+        trace: SearchTraceCollector | None = None,
     ) -> List[SearchIndexRow]:
         """Search across indexed content."""
         ...
@@ -87,8 +117,20 @@ class SearchRepository(Protocol):
         """Index multiple items in a batch."""
         ...
 
+    async def get_entity_search_rows(self, entity_id: int) -> list[SearchIndexRow]:
+        """Return every search projection owned by one entity."""
+        ...
+
+    async def get_entity_chunk_manifest(self, entity_id: int) -> list[ChunkManifestRow]:
+        """Return the stored vector-chunk manifest for one entity."""
+        ...
+
     async def delete_by_permalink(self, permalink: str) -> None:
         """Delete item by permalink."""
+        ...
+
+    async def delete_project_search_rows(self) -> None:
+        """Delete every full-text search row owned by this project."""
         ...
 
     async def delete_by_entity_id(self, entity_id: int) -> None:

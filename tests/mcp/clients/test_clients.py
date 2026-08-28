@@ -445,6 +445,7 @@ class TestDirectoryClient:
                 "page": 2,
                 "page_size": 4,
                 "file_name_glob": "*.md",
+                "sort": "updated_desc",
             }
             return mock_response
 
@@ -452,11 +453,39 @@ class TestDirectoryClient:
 
         mock_http = MagicMock()
         client = DirectoryClient(mock_http, "proj-123")
-        result = await client.list("/", depth=2, file_name_glob="*.md", page=2, page_size=4)
+        result = await client.list(
+            "/",
+            depth=2,
+            file_name_glob="*.md",
+            sort="updated_desc",
+            page=2,
+            page_size=4,
+        )
         assert len(result.nodes) == 1
         assert result.nodes[0].name == "folder"
         assert result.page == 2
         assert result.total == 5
+
+    @pytest.mark.asyncio
+    async def test_list_omits_optional_sort_by_default(self, monkeypatch):
+        """Legacy callers do not acquire an implicit explicit-sort behavior."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "nodes": [],
+            "page": 1,
+            "page_size": 10,
+            "total": 0,
+            "has_more": False,
+        }
+
+        async def mock_call_get(client, url, **kwargs):
+            assert "sort" not in kwargs["params"]
+            return mock_response
+
+        monkeypatch.setattr("basic_memory.mcp.tools.utils.call_get", mock_call_get)
+
+        client = DirectoryClient(MagicMock(), "proj-123")
+        await client.list()
 
 
 class TestResourceClient:
@@ -497,6 +526,36 @@ class TestProjectClient:
         mock_http = MagicMock()
         client = ProjectClient(mock_http)
         assert client.http_client is mock_http
+
+    @pytest.mark.asyncio
+    async def test_create_doctor_project(self, monkeypatch):
+        """Test create_doctor_project posts to the doctor endpoint."""
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "message": "Project 'doctor-abc12345' added successfully",
+            "status": "success",
+            "default": False,
+            "new_project": {
+                "id": 7,
+                "external_id": "uuid-doctor",
+                "name": "doctor-abc12345",
+                "path": "/app/data/doctor-abc12345",
+                "is_default": False,
+            },
+        }
+
+        async def mock_call_post(client, url, **kwargs):
+            assert url == "/v2/projects/doctor"
+            return mock_response
+
+        monkeypatch.setattr("basic_memory.mcp.tools.utils.call_post", mock_call_post)
+
+        mock_http = MagicMock()
+        client = ProjectClient(mock_http)
+        result = await client.create_doctor_project()
+        assert result.new_project is not None
+        assert result.new_project.name == "doctor-abc12345"
 
     @pytest.mark.asyncio
     async def test_list_projects(self, monkeypatch):
