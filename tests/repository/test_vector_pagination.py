@@ -14,6 +14,7 @@ import pytest
 
 from basic_memory.repository.search_repository_base import SearchRepositoryBase
 from basic_memory.repository.search_index_row import SearchIndexRow
+from basic_memory.repository.search_trace import SearchTraceCollector
 from basic_memory.schemas.search import SearchItemType, SearchRetrievalMode
 
 
@@ -46,6 +47,10 @@ class ConcreteSearchRepo(SearchRepositoryBase):
         pass  # pragma: no cover
 
     @override
+    async def get_entity_physical_chunk_keys(self, entity_id: int) -> set[str] | None:
+        return None  # physical storage is not inspectable in this double
+
+    @override
     def _prepare_search_term(self, term, is_prefix=True):
         return term  # pragma: no cover
 
@@ -66,6 +71,8 @@ class ConcreteSearchRepo(SearchRepositoryBase):
         limit: int = 10,
         offset: int = 0,
         allow_relaxed: bool = False,
+        *,
+        trace: SearchTraceCollector | None = None,
     ) -> list[SearchIndexRow]:
         return []  # pragma: no cover
 
@@ -74,7 +81,14 @@ class ConcreteSearchRepo(SearchRepositoryBase):
         pass  # pragma: no cover
 
     @override
-    async def _run_vector_query(self, session, query_embedding, candidate_limit):
+    async def _run_vector_query(
+        self,
+        session,
+        query_embedding,
+        candidate_limit,
+        *,
+        trace: SearchTraceCollector | None = None,
+    ):
         return []  # pragma: no cover
 
     @override

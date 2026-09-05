@@ -5,6 +5,7 @@ from __future__ import annotations
 import tempfile
 import uuid
 from pathlib import Path
+from typing import Protocol
 
 from loguru import logger
 from rich.console import Console
@@ -21,6 +22,14 @@ from basic_memory.schemas.search import SearchQuery
 from basic_memory.schemas import ProjectIndexRunResponse
 
 console = Console()
+
+
+class DoctorProjectClient(Protocol):
+    """Project-client capability required to clean up doctor state."""
+
+    async def delete_project(
+        self, project_external_id: str, delete_notes: bool = False
+    ) -> object: ...
 
 
 def _is_default_project_delete_error(error: Exception) -> bool:
@@ -61,14 +70,14 @@ async def _delete_doctor_project_locally(project_name: str, project_id: str) -> 
 
 
 async def _delete_doctor_project(
-    project_client: ProjectClient, project_name: str, project_id: str
+    project_client: DoctorProjectClient, project_name: str, project_id: str
 ) -> None:
     """Delete the generated doctor project without weakening the public API guard."""
     # Deferred: ToolError lives in FastMCP's runtime, which must not load at CLI startup (#886).
     from fastmcp.exceptions import ToolError
 
     try:
-        await project_client.delete_project(project_id)
+        await project_client.delete_project(project_id, delete_notes=True)
     except ToolError as exc:
         if not _is_default_project_delete_error(exc):
             raise
@@ -79,6 +88,23 @@ async def _delete_doctor_project(
         # must keep rejecting default-project deletion for normal callers.
         # Outcome: cleanup removes only the exact doctor project it created.
         await _delete_doctor_project_locally(project_name, project_id)
+
+
+async def _read_materialized_api_note(api_file: Path, file_path: str) -> str:
+    """Wait for the accepted local write, then read its canonical file."""
+    # Deferred: importing the materialization runtime at CLI module load would slow every
+    # command, while doctor is the only command that needs to observe its write immediately.
+    from basic_memory.index.note_content_materialization import drain_pending_materializations
+
+    # Trigger: production accepts note content before its markdown file is materialized.
+    # Why: doctor verifies the complete DB -> file contract, not only write acceptance.
+    # Outcome: wait for the same deferred work drained at normal CLI shutdown before checking.
+    await drain_pending_materializations()
+
+    if not api_file.exists():
+        raise ValueError(f"API note file missing: {file_path}")
+
+    return api_file.read_text(encoding="utf-8")
 
 
 async def run_doctor() -> None:
@@ -110,9 +136,16 @@ async def run_doctor() -> None:
             project_id: str | None = None
 
             try:
-                status = await project_client.create_project(project_request.model_dump())
+                from basic_memory.config import ConfigManager
+
+                status = (
+                    await project_client.create_doctor_project()
+                    if ConfigManager().config.project_root
+                    else await project_client.create_project(project_request.model_dump())
+                )
                 if not status.new_project:
                     raise ValueError("Failed to create doctor project")
+                project_name = status.new_project.name
                 project_id = status.new_project.external_id
                 # Use the resolved path from the server — when project_root is configured,
                 # the actual project directory differs from the requested temp_path
@@ -132,10 +165,7 @@ async def run_doctor() -> None:
                 api_result = await knowledge_client.create_entity(api_note.model_dump())
 
                 api_file = project_path / api_result.file_path
-                if not api_file.exists():
-                    raise ValueError(f"API note file missing: {api_result.file_path}")
-
-                api_text = api_file.read_text(encoding="utf-8")
+                api_text = await _read_materialized_api_note(api_file, api_result.file_path)
                 if api_note_title not in api_text:
                     raise ValueError("API note content missing from file")
 

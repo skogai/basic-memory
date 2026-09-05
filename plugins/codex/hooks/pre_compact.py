@@ -2,7 +2,11 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#     "basic-memory @ git+https://github.com/basicmachines-co/basic-memory@2f58b81b5e00cf4cecf12ce595ec6b500d6575a8",
+#     "basic-memory @ git+https://github.com/basicmachines-co/basic-memory@v0.23.2",
+#     # Direct pre-release pin so old uv resolves basic-memory (which
+#     # requires this exact beta transitively) without enabling
+#     # pre-releases broadly. Keep in lockstep with core pyproject.
+#     "fastmcp==4.0.0b1",
 # ]
 # ///
 """PreCompact hook launcher backed by a pinned Basic Memory revision.

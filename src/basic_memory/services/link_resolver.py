@@ -92,8 +92,9 @@ class LinkResolver:
     1. Try exact permalink match (fastest)
     2. Try exact title match
     3. Try exact file path match
-    4. Try file path with .md extension (for folder/title patterns)
-    5. Fall back to search for fuzzy matching
+    4. Try file path with .md extension (for root or folder/title patterns)
+    5. Try a unique case-insensitive underscore/hyphen file-path alias
+    6. Fall back to search for fuzzy matching
 
     When ``strict`` is set (the destructive edit/move paths) and a title matches more than one
     note, resolution raises ``AmbiguousIdentifierError`` instead of guessing — the caller must pass
@@ -330,6 +331,7 @@ class LinkResolver:
         # Trigger: source_path is provided AND link contains "/"
         # Why: Resolve paths like [[nested/deep-note]] relative to source folder first
         # Outcome: [[nested/deep-note]] from testing/link-test.md → testing/nested/deep-note.md
+        deferred_relative_alias_path: Optional[str] = None
         if source_path and "/" in clean_text:
             if not (
                 include_project
@@ -360,6 +362,16 @@ class LinkResolver:
                     )
                     if entity:
                         return entity
+
+                    # Only exact relative paths may resolve this early. The forgiving
+                    # alias spelling is deferred until every exact identity — permalink,
+                    # title, file path — has missed, or a nearby alias would shadow
+                    # another note's exact permalink.
+                    deferred_relative_alias_path = (
+                        relative_path
+                        if relative_path.casefold().endswith(".md")
+                        else f"{relative_path}.md"
+                    )
 
         # When source_path is provided, use context-aware resolution:
         # Check both permalink and title matches, prefer closest to source.
@@ -463,8 +475,14 @@ class LinkResolver:
             logger.debug(f"Found entity with path: {found_path.file_path}")
             return found_path
 
-        # 4. Try file path with .md extension if not already present
-        if not clean_text.endswith(".md") and "/" in clean_text:
+        # 4. Try file path with .md extension if not already present. Root-level
+        # filename links need the same fallback as nested paths (#1253). Under a
+        # strict resolve, a duplicated bare title remains ambiguous; callers can
+        # disambiguate it by supplying the exact ``.md`` file path as before.
+        file_path_with_md = clean_text
+        can_use_stem_path = "/" in clean_text or not ambiguous_title_candidates
+        has_markdown_extension = clean_text.casefold().endswith(".md")
+        if not has_markdown_extension and can_use_stem_path:
             file_path_with_md = f"{clean_text}.md"
             found_path_md = await entity_repository.get_by_file_path(
                 session,
@@ -474,6 +492,33 @@ class LinkResolver:
             if found_path_md:
                 logger.debug(f"Found entity with path (with .md): {found_path_md.file_path}")
                 return found_path_md
+
+        # 5. Direct-on-disk vaults commonly mix filename separators and case in
+        # wikilinks. Treat those spellings as aliases only after every exact semantic
+        # and path lookup, and only when the alias identifies one file uniquely.
+        # A source-relative alias is the closest forgiving spelling, so it is tried
+        # ahead of the project-wide one.
+        if deferred_relative_alias_path:
+            relative_alias_entity = await entity_repository.get_unique_by_file_path_alias(
+                session,
+                deferred_relative_alias_path,
+                load_relations=load_relations,
+            )
+            if relative_alias_entity:
+                logger.debug(
+                    f"Found entity by relative file path alias: {relative_alias_entity.file_path}"
+                )
+                return relative_alias_entity
+
+        if has_markdown_extension or can_use_stem_path:
+            alias_path = await entity_repository.get_unique_by_file_path_alias(
+                session,
+                file_path_with_md,
+                load_relations=load_relations,
+            )
+            if alias_path:
+                logger.debug(f"Found entity by unique file path alias: {alias_path.file_path}")
+                return alias_path
 
         # No exact permalink or file path matched. If the only thing that matched was a title
         # shared by several notes under a strict resolve, refuse to guess (#1148).
@@ -487,7 +532,7 @@ class LinkResolver:
         if strict:
             return None
 
-        # 5. Fall back to search for fuzzy matching (only if not in strict mode)
+        # 6. Fall back to search for fuzzy matching (only if not in strict mode)
         if use_search and "*" not in clean_text:
             results = await search_service.search(
                 query=SearchQuery(text=clean_text, entity_types=[SearchItemType.ENTITY]),

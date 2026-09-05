@@ -18,9 +18,6 @@ longmemeval_dev_output_dir := "benchmarks/generated/longmemeval-s-dev"
 sync:
     uv sync --group dev
 
-sync-judge:
-    uv sync --group dev --extra judge
-
 test:
     uv run pytest -q
 
@@ -110,13 +107,6 @@ bench-full:
     just bench-prepare-long
     just bench-run-full
 
-# Full retrieval + judge pipeline:
-# 1) sync deps (+judge extras), 2) fetch+convert long dataset, 3) run full with judge
-bench-full-judge model="gpt-4o-mini":
-    just sync-judge
-    just bench-prepare-long
-    just bench-run-full-judge model="{{model}}"
-
 # --- Benchmark execution ---
 
 bench-smoke:
@@ -198,17 +188,32 @@ bench-run-full:
       {{bm_local_path_flag}} \
       --allow-provider-skip
 
-bench-run-full-judge model="gpt-4o-mini":
-    uv run bm-bench run full \
-      --dataset-id locomo \
-      --dataset-path {{locomo_dataset_path}} \
-      --corpus-dir benchmarks/generated/locomo/docs \
-      --queries-path benchmarks/generated/locomo/queries.json \
-      --providers bm-local,mem0-local \
-      {{bm_local_path_flag}} \
-      --allow-provider-skip \
-      --judge \
-      --judge-model "{{model}}"
+# --- Concurrency benchmark (basic-memory#1248) ---
+
+# Small-scale smoke: 4 writers x 25 notes; strict so divergence fails the command
+bench-concurrent-write-smoke:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -z "{{bm_local_path}}" ]]; then
+        echo "BM_LOCAL_PATH must point to the Basic Memory git checkout under test" >&2
+        exit 2
+    fi
+    uv run bm-bench run concurrent-write \
+      --writers 4 --notes-per-writer 25 \
+      --bm-local-path "{{bm_local_path}}" \
+      --strict
+
+# Load shape for the v0.22.1-vs-v0.23 comparison; report-only (divergence is the result)
+bench-concurrent-write-load writers="8" notes="200":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -z "{{bm_local_path}}" ]]; then
+        echo "BM_LOCAL_PATH must point to the Basic Memory git checkout under test" >&2
+        exit 2
+    fi
+    uv run bm-bench run concurrent-write \
+      --writers {{writers}} --notes-per-writer {{notes}} \
+      --bm-local-path "{{bm_local_path}}"
 
 # --- Artifacts and comparison ---
 
@@ -217,8 +222,11 @@ bench-latest-run:
     set -euo pipefail
     ls -1dt benchmarks/runs/* | head -n 1
 
-bench-judge run_dir model="gpt-4o-mini":
-    uv run bm-bench run judge --run-dir "{{run_dir}}" --model "{{model}}"
+bench-qa run_dir answerer="claude:claude-haiku-4-5" judge="claude:claude-sonnet-4-6":
+    uv run bm-bench run qa \
+      --run-dir "{{run_dir}}" \
+      --answerer "{{answerer}}" \
+      --judge "{{judge}}"
 
 bench-validate run_dir:
     uv run bm-bench validate-artifacts --run-dir "{{run_dir}}"

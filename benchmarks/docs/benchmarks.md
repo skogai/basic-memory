@@ -1,7 +1,7 @@
 # Benchmark Runbook
 
 This document is the canonical operator runbook for benchmark execution in
-`basic-memory-benchmarks`.
+the Core repository's `/benchmarks` package.
 
 It covers:
 1. current benchmark workflows and commands,
@@ -12,8 +12,9 @@ It covers:
 
 | Area | Status |
 | --- | --- |
-| Single run execution (`run retrieval`, `run full`, `run judge`) | Implemented |
-| `just` one-command pipelines (`bench-full`, `bench-full-judge`) | Implemented |
+| Single run execution (`run retrieval`, `run full`, `run qa`) | Implemented |
+| Concurrent write convergence (`run concurrent-write`) | Implemented |
+| `just` retrieval and QA workflows (`bench-full`, `bench-qa`) | Implemented |
 | Artifact generation and publish/compare commands | Implemented |
 | Manual BM revision comparison via worktrees + `--bm-local-path` | Implemented workflow, manual orchestration |
 | `bm-bench run revision-matrix` | Planned, not implemented yet |
@@ -42,8 +43,8 @@ It covers:
 
 ### Repositories and paths
 
-- benchmark repo: clone of `basicmachines-co/basic-memory-benchmarks`
-- BM local repo: set `BM_LOCAL_PATH` env var (or in `.env`) to your local `basic-memory` checkout
+- benchmark package: `/benchmarks` in a clone of `basicmachines-co/basic-memory`
+- BM local repo: set `BM_LOCAL_PATH` env var (or in `.env`) to the Core checkout under test
 
 ### Environment
 
@@ -53,14 +54,8 @@ It covers:
 ### One-time setup
 
 ```bash
-cd /path/to/basic-memory-benchmarks
+cd /path/to/basic-memory/benchmarks
 just sync
-```
-
-If you plan to run judge metrics:
-
-```bash
-just sync-judge
 ```
 
 ### Dataset assumptions
@@ -77,13 +72,14 @@ just bench-prepare-long
 ### `just` commands (current)
 
 - `bench-full`
-- `bench-full-judge`
+- `bench-qa`
+- `bench-concurrent-write-smoke`
+- `bench-concurrent-write-load`
 - `bench-prepare-short`
 - `bench-prepare-long`
 - `bench-run-short`
 - `bench-run-long`
 - `bench-run-full`
-- `bench-judge`
 - `bench-validate`
 - `bench-publish`
 - `bench-compare`
@@ -96,8 +92,11 @@ Top-level commands:
 - `datasets fetch`
 - `convert locomo`
 - `run retrieval`
+- `run concurrent-write`
 - `run full`
-- `run judge`
+- `run qa`
+- `run rejudge`
+- `run review`
 - `compare`
 - `validate-artifacts`
 - `publish`
@@ -107,7 +106,7 @@ Top-level commands:
 ### One-command full retrieval run
 
 ```bash
-cd /path/to/basic-memory-benchmarks
+cd /path/to/basic-memory/benchmarks
 just bench-full
 ```
 
@@ -116,17 +115,15 @@ This runs:
 2. `just bench-prepare-long`
 3. `just bench-run-full`
 
-### One-command full retrieval + judge
+### End-to-end QA scoring
 
 ```bash
-cd /path/to/basic-memory-benchmarks
-just bench-full-judge
+cd /path/to/basic-memory/benchmarks
+just bench-qa benchmarks/runs/<run_id>
 ```
 
-This runs:
-1. `just sync-judge`
-2. `just bench-prepare-long`
-3. `just bench-run-full-judge`
+This generates answers from each provider's retrieved context, applies the
+same judge to every provider, and writes QA artifacts into the retrieval run.
 
 ### Short vs long workflows
 
@@ -192,10 +189,15 @@ Required files:
 - `retrieval-summary.json`
 - `summary.md`
 
-Optional judge files:
+Optional QA files:
 
-- `per-query-judge.jsonl`
-- `judge-summary.json`
+- `per-query-qa.jsonl`
+- `qa-summary.json`
+- `per-query-qa-rejudge.jsonl`
+- `qa-rejudge-summary.json`
+- `qa-rejudge-flips.json`
+- `review.html`
+- `qa-diagnosis.json`
 
 ### Key provenance fields
 
@@ -236,7 +238,7 @@ Use this workflow today to compare BM revisions while keeping benchmark tooling 
 
 ```bash
 BM_REPO=/path/to/basic-memory
-WT_ROOT=/path/to/basic-memory-benchmarks/benchmarks/worktrees/basic-memory
+WT_ROOT=/path/to/basic-memory/benchmarks/benchmarks/worktrees/basic-memory
 
 mkdir -p "$WT_ROOT"
 
@@ -250,7 +252,7 @@ git -C "$BM_REPO" worktree add "$WT_ROOT/current" HEAD
 ### Step 2: Prepare benchmark datasets once
 
 ```bash
-cd /path/to/basic-memory-benchmarks
+cd /path/to/basic-memory/benchmarks
 just sync
 just bench-prepare-short
 just bench-prepare-long
@@ -479,7 +481,7 @@ Dry-run checks:
 just --dry-run bench-run-short
 just --dry-run bench-run-long
 just --dry-run bench-full
-just --dry-run bench-full-judge
+just --dry-run bench-qa benchmarks/runs/<run_id>
 ```
 
 Artifact field checks:

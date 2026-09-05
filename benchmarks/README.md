@@ -1,13 +1,15 @@
-# basic-memory-benchmarks
+# Basic Memory benchmarks
 
-Standalone, reproducible benchmark suite for comparing Basic Memory against competitor memory systems.
+Reproducible benchmark suite for comparing Basic Memory against competitor memory systems. The suite
+lives in Core under `/benchmarks` and keeps its own `pyproject.toml` and lockfile so benchmark-only
+dependencies remain isolated from the product environment.
 
 ## Goals
 
 - Deterministic retrieval benchmarks (Recall@5/10, MRR, Precision@5, content-hit, latency)
-- Optional LLM-as-judge scoring (Pydantic Evals)
+- End-to-end QA scoring with fixed answerer and judge models
 - Public artifacts with provenance and reproducibility metadata
-- Clean dependency isolation from the core `basic-memory` repository
+- Clean dependency isolation from the core Basic Memory package
 
 ## Current v1 Scope
 
@@ -25,12 +27,6 @@ Standalone, reproducible benchmark suite for comparing Basic Memory against comp
 
 ```bash
 uv sync --group dev
-```
-
-Optional judge dependencies:
-
-```bash
-uv sync --group dev --extra judge
 ```
 
 ## Quickstart
@@ -83,16 +79,7 @@ know") when the retrieved memories don't contain the answer, and abstention is
 graded correct only when the gold answer marks the question unanswerable
 (LoCoMo adversarial cases).
 
-### 5) Optional retrieval-context judge (legacy)
-
-Scores whether the *retrieved context* contains the expected answer, without
-answer generation:
-
-```bash
-uv run bm-bench run judge --run-dir benchmarks/runs/<run-id>
-```
-
-### 6) Publish run artifacts
+### 5) Publish run artifacts
 
 ```bash
 uv run bm-bench publish --run-dir benchmarks/runs/<run-id>
@@ -168,6 +155,43 @@ multiple questions each, all sharing one ingested group corpus.
 Anti-leakage: raw conversations carry `containsEvidence`/`model_name` fields;
 rendered docs include neither and conversation ids are remapped to neutral
 positional ids.
+
+## Concurrent-write benchmark (basic-memory#1248)
+
+Measures correctness under concurrency: independent `bm mcp` client sessions
+create and edit notes in one shared Basic Memory project, with overlapping
+relation targets and shared hub notes that every writer appends to (the
+multi-agent shape from basic-memory#1213/#1214).
+
+The driver requires a clean local git checkout so every result records the exact
+Basic Memory commit under test. Commit or stash tracked and untracked changes in
+the target checkout before running it:
+
+```bash
+# Run from the Core benchmarks directory.
+BM_LOCAL_PATH=.. just bench-concurrent-write-smoke
+
+# Load shape, report-only (divergence is a valid benchmark result).
+BM_LOCAL_PATH=.. just bench-concurrent-write-load writers=8 notes=200
+
+# Direct invocation against another checkout or worktree.
+uv run bm-bench run concurrent-write \
+  --writers 4 --notes-per-writer 25 \
+  --bm-local-path /path/to/basic-memory
+```
+
+Per run (`benchmarks/runs/<run-id>/`): `manifest.json`, `per-op.jsonl`,
+`concurrent-write-summary.json`, and `summary.md`. After the concurrent phase
+settles, the driver records convergence directly from the on-disk files and
+the isolated SQLite index before optionally timing a full reindex. It checks
+file/entity/row counts, duplicate permalinks, duplicate observation or relation
+tuples, and unique `bmk-*` markers that detect lost or doubled writes.
+
+The run uses a fresh isolated home under `benchmarks/.bm-homes/`; environment
+variables such as `BASIC_MEMORY_SEMANTIC_SEARCH_ENABLED` pass through, so axes
+like Redis on/off are controlled the same way as the retrieval scripts.
+Postgres row-integrity checks are a follow-up; the write workload itself is
+database-agnostic.
 
 ## Basic Memory source policy
 
@@ -251,8 +275,6 @@ Per run (`benchmarks/runs/<run-id>/`):
 - `retrieval-summary.json`
 - `per-query-qa.jsonl` (optional)
 - `qa-summary.json` (optional)
-- `per-query-judge.jsonl` (optional)
-- `judge-summary.json` (optional)
 - `summary.md`
 
 ## Just commands
@@ -264,8 +286,8 @@ just bench-convert-locomo
 just bench-run-bm-local
 just bench-run-mem0-local
 just bench-run-full
-just bench-judge
-just bench-publish RUN_DIR=benchmarks/runs/<run-id>
+just bench-qa benchmarks/runs/<run-id>
+just bench-publish benchmarks/runs/<run-id>
 ```
 
 ## Notes on dataset publication

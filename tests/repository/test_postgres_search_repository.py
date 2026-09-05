@@ -168,6 +168,68 @@ async def test_postgres_search_repository_index_and_search(session_maker, test_p
 
 
 @pytest.mark.asyncio
+async def test_postgres_search_indexes_full_note_content(session_maker, test_project):
+    """An unbounded note is searchable without creating one unbounded tsvector."""
+    repo = PostgresSearchRepository(session_maker, project_id=test_project.id)
+    now = datetime.now(timezone.utc)
+    deep_content = "shallowmarker " + ("padding " * 150_000) + "deepmarker"
+
+    await repo.index_item(
+        SearchIndexRow(
+            project_id=test_project.id,
+            id=2,
+            title="Deep Search Note",
+            content_stems="deep search note shallowmarker",
+            content_snippet=deep_content,
+            permalink="docs/deep-search-note",
+            file_path="docs/deep-search-note.md",
+            type="entity",
+            metadata={"note_type": "note"},
+            created_at=now,
+            updated_at=now,
+        )
+    )
+
+    assert len(deep_content.encode()) > 1_048_575
+    results = await repo.search(search_text="shallowmarker AND deepmarker")
+    assert [result.permalink for result in results] == ["docs/deep-search-note"]
+    assert await repo.count(search_text="shallowmarker AND deepmarker") == 1
+
+
+@pytest.mark.asyncio
+async def test_postgres_search_preserves_long_lexeme_across_chunk_edge(
+    session_maker,
+    test_project,
+):
+    """A PostgreSQL-indexable lexeme crossing 8,000 characters remains searchable."""
+    repo = PostgresSearchRepository(session_maker, project_id=test_project.id)
+    now = datetime.now(timezone.utc)
+    long_identifier = "lexeme" + ("x" * 394)
+    content = (" " * 7_700) + long_identifier + (" " * 1_000)
+
+    await repo.index_item(
+        SearchIndexRow(
+            project_id=test_project.id,
+            id=3,
+            title="Chunk Edge Note",
+            content_stems="chunk edge note",
+            content_snippet=content,
+            permalink="docs/chunk-edge-note",
+            file_path="docs/chunk-edge-note.md",
+            type="entity",
+            metadata={"note_type": "note"},
+            created_at=now,
+            updated_at=now,
+        )
+    )
+
+    results = await repo.search(search_text=long_identifier)
+
+    assert [result.permalink for result in results] == ["docs/chunk-edge-note"]
+    assert await repo.count(search_text=long_identifier) == 1
+
+
+@pytest.mark.asyncio
 async def test_postgres_search_repository_bulk_index_items_and_prepare_terms(
     session_maker, test_project
 ):
@@ -183,6 +245,29 @@ async def test_postgres_search_repository_bulk_index_items_and_prepare_terms(
     assert repo._prepare_search_term("coffee brewing") == "coffee:* & brewing:*"
     assert repo._prepare_single_term("   ") == "   "
     assert repo._prepare_single_term("coffee", is_prefix=False) == "coffee"
+
+    indexed_from, _where, indexed_params, _order, _score = await repo._build_fts_query_parts(
+        search_text="coffee brewing",
+        allow_relaxed=True,
+    )
+    assert "FROM search_index AS candidate_parent" in indexed_from
+    assert "FROM search_index_fts_chunks AS candidate_chunk" in indexed_from
+    assert "querytree(to_tsquery('english', :text))" in indexed_from
+    assert indexed_params["text_candidate"] == "coffee:* | brewing:*"
+
+    filtered_from, _where, _params, _order, _score = await repo._build_fts_query_parts(
+        search_text="coffee brewing",
+        metadata_filters={"status": "active"},
+    )
+    assert "AS fts_candidate" in filtered_from
+    assert "JOIN entity ON search_index.entity_id = entity.id" in filtered_from
+
+    negated_from, _where, negated_params, _order, _score = await repo._build_fts_query_parts(
+        search_text="coffee NOT brewing",
+    )
+    assert "AS fts_candidate" in negated_from
+    assert "FROM search_index AS candidate_all" in negated_from
+    assert negated_params["text_candidate"] == "coffee | brewing"
 
     now = datetime.now(timezone.utc)
     rows = [
@@ -220,6 +305,10 @@ async def test_postgres_search_repository_bulk_index_items_and_prepare_terms(
     permalinks = {r.permalink for r in results}
     assert "docs/pour-over" in permalinks
     assert "docs/french-press" in permalinks
+
+    negated_results = await repo.search(search_text="coffee NOT french")
+    assert [result.permalink for result in negated_results] == ["docs/pour-over"]
+    assert await repo.count(search_text="coffee NOT french") == 1
 
 
 @pytest.mark.asyncio
@@ -327,6 +416,7 @@ async def test_postgres_search_repository_reraises_non_tsquery_db_errors(
     from basic_memory import db
 
     async with db.scoped_session(session_maker) as session:
+        await session.execute(text("DROP TABLE search_index_fts_chunks"))
         await session.execute(text("DROP TABLE search_index"))
         await session.commit()
 
@@ -1162,3 +1252,96 @@ async def test_postgres_relaxes_after_strict_tsquery_syntax_error(
     search_syntax_error_count = len(syntax_errors)
     assert await repo.count(search_text=query, allow_relaxed=True) == 1
     assert len(syntax_errors) > search_syntax_error_count
+
+
+@pytest.mark.asyncio
+async def test_postgres_relaxed_retry_probes_joined_formatting_characters(
+    session_maker,
+    test_project,
+):
+    """Relaxed probes include words joined after removing formatting characters."""
+    repo = PostgresSearchRepository(session_maker, project_id=test_project.id)
+    now = datetime.now(timezone.utc)
+    await repo.index_item(
+        SearchIndexRow(
+            project_id=test_project.id,
+            id=79,
+            title="Joined word reference",
+            content_stems="a document containing foobar",
+            content_snippet="A document containing foobar.",
+            permalink="docs/joined-word-reference",
+            file_path="docs/joined-word-reference.md",
+            type="entity",
+            metadata={"note_type": "note"},
+            created_at=now,
+            updated_at=now,
+        )
+    )
+
+    query = "foo\u00adbar absentone absenttwo"
+    results = await repo.search(search_text=query, allow_relaxed=True)
+
+    assert any(row.id == 79 for row in results)
+    assert await repo.count(search_text=query, allow_relaxed=True) == 1
+
+
+@pytest.mark.asyncio
+async def test_postgres_relaxed_retry_quotes_apostrophe_operands(
+    session_maker,
+    test_project,
+):
+    """An apostrophe syntax error does not poison relaxed candidate probes."""
+    repo = PostgresSearchRepository(session_maker, project_id=test_project.id)
+    now = datetime.now(timezone.utc)
+    await repo.index_item(
+        SearchIndexRow(
+            project_id=test_project.id,
+            id=81,
+            title="Contraction reference",
+            content_stems="can't sunrise",
+            content_snippet="Can't miss the sunrise.",
+            permalink="docs/contraction-reference",
+            file_path="docs/contraction-reference.md",
+            type="entity",
+            metadata={"note_type": "note"},
+            created_at=now,
+            updated_at=now,
+        )
+    )
+
+    query = "can't find sunrise"
+    results = await repo.search(search_text=query, allow_relaxed=True)
+
+    assert any(row.id == 81 for row in results)
+    assert await repo.count(search_text=query, allow_relaxed=True) == 1
+
+
+@pytest.mark.asyncio
+async def test_postgres_search_supports_more_than_one_hundred_operands(
+    session_maker,
+    test_project,
+):
+    """Synthetic document vectors do not exceed PostgreSQL's function argument limit."""
+    repo = PostgresSearchRepository(session_maker, project_id=test_project.id)
+    now = datetime.now(timezone.utc)
+    await repo.index_item(
+        SearchIndexRow(
+            project_id=test_project.id,
+            id=80,
+            title="Long query reference",
+            content_stems="a document containing targetterm",
+            content_snippet="A document containing targetterm.",
+            permalink="docs/long-query-reference",
+            file_path="docs/long-query-reference.md",
+            type="entity",
+            metadata={"note_type": "note"},
+            created_at=now,
+            updated_at=now,
+        )
+    )
+
+    query = " ".join(["targetterm", *(f"absent{index}" for index in range(100))])
+    results = await repo.search(search_text=query, allow_relaxed=True)
+
+    assert any(row.id == 80 for row in results)
+    assert await repo.count(search_text=query, allow_relaxed=True) == 1

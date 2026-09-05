@@ -3,6 +3,7 @@
 import asyncio
 import json
 import re
+import time
 from collections.abc import Sequence
 from datetime import datetime
 from typing import Any, override, List, Optional
@@ -25,6 +26,10 @@ from basic_memory.repository.search_repository_base import (
     SearchRepositoryBase,
     VectorChunkState,
 )
+from basic_memory.repository.search_trace import (
+    SearchTraceCollector,
+    build_fts_page_stage,
+)
 from basic_memory.repository.metadata_filters import parse_metadata_filters
 from basic_memory.repository.semantic_errors import SemanticDependenciesMissingError
 from basic_memory.repository.semantic_vector_index import SemanticVectorIndex
@@ -38,6 +43,66 @@ from basic_memory.repository.semantic_vector_index_factory import (
 )
 from basic_memory.repository.pgvector_index import PgVectorIndex
 from basic_memory.schemas.search import SearchItemType, SearchRetrievalMode
+
+
+POSTGRES_FTS_CHUNK_SIZE = 8_000
+# PostgreSQL ignores lexemes at 2 KiB and above. A 2,048-character overlap is
+# therefore conservative for every indexable lexeme, including multi-byte text:
+# any token split at one 8,000-character edge is complete in the next chunk.
+POSTGRES_FTS_CHUNK_OVERLAP = 2_048
+_TSQUERY_OPERAND_PATTERN = re.compile(r"'(?:''|[^'])*'(?::\*)?|[^\s&|!()]+")
+_TSQUERY_WORD_PATTERN = re.compile(r"[^\W_]+(?:'[^\W_]+)?", re.UNICODE)
+
+
+def _iter_fts_chunks(content: str | None) -> list[tuple[int, str]]:
+    """Split full note text without losing an indexable lexeme at a chunk edge."""
+    if not content:
+        return []
+
+    step = POSTGRES_FTS_CHUNK_SIZE - POSTGRES_FTS_CHUNK_OVERLAP
+    return [
+        (chunk_index, content[start : start + POSTGRES_FTS_CHUNK_SIZE])
+        for chunk_index, start in enumerate(range(0, len(content), step))
+    ]
+
+
+def _tsquery_operands(processed_text: str) -> list[tuple[str, str]]:
+    """Return unique (query operand, representative text) pairs in source order."""
+    operands: dict[str, str] = {}
+    for operand in _TSQUERY_OPERAND_PATTERN.findall(processed_text):
+        representative = operand.removesuffix(":*")
+        if representative.startswith("'") and representative.endswith("'"):
+            representative = representative[1:-1].replace("''", "'")
+            operands.setdefault(operand, representative)
+            continue
+
+        # An unquoted apostrophe is invalid tsquery syntax. Keep the literal
+        # word for the synthetic document, but quote and escape its probe so a
+        # strict syntax failure can proceed to the relaxed retry.
+        if "'" in representative:
+            escaped = "'{}'".format(representative.replace("'", "''"))
+            safe_operand = f"{escaped}:*" if operand.endswith(":*") else escaped
+            operands.setdefault(safe_operand, representative)
+            continue
+
+        # PostgreSQL legitimately parses punctuation inside operands such as
+        # ``v0.13.0b2:*`` and ``auth-service:*``. Preserve those bytes so the
+        # synthetic document is tokenized the same way as the original note.
+        if "<" not in representative and ">" not in representative:
+            operands.setdefault(operand, representative)
+            continue
+
+        # A malformed strict operand (for example ``foo<bar:*``) must not poison
+        # the later relaxed retry. Split punctuation into the same safe word pieces
+        # that PostgreSQL will lex, while the original full tsquery still determines
+        # whether the strict attempt raises and falls back.
+        is_prefix = operand.endswith(":*")
+        words = _TSQUERY_WORD_PATTERN.findall(representative)
+        for word in words or [representative]:
+            escaped_word = "'{}'".format(word.replace("'", "''")) if "'" in word else word
+            safe_operand = f"{escaped_word}:*" if is_prefix else escaped_word
+            operands.setdefault(safe_operand, word)
+    return list(operands.items())
 
 
 def _strip_nul_from_row(row_data: dict[str, Any]) -> dict[str, Any]:
@@ -194,8 +259,75 @@ class PostgresSearchRepository(SearchRepositoryBase):
                 """),
                 insert_data,
             )
+            await self._replace_fts_chunks(session, [search_index_row])
             logger.debug(f"indexed row {search_index_row}")
             await session.commit()
+
+    async def _replace_fts_chunks(
+        self,
+        session: AsyncSession,
+        search_index_rows: Sequence[SearchIndexRow],
+    ) -> None:
+        """Replace bounded full-content FTS rows for one indexing batch."""
+        if not search_index_rows:
+            return
+
+        await session.execute(
+            text("""
+                DELETE FROM search_index_fts_chunks
+                WHERE project_id = :project_id
+                  AND (search_index_id, search_index_type) IN (
+                      SELECT search_index_id, search_index_type
+                      FROM unnest(
+                          CAST(:search_index_ids AS INTEGER[]),
+                          CAST(:search_index_types AS VARCHAR[])
+                      ) AS indexed_rows(search_index_id, search_index_type)
+                  )
+            """),
+            {
+                "project_id": self.project_id,
+                "search_index_ids": [row.id for row in search_index_rows],
+                "search_index_types": [row.type for row in search_index_rows],
+            },
+        )
+
+        chunks = [
+            {
+                "search_index_id": row.id,
+                "search_index_type": row.type,
+                "chunk_index": chunk_index,
+                "chunk_text": chunk_text.replace("\x00", ""),
+            }
+            for row in search_index_rows
+            for chunk_index, chunk_text in _iter_fts_chunks(row.content_snippet)
+        ]
+        if not chunks:
+            return
+
+        await session.execute(
+            text("""
+                INSERT INTO search_index_fts_chunks (
+                    project_id,
+                    search_index_id,
+                    search_index_type,
+                    chunk_index,
+                    chunk_text
+                )
+                SELECT
+                    :project_id,
+                    chunk.search_index_id,
+                    chunk.search_index_type,
+                    chunk.chunk_index,
+                    chunk.chunk_text
+                FROM jsonb_to_recordset(CAST(:chunks AS JSONB)) AS chunk(
+                    search_index_id INTEGER,
+                    search_index_type VARCHAR,
+                    chunk_index INTEGER,
+                    chunk_text TEXT
+                )
+            """),
+            {"project_id": self.project_id, "chunks": json.dumps(chunks)},
+        )
 
     # ------------------------------------------------------------------
     # tsquery preparation (backend-specific)
@@ -226,12 +358,24 @@ class PostgresSearchRepository(SearchRepositoryBase):
         return self._prepare_single_term(term, is_prefix)
 
     @staticmethod
+    def _relaxed_tsquery_term(word: str) -> str:
+        """Render one relaxed word as a tsquery-safe prefix expression.
+
+        Mirrors the SQLite renderer: a word token can contain an apostrophe, and
+        tsquery reads that as lexeme-quoting syntax rather than text. Quoting the
+        lexeme and doubling any interior quote keeps it literal.
+        """
+        if "'" in word:
+            return "'{}':*".format(word.replace("'", "''"))
+        return f"{word}:*"
+
+    @staticmethod
     def _relaxed_tsquery_text(search_text: Optional[str]) -> Optional[str]:
         """OR-relaxed tsquery expression for a failed strict query, or None."""
         words = relaxed_query_words(search_text)
         if not words:
             return None
-        return " | ".join(f"{word}:*" for word in words)
+        return " | ".join(PostgresSearchRepository._relaxed_tsquery_term(word) for word in words)
 
     def _prepare_boolean_query(self, query: str) -> str:
         """Convert Boolean query to tsquery format.
@@ -326,6 +470,37 @@ class PostgresSearchRepository(SearchRepositoryBase):
     # ------------------------------------------------------------------
 
     @override
+    async def get_entity_physical_chunk_keys(self, entity_id: int) -> set[str] | None:
+        """Return chunk keys whose pgvector physical row is live for this entity."""
+        # Trigger: semantic search is off, or the configured index is external.
+        # Why: a disabled config expects no physical rows, and external adapters expose
+        # no portable storage-inspection contract (same rule as get_embedding_status()).
+        # Outcome: None — chunk status stays manifest-only.
+        if not self._semantic_enabled or self._semantic_vector_index_name != "pgvector":
+            return None
+        async with db.scoped_session(self.session_maker) as session:
+            tables_result = await session.execute(
+                text(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema = ANY (current_schemas(false)) "
+                    "AND table_name IN ('search_vector_chunks', 'search_vector_embeddings')"
+                )
+            )
+            table_names = {str(name) for name in tables_result.scalars().all()}
+            if not {"search_vector_chunks", "search_vector_embeddings"} <= table_names:
+                return set()
+            result = await session.execute(
+                text(
+                    "SELECT c.chunk_key FROM search_vector_chunks c "
+                    "JOIN search_vector_embeddings e "
+                    "ON e.chunk_id = c.id AND e.source_hash = c.source_hash "
+                    "WHERE c.project_id = :project_id AND c.entity_id = :entity_id"
+                ),
+                {"project_id": self.project_id, "entity_id": entity_id},
+            )
+            return {str(chunk_key) for chunk_key in result.scalars().all()}
+
+    @override
     async def _ensure_vector_tables(self) -> None:
         self._assert_semantic_available()
         if not hasattr(self, "_semantic_vector_index"):
@@ -397,8 +572,15 @@ class PostgresSearchRepository(SearchRepositoryBase):
         session: AsyncSession,
         query_embedding: list[float],
         candidate_limit: int,
+        *,
+        trace: SearchTraceCollector | None = None,
     ) -> list[dict[str, Any]]:
-        return await super()._run_vector_query(session, query_embedding, candidate_limit)
+        return await super()._run_vector_query(
+            session,
+            query_embedding,
+            candidate_limit,
+            trace=trace,
+        )
 
     @override
     def _vector_prepare_window_size(self) -> int:
@@ -602,6 +784,7 @@ class PostgresSearchRepository(SearchRepositoryBase):
                 """),
                 insert_data_list,
             )
+            await self._replace_fts_chunks(session, search_index_rows)
             logger.debug(f"Bulk indexed {len(search_index_rows)} rows")
             await session.commit()
 
@@ -630,12 +813,14 @@ class PostgresSearchRepository(SearchRepositoryBase):
         search_item_types: Optional[List[SearchItemType]] = None,
         categories: Optional[List[str]] = None,
         metadata_filters: Optional[dict[str, Any]] = None,
+        allow_relaxed: bool = False,
     ) -> tuple[str, str, dict[str, Any], str, str]:
         """Build Postgres FTS FROM/WHERE params shared by search and count."""
         conditions = []
         params = {}
         order_by_clause = ""
         from_clause = "search_index"
+        document_vector_sql: str | None = None
 
         # Handle text search for title and content using tsvector
         if search_text:
@@ -646,10 +831,61 @@ class PostgresSearchRepository(SearchRepositoryBase):
                 # Prepare search term for tsquery
                 processed_text = self._prepare_search_term(search_text.strip())
                 params["text"] = processed_text
-                # Use @@ operator for tsvector matching
-                conditions.append(
-                    "search_index.textsearchable_index_col @@ to_tsquery('english', :text)"
-                )
+                probe_texts = [processed_text]
+                if allow_relaxed:
+                    relaxed_text = self._relaxed_tsquery_text(search_text)
+                    if relaxed_text:
+                        probe_texts.append(relaxed_text)
+
+                candidate_operands: dict[str, None] = {}
+                for probe_text in probe_texts:
+                    for operand, _representative in _tsquery_operands(probe_text):
+                        candidate_operands.setdefault(operand, None)
+                if candidate_operands:
+                    params["text_candidate"] = " | ".join(candidate_operands)
+
+                    # Trigger: PostgreSQL can extract a required-positive query tree.
+                    # Why: OR-ing its operands is a safe indexed superset even when
+                    # terms live in different chunks. Pure/optional negation returns
+                    # ``T`` and must retain all project rows for correct semantics.
+                    # Outcome: ordinary and required-positive NOT queries use both
+                    # GIN indexes; only genuinely unindexable negation scans the project.
+                    from_clause = """
+                            search_index JOIN (
+                                SELECT
+                                    candidate_parent.project_id,
+                                    candidate_parent.id,
+                                    candidate_parent.type
+                                FROM search_index AS candidate_parent
+                                WHERE candidate_parent.project_id = :project_id
+                                  AND querytree(to_tsquery('english', :text)) <> 'T'
+                                  AND candidate_parent.textsearchable_index_col
+                                      @@ to_tsquery('english', :text_candidate)
+                                UNION
+                                SELECT
+                                    candidate_chunk.project_id,
+                                    candidate_chunk.search_index_id AS id,
+                                    candidate_chunk.search_index_type AS type
+                                FROM search_index_fts_chunks AS candidate_chunk
+                                WHERE candidate_chunk.project_id = :project_id
+                                  AND querytree(to_tsquery('english', :text)) <> 'T'
+                                  AND candidate_chunk.textsearchable_index_col
+                                      @@ to_tsquery('english', :text_candidate)
+                                UNION
+                                SELECT
+                                    candidate_all.project_id,
+                                    candidate_all.id,
+                                    candidate_all.type
+                                FROM search_index AS candidate_all
+                                WHERE candidate_all.project_id = :project_id
+                                  AND querytree(to_tsquery('english', :text)) = 'T'
+                            ) AS fts_candidate
+                              ON fts_candidate.project_id = search_index.project_id
+                             AND fts_candidate.id = search_index.id
+                             AND fts_candidate.type = search_index.type
+                    """
+                document_vector_sql = self._document_fts_vector_sql(probe_texts, params)
+                conditions.append(f"{document_vector_sql} @@ to_tsquery('english', :text)")
 
         # Handle title search
         if title:
@@ -730,7 +966,7 @@ class PostgresSearchRepository(SearchRepositoryBase):
         # path parts instead of #>> / #> with interpolated paths.
         if metadata_filters:
             parsed_filters = parse_metadata_filters(metadata_filters)
-            from_clause = "search_index JOIN entity ON search_index.entity_id = entity.id"
+            from_clause = f"{from_clause} JOIN entity ON search_index.entity_id = entity.id"
             metadata_expr = "entity.entity_metadata::jsonb"
 
             for idx, filt in enumerate(parsed_filters):
@@ -808,13 +1044,58 @@ class PostgresSearchRepository(SearchRepositoryBase):
         # Build SQL with ts_rank() for scoring
         # Note: If no text search, score will be NULL, so we use COALESCE to default to 0
         if search_text and search_text.strip() and search_text.strip() != "*":
+            assert document_vector_sql is not None
             score_expr = (
-                "ts_rank(search_index.textsearchable_index_col, to_tsquery('english', :text))"
+                "GREATEST("
+                f"ts_rank({document_vector_sql}, to_tsquery('english', :text)), "
+                "ts_rank(search_index.textsearchable_index_col, to_tsquery('english', :text)), "
+                "COALESCE((SELECT MAX(ts_rank("
+                "fts_chunk.textsearchable_index_col, to_tsquery('english', :text))) "
+                "FROM search_index_fts_chunks AS fts_chunk "
+                "WHERE fts_chunk.project_id = search_index.project_id "
+                "AND fts_chunk.search_index_id = search_index.id "
+                "AND fts_chunk.search_index_type = search_index.type "
+                "AND fts_chunk.textsearchable_index_col "
+                "@@ to_tsquery('english', :text)), 0))"
             )
         else:
             score_expr = "0"
 
         return from_clause, where_clause, params, order_by_clause, score_expr
+
+    @staticmethod
+    def _document_fts_vector_sql(processed_texts: Sequence[str], params: dict[str, Any]) -> str:
+        """Build a query-sized vector representing lexemes found anywhere in one item."""
+        operands: dict[str, str] = {}
+        for processed_text in processed_texts:
+            for operand, representative in _tsquery_operands(processed_text):
+                operands.setdefault(operand, representative)
+
+        present_lexemes: list[str] = []
+        for index, (operand, representative) in enumerate(operands.items()):
+            operand_param = f"text_operand_{index}"
+            representative_param = f"text_representative_{index}"
+            params[operand_param] = operand
+            params[representative_param] = representative
+            present_lexemes.append(
+                "CASE WHEN (search_index.textsearchable_index_col "
+                f"@@ to_tsquery('english', :{operand_param}) OR EXISTS ("
+                "SELECT 1 FROM search_index_fts_chunks AS operand_chunk "
+                "WHERE operand_chunk.project_id = search_index.project_id "
+                "AND operand_chunk.search_index_id = search_index.id "
+                "AND operand_chunk.search_index_type = search_index.type "
+                "AND operand_chunk.textsearchable_index_col "
+                f"@@ to_tsquery('english', :{operand_param}))) "
+                f"THEN :{representative_param} ELSE '' END"
+            )
+
+        if not present_lexemes:
+            return "search_index.textsearchable_index_col"
+
+        # The synthesized text contains at most the query operands, never the note body.
+        # This preserves document-wide Boolean semantics without recreating an unbounded vector.
+        lexeme_array = f"ARRAY[{', '.join(present_lexemes)}]"
+        return f"to_tsvector('english', array_to_string({lexeme_array}, ' '))"
 
     @override
     async def search(
@@ -834,6 +1115,8 @@ class PostgresSearchRepository(SearchRepositoryBase):
         offset: int = 0,
         allow_relaxed: bool = False,
         session: AsyncSession | None = None,
+        *,
+        trace: SearchTraceCollector | None = None,
     ) -> List[SearchIndexRow]:
         """Search across all indexed content using PostgreSQL tsvector."""
         # --- Dispatch vector / hybrid modes (shared logic) ---
@@ -851,6 +1134,7 @@ class PostgresSearchRepository(SearchRepositoryBase):
             min_similarity=min_similarity,
             limit=limit,
             offset=offset,
+            trace=trace,
         )
         if dispatched is not None:
             return dispatched
@@ -872,6 +1156,7 @@ class PostgresSearchRepository(SearchRepositoryBase):
             search_item_types=search_item_types,
             categories=categories,
             metadata_filters=metadata_filters,
+            allow_relaxed=allow_relaxed,
         )
 
         # set limit and offset
@@ -904,6 +1189,7 @@ class PostgresSearchRepository(SearchRepositoryBase):
         """
 
         logger.trace(f"Search {sql} params: {params}")
+        fts_started_at = time.perf_counter() if trace is not None else None
 
         use_savepoint = session is not None or allow_relaxed
 
@@ -921,6 +1207,7 @@ class PostgresSearchRepository(SearchRepositoryBase):
         async def run_search(active_session: AsyncSession):
             relaxed = self._relaxed_tsquery_text(search_text) if allow_relaxed else None
             strict_syntax_error = False
+            relaxed_fallback_used = False
             try:
                 rows = await execute_rows(active_session, params)
             except Exception as exc:
@@ -938,6 +1225,7 @@ class PostgresSearchRepository(SearchRepositoryBase):
             # Outcome: one retry with OR-joined prefix lexemes; ts_rank
             # still ranks multi-term matches first.
             if relaxed and not rows and params.get("text"):
+                relaxed_fallback_used = True
                 retry_reason = "invalid syntax" if strict_syntax_error else "0 results"
                 logger.debug(
                     f"Strict Postgres FTS returned {retry_reason}; retrying relaxed FTS query "
@@ -955,17 +1243,27 @@ class PostgresSearchRepository(SearchRepositoryBase):
                         active_session,
                         {**params, "text": relaxed},
                     )
-            return rows
+            return rows, relaxed_fallback_used
 
         try:
             if session is not None:
-                rows = await run_search(session)
+                rows, relaxed_fallback_used = await run_search(session)
             else:
                 async with db.scoped_session(self.session_maker) as owned_session:
-                    rows = await run_search(owned_session)
+                    rows, relaxed_fallback_used = await run_search(owned_session)
         except Exception as e:
             if self._is_tsquery_syntax_error(e):
                 logger.warning(f"tsquery syntax error for search term: {search_text}, error: {e}")
+                if trace is not None:
+                    trace.fts = build_fts_page_stage(
+                        [],
+                        relaxed_fallback_used=False,
+                        fts_ms=(
+                            (time.perf_counter() - fts_started_at) * 1000
+                            if fts_started_at is not None
+                            else None
+                        ),
+                    )
                 return []
 
             # Re-raise other database errors
@@ -973,6 +1271,16 @@ class PostgresSearchRepository(SearchRepositoryBase):
             raise
 
         results = [SearchIndexRow.from_mapping(row._asdict()) for row in rows]
+        if trace is not None:
+            trace.fts = build_fts_page_stage(
+                [((row.type, row.id), row.score or 0.0) for row in results],
+                relaxed_fallback_used=relaxed_fallback_used,
+                fts_ms=(
+                    (time.perf_counter() - fts_started_at) * 1000
+                    if fts_started_at is not None
+                    else None
+                ),
+            )
 
         logger.trace(f"Found {len(results)} search results")
         for r in results:
@@ -1030,6 +1338,7 @@ class PostgresSearchRepository(SearchRepositoryBase):
             search_item_types=search_item_types,
             categories=categories,
             metadata_filters=metadata_filters,
+            allow_relaxed=allow_relaxed,
         )
         sql = f"SELECT COUNT(*) FROM {from_clause} WHERE {where_clause}"
         logger.trace(f"Count {sql} params: {params}")

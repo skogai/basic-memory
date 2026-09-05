@@ -42,11 +42,11 @@ ENV BASIC_MEMORY_HOME=/app/data/basic-memory \
 USER appuser
 
 # Expose port
-EXPOSE 8000
+EXPOSE 8080
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD basic-memory --version || exit 1
 
 # Use the basic-memory entrypoint to run the MCP server with default SSE transport
-CMD ["basic-memory", "mcp", "--transport", "sse", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["basic-memory", "mcp", "--transport", "http", "--host", "0.0.0.0", "--port", "8080"]

@@ -3,11 +3,11 @@
 import hashlib
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, cast
+from typing import Any, Callable, Dict, List, Literal, Optional, cast
 
 import logfire as logfire
 from loguru import logger
@@ -16,10 +16,14 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from basic_memory import db
+from basic_memory.config import BasicMemoryConfig
 from basic_memory.repository import semantic_vector_sync
 from basic_memory.repository.embedding_provider import (
     EmbeddingProvider,
     embedding_provider_identity,
+)
+from basic_memory.repository.embedding_provider_factory import (
+    configured_embedding_provider_identity,
 )
 from basic_memory.repository.rerank_provider import (
     RerankProvider,
@@ -28,6 +32,20 @@ from basic_memory.repository.rerank_provider import (
     validate_rerank_scores,
 )
 from basic_memory.repository.search_index_row import SearchIndexRow
+from basic_memory.repository.search_trace import (
+    BelowThreshold,
+    FilteredOut,
+    HydrationDropKey,
+    HydrationDropped,
+    MissingSearchRow,
+    SearchTraceCollector,
+    build_fts_page_stage,
+    build_fusion_stage,
+    build_rerank_stage,
+    build_vector_stage,
+    classify_hydration_drops,
+    read_manifest_readiness,
+)
 from basic_memory.repository.semantic_chunking import (
     SemanticSourceRow,
     VectorChunkRecord,
@@ -59,6 +77,7 @@ from basic_memory.repository.semantic_vector_sync import (
 )
 from basic_memory.runtime.vector_sync import VectorSyncBatchResult
 from basic_memory.schemas.search import SearchItemType, SearchRetrievalMode
+from basic_memory.utils import ensure_timezone_aware
 
 # --- Semantic search constants ---
 
@@ -69,6 +88,7 @@ VECTOR_HYDRATION_BATCH_SIZE = 250
 # to keep enough unique documents in the rerank window.
 RERANK_POOL_CHUNK_FANOUT = 4
 FUSION_BONUS = 0.3
+FUSION_FORMULA_VERSION = "max+0.3*min/v1"
 FTS_GATE_THRESHOLD = 0.0
 TOP_CHUNKS_PER_RESULT = 5
 SMALL_NOTE_CONTENT_LIMIT = 2000
@@ -80,6 +100,53 @@ _BUILT_IN_VECTOR_INDEX_NAMES = frozenset({"pgvector", "sqlite-vec"})
 # auto-increment sequences, so a bare id is ambiguous across row types. Every map in
 # the vector/hybrid retrieval path must key rows by (type, id) to avoid collisions.
 type SearchIndexKey = tuple[str, int]
+type StoredEmbeddingStatus = Literal["pending", "ready"]
+
+
+@dataclass(frozen=True, slots=True)
+class ChunkManifestRow:
+    """One persisted vector-chunk manifest row."""
+
+    entity_id: int
+    chunk_key: str
+    chunk_text: str
+    source_hash: str
+    entity_fingerprint: str
+    embedding_model: str
+    vector_index: str
+    embedding_status: StoredEmbeddingStatus
+    updated_at: datetime
+
+    @classmethod
+    def from_mapping(cls, row: Mapping[str, Any]) -> "ChunkManifestRow":
+        """Hydrate one portable manifest row from SQLite or PostgreSQL."""
+        raw_status = str(row["embedding_status"])
+        match raw_status:
+            case "pending":
+                embedding_status: StoredEmbeddingStatus = "pending"
+            case "ready":
+                embedding_status = "ready"
+            case _:
+                raise ValueError(f"Unknown vector chunk embedding status: {raw_status!r}")
+
+        return cls(
+            entity_id=int(row["entity_id"]),
+            chunk_key=str(row["chunk_key"]),
+            chunk_text=str(row["chunk_text"]),
+            source_hash=str(row["source_hash"]),
+            entity_fingerprint=str(row["entity_fingerprint"]),
+            embedding_model=str(row["embedding_model"]),
+            vector_index=str(row["vector_index"]),
+            embedding_status=embedding_status,
+            updated_at=row["updated_at"],
+        )
+
+    def __post_init__(self) -> None:
+        """Restore a timezone-aware datetime from either backend's raw value."""
+        updated_at = self.updated_at
+        if isinstance(updated_at, str):
+            updated_at = datetime.fromisoformat(updated_at)
+        object.__setattr__(self, "updated_at", ensure_timezone_aware(updated_at))
 
 
 async def purge_stale_search_index_rows(
@@ -131,6 +198,7 @@ class SearchRepositoryBase(ABC):
 
     # --- Subclass-populated attributes ---
     _semantic_enabled: bool
+    _app_config: BasicMemoryConfig
     _semantic_vector_k: int
     _semantic_min_similarity: float
     _embedding_provider: Optional[EmbeddingProvider]
@@ -160,6 +228,41 @@ class SearchRepositoryBase(ABC):
 
         self.session_maker = session_maker
         self.project_id = project_id
+
+    async def semantic_effectively_enabled(self) -> bool:
+        """Return whether semantic retrieval can actually run for this repository.
+
+        Configuration is the default signal. Backends with a startup runtime
+        fallback (SQLite degrades to keyword-only search when sqlite-vec cannot
+        load, #711) override this with a runtime probe so per-request instances
+        honor the degraded state instead of trusting still-enabled config.
+        """
+        return self._semantic_enabled
+
+    @property
+    def configured_embedding_model(self) -> str:
+        """Return the configured persisted embedding identity without loading a model."""
+        return configured_embedding_provider_identity(self._app_config)
+
+    @property
+    def configured_vector_index(self) -> str:
+        """Return the configured vector-index identity."""
+        return self._semantic_vector_index_name
+
+    @property
+    def configured_min_similarity(self) -> float:
+        """Return the configured vector similarity floor."""
+        return self._semantic_min_similarity
+
+    @property
+    def configured_reranker_model(self) -> str | None:
+        """Return the configured reranker identity without invoking it."""
+        return self._rerank_provider.model_name if self._rerank_provider is not None else None
+
+    @property
+    def configured_reranker_candidates(self) -> int:
+        """Return the fixed maximum reranker pool size."""
+        return self._reranker_candidates
 
     # ------------------------------------------------------------------
     # Abstract methods — FTS and schema (backend-specific)
@@ -209,6 +312,8 @@ class SearchRepositoryBase(ABC):
         limit: int = 10,
         offset: int = 0,
         allow_relaxed: bool = False,
+        *,
+        trace: SearchTraceCollector | None = None,
     ) -> List[SearchIndexRow]:
         """Search across all indexed content.
 
@@ -268,8 +373,16 @@ class SearchRepositoryBase(ABC):
         session: AsyncSession,
         query_embedding: list[float],
         candidate_limit: int,
+        *,
+        trace: SearchTraceCollector | None = None,
     ) -> list[dict[str, Any]]:
         """Query the configured adapter and hydrate only live, ready manifest rows."""
+        if trace is not None:
+            trace.vector = build_vector_stage(
+                candidate_limit=candidate_limit,
+                adapter_match_count=0,
+                hydrated_count=0,
+            )
         if candidate_limit <= 0:
             return []
 
@@ -279,7 +392,14 @@ class SearchRepositoryBase(ABC):
                 query_embedding,
                 limit=candidate_limit,
             )
-            return await self._hydrate_vector_matches(session, matches)
+            if trace is not None:
+                trace.readiness = await read_manifest_readiness(
+                    session,
+                    self.project_id,
+                    self._semantic_vector_index_name,
+                    self._embedding_model_key(),
+                )
+            return await self._hydrate_vector_matches(session, matches, trace=trace)
 
         scan_limit = min(candidate_limit, VECTOR_FILTER_SCAN_LIMIT)
         while True:
@@ -287,13 +407,50 @@ class SearchRepositoryBase(ABC):
                 query_embedding,
                 limit=scan_limit,
             )
-            hydrated = await self._hydrate_vector_matches(session, matches)
+            if trace is not None and trace.readiness is None:
+                trace.readiness = await read_manifest_readiness(
+                    session,
+                    self.project_id,
+                    self._semantic_vector_index_name,
+                    self._embedding_model_key(),
+                )
+            hydrated = await self._hydrate_vector_matches(session, matches, trace=trace)
             if (
                 len(hydrated) >= candidate_limit
                 or len(matches) < scan_limit
                 or scan_limit >= VECTOR_FILTER_SCAN_LIMIT
             ):
-                return hydrated[:candidate_limit]
+                returned = hydrated[:candidate_limit]
+                # Trigger: the expanded stale-hit rescan hydrated more chunks than the
+                # candidate window the search consumes.
+                # Why: chunks beyond the window never enter thresholding, fusion, or
+                # reranking — tracing them would invent candidates this execution
+                # never considered.
+                # Outcome: the traced stage is trimmed to the returned window.
+                if trace is not None and trace.vector is not None and len(hydrated) > len(returned):
+                    # Two owners can share one parseable chunk_key (manifest uniqueness
+                    # includes entity_id), so window membership matches by owner too.
+                    returned_chunk_keys = {
+                        (int(row["entity_id"]), str(row["chunk_key"])) for row in returned
+                    }
+                    trimmed: dict[SearchIndexKey, list[tuple[str, float, int | None]]] = {}
+                    for chunk_match in trace.vector.chunk_matches:
+                        if (chunk_match.entity_id, chunk_match.chunk_key) in returned_chunk_keys:
+                            trimmed.setdefault(chunk_match.key, []).append(
+                                (
+                                    chunk_match.chunk_key,
+                                    chunk_match.similarity,
+                                    chunk_match.entity_id,
+                                )
+                            )
+                    # hydrated_count keeps full-scan scope so the vector stage's
+                    # dropped count matches its hydration-drop list; the flattener
+                    # reports the window truncation as its own candidate_window stage.
+                    trace.vector = build_vector_stage(
+                        previous=trace.vector,
+                        chunk_matches=trimmed,
+                    )
+                return returned
 
             # Trigger: stale, pending, or wrong-model adapter hits consumed the
             # requested top-k before manifest hydration.
@@ -307,6 +464,8 @@ class SearchRepositoryBase(ABC):
         self,
         session: AsyncSession,
         matches: list[VectorMatch],
+        *,
+        trace: SearchTraceCollector | None = None,
     ) -> list[dict[str, Any]]:
         """Resolve adapter matches through the authoritative ready manifest."""
         if not matches:
@@ -351,7 +510,7 @@ class SearchRepositoryBase(ABC):
                     for row in result.mappings().all()
                 }
             )
-        return [
+        hydrated = [
             {
                 "entity_id": match.key.entity_id,
                 "chunk_key": match.key.chunk_key,
@@ -361,6 +520,51 @@ class SearchRepositoryBase(ABC):
             for match in matches
             if match.key in chunks_by_key
         ]
+        if trace is not None:
+            dropped_keys = [
+                HydrationDropKey(
+                    entity_id=match.key.entity_id,
+                    chunk_key=match.key.chunk_key,
+                    similarity=match.similarity,
+                    configured_index=self._semantic_vector_index_name,
+                    configured_model=self._embedding_model_key(),
+                )
+                for match in matches
+                if match.key not in chunks_by_key
+            ]
+            drops = await classify_hydration_drops(session, self.project_id, dropped_keys)
+            chunk_matches: dict[SearchIndexKey, list[tuple[str, float, int | None]]] = {}
+            malformed_drops: list[HydrationDropped] = []
+            for row in hydrated:
+                try:
+                    key = self._parse_chunk_key(str(row["chunk_key"]))
+                except (ValueError, IndexError):
+                    # A hydrated chunk with an unparseable key silently vanishes from
+                    # retrieval; the trace must name it or the stage counts lie.
+                    malformed_drops.append(
+                        HydrationDropped(
+                            entity_id=int(row["entity_id"]),
+                            chunk_key=str(row["chunk_key"]),
+                            similarity=float(row["best_similarity"]),
+                            reason="malformed_key",
+                            stored_model=None,
+                            stored_index=None,
+                        )
+                    )
+                    continue
+                chunk_matches.setdefault(key, []).append(
+                    (str(row["chunk_key"]), float(row["best_similarity"]), int(row["entity_id"]))
+                )
+            trace.vector = build_vector_stage(
+                previous=trace.vector,
+                adapter_match_count=len(matches),
+                # Malformed keys are dropped, not served — counting them as output
+                # would contradict the malformed_key rejection listed alongside.
+                hydrated_count=len(hydrated) - len(malformed_drops),
+                drops=(*drops, *malformed_drops),
+                chunk_matches=chunk_matches,
+            )
+        return hydrated
 
     async def _write_embeddings(
         self,
@@ -859,6 +1063,58 @@ class SearchRepositoryBase(ABC):
             logger.debug(f"Bulk indexed {len(search_index_rows)} rows")
             await session.commit()
 
+    async def get_entity_search_rows(self, entity_id: int) -> list[SearchIndexRow]:
+        """Return every search projection owned by one entity."""
+        async with db.scoped_session(self.session_maker) as session:
+            result = await session.execute(
+                text(
+                    "SELECT project_id, id, title, content_stems, content_snippet, "
+                    "permalink, file_path, type, metadata, from_id, to_id, relation_type, "
+                    "entity_id, category, created_at, updated_at "
+                    "FROM search_index "
+                    "WHERE project_id = :project_id AND ("
+                    "(type = 'entity' AND id = :entity_id) "
+                    "OR entity_id = :entity_id "
+                    "OR (type = 'relation' AND from_id = :entity_id)"
+                    ") ORDER BY type, id"
+                ),
+                {"project_id": self.project_id, "entity_id": entity_id},
+            )
+            return [SearchIndexRow.from_mapping(dict(row)) for row in result.mappings().all()]
+
+    async def get_entity_chunk_manifest(self, entity_id: int) -> list[ChunkManifestRow]:
+        """Return the stored vector-chunk manifest for one project-scoped entity."""
+        async with db.scoped_session(self.session_maker) as session:
+            connection = await session.connection()
+            manifest_exists = await connection.run_sync(
+                lambda sync_connection: inspect(sync_connection).has_table("search_vector_chunks")
+            )
+            if not manifest_exists:
+                return []
+
+            result = await session.execute(
+                text(
+                    "SELECT entity_id, chunk_key, chunk_text, source_hash, "
+                    "entity_fingerprint, embedding_model, vector_index, "
+                    "embedding_status, updated_at "
+                    "FROM search_vector_chunks "
+                    "WHERE project_id = :project_id AND entity_id = :entity_id "
+                    "ORDER BY chunk_key"
+                ),
+                {"project_id": self.project_id, "entity_id": entity_id},
+            )
+            return [ChunkManifestRow.from_mapping(dict(row)) for row in result.mappings().all()]
+
+    @abstractmethod
+    async def get_entity_physical_chunk_keys(self, entity_id: int) -> set[str] | None:
+        """Return manifest chunk keys whose built-in physical vector row is live.
+
+        ``None`` means physical storage is not inspectable here: semantic search is
+        disabled, or the configured index is external and exposes no portable
+        storage-inspection contract (mirroring get_embedding_status()).
+        """
+        ...
+
     async def delete_by_entity_id(self, entity_id: int) -> None:
         """Delete all search index entries for an entity.
 
@@ -884,6 +1140,21 @@ class SearchRepositoryBase(ABC):
                     "DELETE FROM search_index WHERE permalink = :permalink AND project_id = :project_id"
                 ),
                 {"permalink": permalink, "project_id": self.project_id},
+            )
+            await session.commit()
+
+    async def delete_project_search_rows(self) -> None:
+        """Delete every full-text search row owned by this repository's project.
+
+        Shared across backends: both store rows in `search_index` keyed by
+        project_id, and a project-scoped DELETE leaves sibling projects in the
+        same database untouched. On Postgres the bounded FTS chunk rows follow
+        via their ON DELETE CASCADE foreign key.
+        """
+        async with db.scoped_session(self.session_maker) as session:
+            await session.execute(
+                text("DELETE FROM search_index WHERE project_id = :project_id"),
+                {"project_id": self.project_id},
             )
             await session.commit()
 
@@ -1625,6 +1896,7 @@ class SearchRepositoryBase(ABC):
         min_similarity: Optional[float] = None,
         limit: int,
         offset: int,
+        trace: SearchTraceCollector | None = None,
     ) -> Optional[List[SearchIndexRow]]:
         """Dispatch vector or hybrid retrieval if requested.
 
@@ -1658,6 +1930,7 @@ class SearchRepositoryBase(ABC):
                 min_similarity=min_similarity,
                 limit=limit,
                 offset=offset,
+                trace=trace,
             )
         if mode == SearchRetrievalMode.HYBRID.value:
             if not can_use_vector:
@@ -1678,6 +1951,7 @@ class SearchRepositoryBase(ABC):
                 min_similarity=min_similarity,
                 limit=limit,
                 offset=offset,
+                trace=trace,
             )
 
         # FTS mode: return None to let the subclass handle it
@@ -1763,6 +2037,7 @@ class SearchRepositoryBase(ABC):
         offset: int,
         limit: int,
         stable_rows: list[SearchIndexRow] | None = None,
+        trace: SearchTraceCollector | None = None,
     ) -> list[SearchIndexRow]:
         """Rerank the top candidates, then return the requested ``[offset:offset+limit]`` page.
 
@@ -1798,10 +2073,14 @@ class SearchRepositoryBase(ABC):
         if not pool or offset >= len(ordered_rows):
             return ordered_rows[offset:page_end]
 
+        pre_rerank_scores = None
+        if trace is not None:
+            pre_rerank_scores = {(row.type, row.id): row.score or 0.0 for row in ordered_rows}
         documents = [self._rerank_document_text(row) for row in pool]
         # A transient provider failure must surface instead of switching this page
         # back to retrieval order. A prior page may already have returned reranked
         # order, so degrading here can duplicate one result and omit another.
+        rerank_start = time.perf_counter() if trace is not None else None
         scores = validate_rerank_scores(
             await self._rerank_provider.rerank(query_text, documents),
             len(pool),
@@ -1814,8 +2093,26 @@ class SearchRepositoryBase(ABC):
             pool=len(pool),
             model=self._rerank_provider.model_name,
         )
-        demoted_tail = self._demote_tail(tail, floor=reranked[-1].score or 0.0)
-        return (reranked + demoted_tail)[offset:page_end]
+        tail_floor = reranked[-1].score or 0.0
+        demoted_tail = self._demote_tail(tail, floor=tail_floor)
+        reranked_rows = reranked + demoted_tail
+        if trace is not None:
+            assert pre_rerank_scores is not None and rerank_start is not None
+            trace.rerank = build_rerank_stage(
+                provider_model=self._rerank_provider.model_name,
+                reranker_candidates=self._reranker_candidates,
+                pre_rerank_scores=pre_rerank_scores,
+                pool_keys=[(row.type, row.id) for row in pool],
+                rerank_scores={
+                    (pool[index].type, pool[index].id): score for index, score in enumerate(scores)
+                },
+                post_rerank_rows=[((row.type, row.id), row.score or 0.0) for row in reranked_rows],
+                demoted_scores={(row.type, row.id): row.score or 0.0 for row in demoted_tail},
+                tail_floor=tail_floor,
+                stable_pool_refetched=trace.stable_pool_refetched,
+                rerank_ms=(time.perf_counter() - rerank_start) * 1000,
+            )
+        return reranked_rows[offset:page_end]
 
     async def _search_vector_only(
         self,
@@ -1835,6 +2132,7 @@ class SearchRepositoryBase(ABC):
         candidate_limit: int | None = None,
         _emit_observability_log: bool = True,
         _apply_rerank: bool = True,
+        trace: SearchTraceCollector | None = None,
     ) -> List[SearchIndexRow]:
         """Run vector-only search returning chunk-level results.
 
@@ -1862,24 +2160,51 @@ class SearchRepositoryBase(ABC):
             # test/runtime pool can contain only one connection. A plain AsyncSession
             # defers checkout until hydration runs after adapter search has released it.
             async with self.session_maker() as session:
-                vector_rows = await self._run_vector_query(
-                    session,
-                    query_embedding,
-                    candidate_limit,
-                )
+                if trace is None:
+                    vector_rows = await self._run_vector_query(
+                        session,
+                        query_embedding,
+                        candidate_limit,
+                    )
+                else:
+                    vector_rows = await self._run_vector_query(
+                        session,
+                        query_embedding,
+                        candidate_limit,
+                        trace=trace,
+                    )
         else:
             # Compatibility for focused test repositories that implement the
             # pre-extension private query hook without configuring an adapter.
             async with db.scoped_session(self.session_maker) as session:
                 await self._prepare_vector_session(session)
-                vector_rows = await self._run_vector_query(
-                    session,
-                    query_embedding,
-                    candidate_limit,
-                )
+                if trace is None:
+                    vector_rows = await self._run_vector_query(
+                        session,
+                        query_embedding,
+                        candidate_limit,
+                    )
+                else:
+                    vector_rows = await self._run_vector_query(
+                        session,
+                        query_embedding,
+                        candidate_limit,
+                        trace=trace,
+                    )
         vector_query_ms = (time.perf_counter() - vector_query_start) * 1000
         vector_row_count = len(vector_rows)
         hydrate_ms = 0.0
+
+        if trace is not None:
+            trace.vector = build_vector_stage(
+                previous=trace.vector,
+                effective_min_similarity=(
+                    min_similarity if min_similarity is not None else self._semantic_min_similarity
+                ),
+                min_similarity_source=("query" if min_similarity is not None else "config"),
+                embed_ms=embed_ms,
+                vector_query_ms=vector_query_ms,
+            )
 
         def _log_vector_summary() -> None:
             if not _emit_observability_log:
@@ -1945,6 +2270,16 @@ class SearchRepositoryBase(ABC):
             min_similarity if min_similarity is not None else self._semantic_min_similarity
         )
         if effective_min_similarity > 0.0:
+            if trace is not None:
+                threshold_rejections = tuple(
+                    BelowThreshold(key=key, similarity=value, threshold=effective_min_similarity)
+                    for key, value in similarity_by_si_key.items()
+                    if value < effective_min_similarity
+                )
+                trace.vector = build_vector_stage(
+                    previous=trace.vector,
+                    threshold_rejections=threshold_rejections,
+                )
             similarity_by_si_key = {
                 k: v for k, v in similarity_by_si_key.items() if v >= effective_min_similarity
             }
@@ -1957,6 +2292,15 @@ class SearchRepositoryBase(ABC):
         # bare id, so deduplicate while preserving first-seen order.
         si_ids = list(dict.fromkeys(si_id for _, si_id in similarity_by_si_key))
         search_index_rows = await self._fetch_search_index_rows_by_ids(si_ids)
+        if trace is not None:
+            trace.vector = build_vector_stage(
+                previous=trace.vector,
+                missing_search_rows=tuple(
+                    MissingSearchRow(key=key)
+                    for key in similarity_by_si_key
+                    if key not in search_index_rows
+                ),
+            )
 
         # Apply optional filters if requested
         filter_requested = any(
@@ -1990,6 +2334,13 @@ class SearchRepositoryBase(ABC):
             # Use (type, id) tuples to avoid collisions between different
             # search_index row types that share the same auto-increment id.
             allowed_keys = {(row.type, row.id) for row in filtered_rows if row.id is not None}
+            if trace is not None:
+                trace.vector = build_vector_stage(
+                    previous=trace.vector,
+                    filter_rejections=tuple(
+                        FilteredOut(key=key) for key in search_index_rows if key not in allowed_keys
+                    ),
+                )
             search_index_rows = {k: v for k, v in search_index_rows.items() if k in allowed_keys}
 
         ranked_rows: list[SearchIndexRow] = []
@@ -2027,6 +2378,8 @@ class SearchRepositoryBase(ABC):
             if self._should_rerank(query_text):
                 stable_candidate_limit = self._rerank_candidate_limit()
                 if candidate_limit > stable_candidate_limit:
+                    if trace is not None:
+                        trace.stable_pool_refetched = True
                     stable_rows = await self._search_vector_only(
                         search_text=search_text,
                         permalink=permalink,
@@ -2043,6 +2396,7 @@ class SearchRepositoryBase(ABC):
                         candidate_limit=stable_candidate_limit,
                         _emit_observability_log=False,
                         _apply_rerank=False,
+                        trace=None,
                     )
             output = await self._rerank_and_paginate(
                 query_text,
@@ -2050,6 +2404,7 @@ class SearchRepositoryBase(ABC):
                 offset=offset,
                 limit=limit,
                 stable_rows=stable_rows,
+                trace=trace,
             )
         else:
             output = ranked_rows[offset : offset + limit]
@@ -2113,6 +2468,7 @@ class SearchRepositoryBase(ABC):
         _candidate_limit_override: int | None = None,
         _apply_rerank: bool = True,
         _emit_observability_log: bool = True,
+        trace: SearchTraceCollector | None = None,
     ) -> List[SearchIndexRow]:
         """Fuse FTS and vector results using score-based fusion.
 
@@ -2148,6 +2504,7 @@ class SearchRepositoryBase(ABC):
             limit=candidate_limit,
             offset=0,
             allow_relaxed=True,
+            trace=trace,
         )
         fts_ms = (time.perf_counter() - fts_start) * 1000
         vector_start = time.perf_counter()
@@ -2171,8 +2528,38 @@ class SearchRepositoryBase(ABC):
             candidate_limit=candidate_limit if rerank_configured else None,
             _emit_observability_log=False,
             _apply_rerank=False,
+            trace=trace,
         )
         vector_ms = (time.perf_counter() - vector_start) * 1000
+        # Trigger: with reranking disabled the vector leg expands internally and can
+        # hydrate more rows than the fusion window it returns.
+        # Why: rows cut here never fuse — left in the trace they would surface as
+        # candidates with no rejection and no fused rank, which the response labels
+        # "returned". Rows with a recorded rejection keep their chunk evidence.
+        # Outcome: the trace keeps rows handed to fusion (or explicitly rejected);
+        # the cut shows up as served-chunk shrinkage in the candidate_window stage.
+        if trace is not None and trace.vector is not None:
+            kept_row_keys = {(row.type, row.id) for row in vector_results}
+            kept_row_keys.update(
+                rejection.key
+                for rejection_group in (
+                    trace.vector.threshold_rejections,
+                    trace.vector.filter_rejections,
+                    trace.vector.missing_search_rows,
+                )
+                for rejection in rejection_group
+            )
+            if any(match.key not in kept_row_keys for match in trace.vector.chunk_matches):
+                fused_chunks: dict[SearchIndexKey, list[tuple[str, float, int | None]]] = {}
+                for chunk_match in trace.vector.chunk_matches:
+                    if chunk_match.key in kept_row_keys:
+                        fused_chunks.setdefault(chunk_match.key, []).append(
+                            (chunk_match.chunk_key, chunk_match.similarity, chunk_match.entity_id)
+                        )
+                trace.vector = build_vector_stage(
+                    previous=trace.vector,
+                    chunk_matches=fused_chunks,
+                )
         fusion_start = time.perf_counter()
 
         # --- Score-based fusion keyed on (type, id) ---
@@ -2201,6 +2588,19 @@ class SearchRepositoryBase(ABC):
             fts_ranks.setdefault(row_key, rank)
             rows_by_key[row_key] = row
 
+        if trace is not None:
+            relaxed_fallback_used = (
+                trace.fts.relaxed_fallback_used if trace.fts is not None else False
+            )
+            trace.fts = build_fts_page_stage(
+                [((row.type, row.id), row.score or 0.0) for row in fts_results],
+                normalized_scores=fts_scores,
+                entity_ids={(row.type, row.id): row.entity_id for row in fts_results},
+                fts_max_abs=fts_max,
+                relaxed_fallback_used=relaxed_fallback_used,
+                fts_ms=fts_ms,
+            )
+
         vec_scores: dict[SearchIndexKey, float] = {}
         vec_ranks: dict[SearchIndexKey, int] = {}
         for rank, row in enumerate(vector_results):
@@ -2224,6 +2624,18 @@ class SearchRepositoryBase(ABC):
             fused_scores[row_key] = max(v, f) + FUSION_BONUS * min(v, f)
 
         ranked = sorted(fused_scores.items(), key=lambda item: item[1], reverse=True)
+        fusion_ms = (time.perf_counter() - fusion_start) * 1000
+        if trace is not None:
+            trace.fusion = build_fusion_stage(
+                formula_version=FUSION_FORMULA_VERSION,
+                bonus=FUSION_BONUS,
+                fts_scores=fts_scores,
+                fts_ranks=fts_ranks,
+                vector_scores=vec_scores,
+                vector_ranks=vec_ranks,
+                ranked_scores=ranked,
+                fusion_ms=fusion_ms,
+            )
 
         def _materialize(entry: tuple[SearchIndexKey, float]) -> SearchIndexRow:
             row_key, fused_score = entry
@@ -2244,6 +2656,8 @@ class SearchRepositoryBase(ABC):
             stable_candidates = candidates
             stable_candidate_limit = self._rerank_candidate_limit()
             if candidate_limit > stable_candidate_limit:
+                if trace is not None:
+                    trace.stable_pool_refetched = True
                 stable_candidates = await self._search_hybrid(
                     search_text=search_text,
                     permalink=permalink,
@@ -2260,6 +2674,7 @@ class SearchRepositoryBase(ABC):
                     _candidate_limit_override=stable_candidate_limit,
                     _apply_rerank=False,
                     _emit_observability_log=False,
+                    trace=None,
                 )
                 stable_keys = {(row.type, row.id) for row in stable_candidates}
                 expanded_tail = [entry for entry in ranked if entry[0] not in stable_keys]
@@ -2286,10 +2701,10 @@ class SearchRepositoryBase(ABC):
                 offset=offset,
                 limit=limit,
                 stable_rows=stable_candidates,
+                trace=trace,
             )
         else:
             output = [_materialize(entry) for entry in ranked[offset : offset + limit]]
-        fusion_ms = (time.perf_counter() - fusion_start) * 1000
         total_ms = (time.perf_counter() - query_start) * 1000
         if _emit_observability_log and total_ms > 2500:
             logger.warning(

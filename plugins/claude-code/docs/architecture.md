@@ -54,7 +54,7 @@ hooks). The plugin itself holds no state — configuration lives in
 ## SessionStart — the brief
 
 When a session begins, the hook puts the most relevant slice of the graph in front
-of Claude *before the first prompt*, so the session starts oriented instead of cold.
+of Claude _before the first prompt_, so the session starts oriented instead of cold.
 
 ```mermaid
 sequenceDiagram
@@ -78,6 +78,7 @@ sequenceDiagram
 ```
 
 Key properties:
+
 - **Structured, not fuzzy.** Queries filter on `type`/`status` frontmatter, so recall
   is deterministic — exactly the active tasks and open decisions, not "things that
   look similar."
@@ -110,7 +111,7 @@ sequenceDiagram
     Note over CC: compaction proceeds;<br/>checkpoint surfaces in the next<br/>SessionStart brief
 ```
 
-The checkpoint is a schema-conforming `type: session` note, so the *next* session's
+The checkpoint is a schema-conforming `type: session` note, so the _next_ session's
 SessionStart query (`type=session`) finds it. Capture is extractive today; an
 LLM-summarized version is the planned enrichment (PreCompact has a ~600s budget).
 
@@ -128,39 +129,14 @@ flowchart LR
 Because decisions are captured **typed**, they show up in the next session's brief
 automatically — the read and write sides reinforce each other.
 
-## Teams — read across, share deliberately
-
-On Basic Memory Cloud, the plugin reads team context into your brief but never
-auto-writes to a shared project. Publishing back is always a manual gesture.
-
-```mermaid
-flowchart TB
-    subgraph You["Your session"]
-        P["primaryProject<br/>(personal capture)"]
-    end
-    subgraph Team["Team workspace"]
-        T1["team/main"]
-        T2["team/notes"]
-    end
-
-    T1 -- "read-only<br/>(SessionStart)" --> P
-    T2 -- "read-only<br/>(SessionStart)" --> P
-    P -- "/basic-memory:bm-share<br/>(deliberate, confirmed)" --> T2
-
-    note["Auto-capture (checkpoints, /remember)<br/>writes ONLY to primaryProject"]
-```
-
-Team refs are workspace-qualified (`team/notes`) or `external_id` UUIDs, because
-project names collide across workspaces. Reads route over the user's OAuth session.
-
 ## Where things live
 
-| Path | Role |
-|------|------|
-| `hooks/session_start.py`, `hooks/pre_compact.py` | the ambient bridge (read / write) |
-| `hooks/hooks.json` | registers the hooks |
-| `output-styles/basic-memory.md` | the capture reflexes |
-| `skills/{bm-setup,bm-remember,bm-share,bm-status}/` | the deliberate slash commands |
-| `schemas/{session,decision,task}.md` | picoschema seeds (copied into your project at setup) |
-| `.claude/settings.json` → `basicMemory` | per-project configuration |
-| your Basic Memory projects | all actual content |
+| Path                                                | Role                                                 |
+| --------------------------------------------------- | ---------------------------------------------------- |
+| `hooks/session_start.py`, `hooks/pre_compact.py`    | the ambient bridge (read / write)                    |
+| `hooks/hooks.json`                                  | registers the hooks                                  |
+| `output-styles/basic-memory.md`                     | the capture reflexes                                 |
+| `skills/{bm-setup,bm-remember,bm-share,bm-status}/` | the deliberate slash commands                        |
+| `schemas/{session,decision,task}.md`                | picoschema seeds (copied into your project at setup) |
+| `.claude/settings.json` → `basicMemory`             | per-project configuration                            |
+| your Basic Memory projects                          | all actual content                                   |
