@@ -7,9 +7,11 @@ A ~5-minute walkthrough from zero to a working memory bridge. New to the idea? R
 
 - **Claude Code.**
 - **Basic Memory** (`>= 0.19.0`) installed and connected as an MCP server:
+
   ```bash
   uv tool install basic-memory
   ```
+
   Then add it to Claude Code (`claude mcp add` or your MCP config). Confirm it's
   reachable — Claude should be able to call `list_memory_projects`.
 
@@ -41,6 +43,7 @@ In a project (repo) where you want memory, run:
 ```
 
 It's a short interview. It will:
+
 - map this project to a Basic Memory project (pick an existing one or create a new one),
 - seed the `session` / `decision` / `task` schemas so notes are findable by structured
   search,
@@ -64,11 +67,11 @@ to see exactly what the plugin is tracking.
 
 ## 4. See it work
 
-1. **Capture a decision.** In normal conversation, make a decision — e.g. *"Let's use
-   Postgres, not SQLite, because we need concurrent writers."* With the output style on,
+1. **Capture a decision.** In normal conversation, make a decision — e.g. _"Let's use
+   Postgres, not SQLite, because we need concurrent writers."_ With the output style on,
    Claude writes a `type: decision` note and tells you the permalink.
 2. **Quick-capture something.** `/basic-memory:bm-remember switch the staging job to the
-   new image after the rebase lands` → saved to `bm-remember/`.
+new image after the rebase lands` → saved to `bm-remember/`.
 3. **Start a fresh session.** Open a new Claude Code session in the same project. The
    **SessionStart brief** appears first thing, showing your active tasks and the open
    decision you just captured — Claude is oriented before you type anything.
@@ -78,51 +81,21 @@ to see exactly what the plugin is tracking.
 That loop — capture → checkpoint → brief — is the whole point. It gets richer as the
 graph accumulates.
 
-## 5. Add your team (optional)
-
-On Basic Memory Cloud with a team workspace, you can read team context into your brief
-and publish back deliberately.
-
-Re-run `/basic-memory:bm-setup` (or edit `.claude/settings.json`). Because project names
-repeat across workspaces, team projects use **workspace-qualified names**
-(`my-team/notes`) or `external_id` UUIDs — setup finds these for you via
-`list_workspaces`.
-
-```json
-{
-  "basicMemory": {
-    "primaryProject": "my-org/main",
-    "secondaryProjects": ["my-team/main", "my-team/notes"],
-    "teamProjects": { "my-team/notes": { "promoteFolder": "shared" } }
-  },
-  "outputStyle": "basic-memory"
-}
-```
-
-Now:
-- SessionStart folds the team's **open decisions** into your brief (read-only).
-- Your captures still go **only** to `primaryProject` — never to the team.
-- `/basic-memory:bm-share <note>` publishes a chosen note to `my-team/notes/shared`, with
-  attribution and a confirmation step.
-
-Tip: a team brief is only as rich as the team's typed notes. Share an existing decision
-into a team project and watch it appear in the next session's brief.
-
-## 6. Tune it (optional)
+## 5. Tune it (optional)
 
 Everything is in the `basicMemory` block of `.claude/settings.json`. Common knobs:
 
-| Key | Default | What it does |
-|-----|---------|--------------|
-| `primaryProject` | (default project) | where briefs read from and captures write to |
-| `secondaryProjects` | `[]` | team/shared projects read for recall (read-only) |
-| `teamProjects` | `{}` | share targets for `/basic-memory:bm-share` |
-| `captureFolder` | `sessions` | folder for PreCompact checkpoints |
-| `rememberFolder` | `bm-remember` | folder for `/basic-memory:bm-remember` |
-| `recallTimeframe` | `3d` | recency window for the brief |
-| `preCompactCapture` | `extractive` | how checkpoints are produced |
+| Key                 | Default           | What it does                                     |
+| ------------------- | ----------------- | ------------------------------------------------ |
+| `primaryProject`    | (default project) | where briefs read from and captures write to     |
+| `secondaryProjects` | `[]`              | team/shared projects read for recall (read-only) |
+| `teamProjects`      | `{}`              | share targets for `/basic-memory:bm-share`       |
+| `captureFolder`     | `sessions`        | folder for PreCompact checkpoints                |
+| `rememberFolder`    | `bm-remember`     | folder for `/basic-memory:bm-remember`           |
+| `recallTimeframe`   | `3d`              | recency window for the brief                     |
+| `preCompactCapture` | `extractive`      | how checkpoints are produced                     |
 
-See [settings.example.json](../settings.example.json) for the full shape.
+See and modify [.claude/settings.json](.claude/settings.json) for the full shape.
 
 ## Troubleshooting
 
