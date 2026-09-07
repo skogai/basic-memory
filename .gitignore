@@ -70,3 +70,4 @@ claude-output
 /integrations/openclaw/dist/
 /integrations/openclaw/skills/
 /integrations/openclaw/*.tgz
+/.skogai/config/script_metadata.json
