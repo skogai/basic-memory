@@ -2,7 +2,7 @@
   "mcpServers": {
     "basic-memory": {
       "command": "uv",
-      "args": ["run", "--python", "3.13", "basic-memory", "mcp"]
+      "args": ["run", "basic-memory", "mcp"]
     }
   }
 }
