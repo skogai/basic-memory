@@ -237,16 +237,26 @@ def isolate_routing_env(monkeypatch) -> None:
 
 
 @pytest.fixture(autouse=True)
-def isolate_data_dir_env(monkeypatch) -> None:
-    """Keep host data-dir env vars from leaking into tests.
+def isolate_data_dir_env(monkeypatch, tmp_path) -> None:
+    """Keep host data-dir env vars — and the real HOME config — from leaking into tests.
 
     Why: GitHub Actions Ubuntu runners set ``XDG_CONFIG_HOME=/home/runner/.config``,
     and ``resolve_data_dir()`` honors it ahead of ``Path.home() / ".basic-memory"``.
     Without clearing it, tests that monkeypatch HOME still see the host XDG path
     and assertions against the tmp home directory fail.
+
+    Also patch HOME itself: tests that build schema/config objects directly
+    (bypassing the ``config_home``/``app_config`` fixtures) call ``ConfigManager()``,
+    which falls back to ``Path.home() / ".basic-memory"``. Without this, they pick
+    up the developer's real global config (e.g. a non-default ``kebab_filenames``),
+    making results depend on the machine running the suite instead of the code
+    under test.
     """
     monkeypatch.delenv("BASIC_MEMORY_CONFIG_DIR", raising=False)
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    if os.name == "nt":  # pragma: no cover - Windows-only branch
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
 
 
 @pytest_asyncio.fixture(autouse=True)
