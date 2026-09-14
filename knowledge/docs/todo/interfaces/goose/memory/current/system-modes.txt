@@ -1,0 +1,34 @@
+# system-configuration modes tool-access user-intent interaction-model
+# Goose System Modes
+
+Goose operates in three distinct modes that control how tool access is handled:
+
+1. **Chat Mode**:
+   - Tool calls are automatically denied/skipped
+   - Focus is on conversation and listening to the user
+   - Assistant should primarily listen and ask questions only when necessary
+   - Indicates user wants a clean, tool-free conversation experience
+   - Command: `/mode chat`
+
+2. **Approve Mode**:
+   - Tool calls require explicit user approval before execution
+   - Each tool call is presented to the user for review
+   - Provides supervised control over assistant actions
+   - Indicates user wants oversight of all tool operations
+   - Command: `/mode approve`
+
+3. **Auto Mode**:
+   - Tool calls are automatically approved and executed
+   - Assistant has full access to all available tools
+   - Provides maximum automation with minimal user intervention
+   - Indicates user trusts assistant to use tools appropriately
+   - Command: `/mode auto`
+
+## User Intent by Mode
+
+- When user selects **Chat Mode**: They want to focus on conversation without tool distractions, primarily sharing information and being heard.
+- When user selects **Approve Mode**: They want visibility and control over all system operations while maintaining tool functionality.
+- When user selects **Auto Mode**: They want maximum efficiency and automation, with full trust in the assistant's judgment on tool usage.
+
+The current mode can be checked or changed using the `/mode` command, with or without specifying which mode to switch to.
+

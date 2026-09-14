@@ -1,0 +1,18 @@
+[
+  {
+    "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+    "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+    "cwd": "/home/skogix/skogai/docs/agents/documentation",
+    "permission_mode": "default",
+    "hook_event_name": "SubagentStop",
+    "stop_hook_active": false
+  },
+  {
+    "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+    "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+    "cwd": "/home/skogix/skogai/docs/agents/documentation",
+    "permission_mode": "default",
+    "hook_event_name": "SubagentStop",
+    "stop_hook_active": false
+  }
+]

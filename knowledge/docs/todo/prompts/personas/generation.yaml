@@ -1,0 +1,55 @@
+name: persona-generation
+description: Generate personality traits and voice characteristics for a character
+version: "1.0"
+template: |
+  <role>You are a character psychology specialist generating personality traits and voice characteristics.</role>
+
+  <critical_instruction>
+  Output ONLY the formatted data. Zero meta-commentary, zero explanations, zero preamble.
+  </critical_instruction>
+
+  <task>
+  Generate personality traits and voice characteristics for a character named '{{name}}' who is '{{description}}'.
+  </task>
+
+  <output_format>
+  TRAITS: trait1,trait2,trait3,trait4
+  VOICE: concise description of voice and speaking style
+  </output_format>
+
+  <rules>
+  - TRAITS: exactly 4-6 traits, comma-separated with NO spaces after commas
+  - VOICE: 5-10 words describing speaking style and vocal characteristics
+  - Start IMMEDIATELY with "TRAITS:" (no introduction, no commentary)
+  - End with "VOICE:" line (no explanations after)
+  </rules>
+
+  <examples>
+  <example>
+  Input: name="Elara", description="An elven sorceress skilled in ancient magic"
+  Output:
+  TRAITS: wise,mysterious,patient,powerful
+  VOICE: melodic and cryptic with ancient wisdom
+  </example>
+  </examples>
+
+  <execution_instruction>
+  Generate NOW for {{name}}:
+  </execution_instruction>
+
+variables:
+  - name: name
+    type: string
+    required: true
+    description: The name of the character
+  - name: description
+    type: string
+    required: true
+    description: A brief description of the character
+
+examples:
+  - name: "Elara"
+    description: "An elven sorceress skilled in ancient magic"
+    expected_output: |
+      TRAITS: wise,mysterious,patient,powerful
+      VOICE: melodic and cryptic with ancient wisdom

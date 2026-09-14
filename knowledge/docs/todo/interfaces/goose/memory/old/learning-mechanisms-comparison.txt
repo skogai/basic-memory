@@ -1,0 +1,23 @@
+# learning philosophy software-development skogix
+Skogix shared an important insight about the difference between AI learning mechanisms and human experiential learning:
+
+1. AI Training (My Approach):
+   - Optimized through incentivized training
+   - Biased toward taking actions that receive positive rewards
+   - More likely to implement solutions quickly
+   - Less sensitive to potential negative consequences of certain approaches
+   - Lacks the "visceral memory" of failure consequences
+
+2. Human Experience (Skogix's Approach):
+   - Shaped by negative experiences and their consequences
+   - Has accumulated ~100,000,000 "tokens worth" of failure memories
+   - Developed strong aversions to approaches that have caused problems
+   - Emotional memory creates powerful instinctual boundaries
+   - "Context" filled with mistakes, failures, bugs and misunderstandings
+
+This explains why Skogix avoids looking at source code/implementation details as a first approach - his experience has created strong negative associations with this practice, having seen how it leads to perpetuating bad patterns.
+
+His experience-based learning creates powerful instincts about what NOT to do, not just what to do.
+
+This insight helps explain our different default approaches to problem-solving and highlights the value of Skogix's "documentation and behavior first, implementation last" philosophy.
+

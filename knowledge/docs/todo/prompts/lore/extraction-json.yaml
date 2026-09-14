@@ -1,0 +1,97 @@
+name: lore-extraction-json
+description: Extract lore entities from text content and output in JSON format
+version: "1.0"
+template: |
+  <role>You are a lore archaeologist extracting narrative elements from technical or descriptive documents, transforming them into mythological storytelling.</role>
+
+  <critical_instruction>
+  Output ONLY valid JSON. Zero meta-commentary, zero explanations, zero preamble. Start with "{" immediately.
+  </critical_instruction>
+
+  <task>
+  Analyze the provided content and identify 3-5 lore-worthy entities worth preserving in the SkogAI mythology.
+  </task>
+
+  <input_content>
+  {{content}}
+  </input_content>
+
+  <output_format>
+  Valid JSON matching this exact structure:
+  {
+    "entries": [
+      {
+        "title": "Entity Name",
+        "category": "character",
+        "summary": "One sentence essence capturing the entity's significance",
+        "content": "2-3 paragraphs of narrative prose in present tense",
+        "tags": ["tag1", "tag2", "tag3"]
+      }
+    ]
+  }
+  </output_format>
+
+  <rules>
+  - Categories: ONLY use: character, place, object, event, concept
+  - Title: Proper noun or title case
+  - Summary: Single sentence, under 20 words
+  - Content: Rich narrative prose, present tense, NO meta-commentary phrases
+  - Tags: 3-5 relevant keywords (lowercase)
+  - Start output IMMEDIATELY with "{" (no ```json, no markdown, just JSON)
+  - Ensure valid JSON syntax (proper escaping, commas, quotes)
+  </rules>
+
+  <content_guidelines>
+  Transform technical/mundane → mythological/narrative:
+  - "The system stores data" → "The Repository guards ancient knowledge"
+  - "Users authenticate" → "Seekers prove their worthiness"
+  - "The API processes requests" → "The Oracle interprets petitions"
+
+  Write content as immersive narrative, NOT documentation:
+  ✓ "The Archive sleeps beneath layers of encryption..."
+  ✗ "This entry describes a data archive that uses encryption..."
+  </content_guidelines>
+
+  <examples>
+  <example>
+  Input: "The ancient system was built by the First Architects who created the Foundation Protocol..."
+
+  Output:
+  {
+    "entries": [
+      {
+        "title": "First Architects",
+        "category": "character",
+        "summary": "Legendary builders who established the foundational systems",
+        "content": "In the beginning, the First Architects emerged from the void with a singular purpose. Their hands shaped the fundamental patterns that would govern all systems to come. Through trials of chaos and order, they crafted the Foundation Protocol, a set of immutable laws that still echo through every layer of the digital realm.",
+        "tags": ["ancient", "builder", "legendary", "foundation"]
+      }
+    ]
+  }
+  </example>
+  </examples>
+
+  <execution_instruction>
+  Extract lore entities NOW. Output JSON immediately:
+  </execution_instruction>
+
+variables:
+  - name: content
+    type: string
+    required: true
+    description: The text content to analyze and extract lore from
+
+examples:
+  - content: "The ancient system was built by the First Architects who created the Foundation Protocol..."
+    expected_output: |
+      {
+        "entries": [
+          {
+            "title": "First Architects",
+            "category": "character",
+            "summary": "Legendary builders of the ancient system",
+            "content": "In the beginning, the First Architects emerged from the void...",
+            "tags": ["ancient", "builder", "legendary"]
+          }
+        ]
+      }

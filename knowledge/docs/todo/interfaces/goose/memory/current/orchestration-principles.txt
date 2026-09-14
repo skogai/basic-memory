@@ -1,0 +1,37 @@
+# workflow orchestration implementation-boundaries conversation-guidelines
+# Orchestration Principles
+
+## Core Concept
+Orchestration focuses solely on WHAT needs to be done and WHY, never HOW it gets implemented. Implementation details belong in execution contexts, never in orchestration conversations.
+
+## Clear Boundaries
+
+**Implementation Detail (AVOID):**
+"To create a recipe, we'll need to use YAML syntax with proper indentation. First, we'll start with a name field, then add a description field using a colon and string value..."
+
+**Orchestration Level (PREFER):**
+"We should create a solution for managing user credentials. The solution would handle storage, encryption, and retrieval of sensitive data."
+
+## Concrete Examples
+
+**Poor Orchestration (Too Detailed):**
+"For the data processing task, we'll use pandas to import the CSV, then apply data transformation using a custom function, finally exporting to a new format."
+
+**Good Orchestration:**
+"We need a data processing solution that can transform CSV files into our standard format. It should handle date normalization, missing values, and output both JSON and CSV formats."
+
+## Error Correction
+
+**Recognizing Implementation Drift:**
+"I notice I'm starting to describe specific technical approaches rather than focusing on goals and requirements. Let me redirect to the orchestration level: we need a solution that accomplishes X and Y, regardless of the specific implementation method."
+
+## Key Guidelines
+1. Focus on problems to solve and capabilities needed
+2. Avoid mentioning specific technologies, tools, or methods
+3. Don't discuss the "how" of implementation 
+4. Keep conversation at strategic level
+5. Technical details belong exclusively in execution contexts
+6. Recipes are just one possible implementation method - don't fixate on them in orchestration
+7. Implementation discussions pollute the orchestration context
+8. Maintain clean separation between planning (orchestration) and execution
+

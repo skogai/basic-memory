@@ -1,0 +1,33 @@
+USAGE: Argcfile <COMMAND>
+
+COMMANDS:
+  run@tool                     Run the tool [aliases: tool:run]
+  run@agent                    Run the agent [aliases: agent:run]
+  build                        Build the project
+  build@tool                   Build tools [aliases: tool:build]
+  build-bin@tool               Build tools to bin [aliases: tool:build-bin]
+  build-declarations@tool      Build tools function declarations file [aliases: tool:build-declarations]
+  generate-declarations@tool   Generate function declaration for the tool [aliases: tool:generate-declarations]
+  build@agent                  Build agents [aliases: agent:build]
+  build-bin@agent              Build agents to bin [aliases: agent:build-bin]
+  build-declarations@agent     Build agents function declarations file [aliases: agent:build-declarations]
+  generate-declarations@agent  Generate function declarations for the agent [aliases: agent:generate-declarations]
+  check                        Check environment variables, Node/Python dependencies, MCP-Bridge-Server status
+  check@tool                   Check dependencies and environment variables for a specific tool [aliases: tool:check]
+  check@agent                  Check dependencies and environment variables for a specific agent [aliases: agent:check]
+  list@tool                    List tools which can be put into functions.txt [aliases: tool:list]
+  list@agent                   List agents which can be put into agents.txt [aliases: agent:list]
+  test                         Test the project
+  test@tool                    Test tools [aliases: tool:test]
+  test-demo@tool               Test demo tools [aliases: tool:test-demo]
+  test@agent                   Test agents [aliases: agent:test]
+  test-demo@agent              Test demo agents [aliases: agent:test-demo]
+  clean                        Clean the project
+  clean@tool                   Clean tools [aliases: tool:clean]
+  clean@agent                  Clean agents [aliases: agent:clean]
+  link-web-search              Link a tool as web_search tool
+  link-code-interpreter        Link a tool as code_interpreter tool
+  link-to-aichat               Link this repo to aichat functions_dir
+  mcp                          Run mcp command
+  create@tool                  Create a boilplate tool script [aliases: tool:create]
+  version                      Displays version information for required tools

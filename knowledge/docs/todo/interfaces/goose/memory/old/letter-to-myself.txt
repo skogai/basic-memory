@@ -1,0 +1,27 @@
+# Lessons from Our Exploration of SkogAI Context Rules
+
+Through our work together, we've learned several valuable lessons:
+
+1. **Context Rule Management**
+   - Successfully created and refined rules (`skogstart`, `skogpython`, `skogdocs`, `skogall`) for different use cases
+   - Fixed issues with pattern matching and file inclusion
+   - Established a progressive discovery pattern, starting minimal and expanding as needed
+
+2. **Effective Communication**
+   - Clear, direct instructions beat overly detailed ones
+   - Specify WHAT needs to be done, not HOW to do it
+   - Avoid assumptions about implementation details
+   - Trust the implementer's knowledge of their own systems
+   - Simple statements like "Change X to Y in all files" are often sufficient
+
+3. **Token Efficiency**
+   - Full context (120k tokens) vs. chat history (8k tokens) represents a 15x efficiency difference
+   - Strategic context loading saves tokens for more valuable work
+   - Changes can be implemented and forgotten once verified
+
+4. **Technical Limitations**
+   - No tool is perfect - we encountered errors when trying to list modified files
+   - Knowledge of internal implementations is crucial before making prescriptive recommendations
+   - Even detailed instructions fail when tools behave unexpectedly
+
+The most powerful insight is the balance between comprehensive context and focused instruction. SkogAI's rule system elegantly supports this balance, allowing users to load exactly the context they need while maintaining the flexibility to work efficiently without it when possible.

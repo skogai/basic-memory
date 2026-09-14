@@ -1,0 +1,11 @@
+# notes observations system
+# SYSTEM NOTES
+
+- Memory injection at initialization works well
+- Numbered categories (00, 01, etc.) provide good structure
+- Consider creating a memory map for better navigation
+- Focus is on MCP servers/tool calls/function calls/memory
+- Granular memory categories improve maintainability
+- Memory patterns like "00*" can be used for context level filtering
+
+Last updated: 2025-03-26

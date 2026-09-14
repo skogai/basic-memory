@@ -1,0 +1,58 @@
+[
+  {
+    "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+    "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+    "cwd": "/home/skogix/skogai/docs/agents/documentation",
+    "hook_event_name": "Notification",
+    "message": "Claude needs your permission to use snippets - search (MCP)"
+  },
+  {
+    "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+    "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+    "cwd": "/home/skogix/skogai/docs/agents/documentation",
+    "hook_event_name": "Notification",
+    "message": "Claude needs your permission to use snippets - search (MCP)"
+  },
+  {
+    "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+    "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+    "cwd": "/home/skogix/skogai/docs/agents/documentation",
+    "hook_event_name": "Notification",
+    "message": "Claude needs your permission to use Bash"
+  },
+  {
+    "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+    "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+    "cwd": "/home/skogix/skogai/docs/agents/documentation",
+    "hook_event_name": "Notification",
+    "message": "Claude needs your permission to use Bash"
+  },
+  {
+    "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+    "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+    "cwd": "/home/skogix/skogai/docs/agents/documentation",
+    "hook_event_name": "Notification",
+    "message": "Claude needs your permission to use Read"
+  },
+  {
+    "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+    "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+    "cwd": "/home/skogix/skogai/docs/agents/documentation",
+    "hook_event_name": "Notification",
+    "message": "Claude needs your permission to use Read"
+  },
+  {
+    "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+    "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+    "cwd": "/home/skogix/skogai/docs/agents/documentation",
+    "hook_event_name": "Notification",
+    "message": "Claude needs your permission to use Bash"
+  },
+  {
+    "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+    "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+    "cwd": "/home/skogix/skogai/docs/agents/documentation",
+    "hook_event_name": "Notification",
+    "message": "Claude needs your permission to use Bash"
+  }
+]

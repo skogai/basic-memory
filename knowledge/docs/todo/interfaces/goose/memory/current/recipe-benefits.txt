@@ -1,0 +1,25 @@
+# recipes context-management efficiency workflow best-practices
+The recipe-based approach to task execution provides several key benefits:
+
+1. Context Preservation:
+   - Main conversation remains uncluttered by implementation details
+   - Prevents context window overflow with technical minutiae
+   - Maintains focus on high-level planning and decision-making
+
+2. Task Specialization:
+   - Each recipe has precisely the context it needs
+   - No wasted tokens on irrelevant information
+   - Optimized for specific tasks (data processing, migration, generation)
+
+3. Continuity in Planning:
+   - Orchestration conversations can span multiple complex tasks
+   - No need to restart conversations due to context pollution
+   - Enables complex, multi-stage workflows without losing place
+
+4. Cleaner Mental Model:
+   - Clear separation of planning vs. execution
+   - Results-focused rather than implementation-focused
+   - More efficient use of both human and AI attention
+
+This pattern is particularly valuable for data-intensive tasks, repetitive operations, or any scenario where implementation details would overwhelm the main conversation context.
+

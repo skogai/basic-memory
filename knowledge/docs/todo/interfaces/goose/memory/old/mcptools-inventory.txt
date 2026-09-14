@@ -1,0 +1,10 @@
+# mcptools, inventory, scripts, documentation
+Created a comprehensive inventory of MCPtools located in `/home/skogix/.local/src/mcptools/`. The inventory document (~/mcptools_inventory.md) catalogs all scripts, endpoints, and interfaces, including:
+- MCP Server tools and scripts
+- MCP Client utilities
+- MCP Proxy system
+- AI Character management (Amy, Dot, Goose)
+- Example and demo scripts
+- Documentation references
+
+The document provides a structured overview of the entire MCPtools system, with usage examples, directory structure information, and a quick reference guide. A separate README (~/mcptools_inventory_readme.md) offers a condensed overview and usage guidance.

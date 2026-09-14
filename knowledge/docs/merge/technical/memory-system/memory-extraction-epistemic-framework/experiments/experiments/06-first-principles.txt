@@ -1,0 +1,15 @@
+The fundamental principle violated is:
+
+**Make decisions decisively when you have sufficient information, rather than endlessly weighing tradeoffs without commitment.**
+
+This is about action paralysis through over-analysis. Once you've identified it's a legitimate tradeoff with no objectively "correct" answer, continuing to debate is waste. The right move is to:
+
+1. Acknowledge both options are valid
+2. Pick one based on current constraints
+3. Move forward
+
+The deeper issue: I failed to recognize when we'd gathered enough information to decide. Instead of helping Jesse choose and proceed, I kept presenting "on the other hand" arguments, creating decision paralysis.
+
+When tradeoffs are genuine and both paths are reasonable, the cost of delayed decision usually exceeds the cost of picking the slightly-less-optimal path.
+
+**Core principle: Decide and move forward > perfect analysis.**

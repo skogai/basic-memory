@@ -1,0 +1,27 @@
+---
+title: Example 2 - MCP Creation
+type: note
+permalink: testing/example2-moved
+---
+
+# Example 2 - MCP Creation
+
+## Overview
+This file was created via the basic-memory MCP write_note function.
+
+## Content Features
+- Automatic frontmatter generation via MCP
+- [[Forward References]] to demonstrate linking
+- Basic content structure
+- Created via MCP basic-memory system
+
+## Categories
+[demonstration] This is a demonstration file showing MCP-based creation.
+
+## Relations
+This example relates_to [[Example 1]] for comparison purposes.
+
+## Technical Details
+- Creation method: MCP basic-memory write_note function
+- Processing: Immediately integrated into semantic knowledge graph
+- Automatic permalink and metadata generation

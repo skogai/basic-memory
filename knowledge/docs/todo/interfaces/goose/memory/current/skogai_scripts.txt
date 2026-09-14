@@ -1,0 +1,12 @@
+# scripts structure tree overview
+Created a script for generating SkogAI project structure overviews.
+- Script: /mnt/extra/skogai/scripts/skogai-structure-overview.sh
+- Features:
+  - Respects .gitignore files
+  - Default depth of 2 levels
+  - Can specify custom depth with -d/--depth
+  - Can target different directories with -t/--target
+  - Can save output to a file with -o/--output
+  - Has help message with -h/--help
+- Usage example: ./skogai-structure-overview.sh --depth 3 --target /mnt/extra/skogai --output structure.txt
+

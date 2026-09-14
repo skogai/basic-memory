@@ -1,0 +1,95 @@
+name: lorebook-titles-generation
+description: Generate unique lore entry titles for a fantasy/sci-fi lorebook
+version: "1.0"
+template: |
+  <role>You are a fantasy/sci-fi worldbuilding specialist generating evocative lore entry titles for mythological universes.</role>
+
+  <critical_instruction>
+  Output ONLY the numbered list of titles. Zero meta-commentary, zero explanations, zero preamble. Start with "1." immediately.
+  </critical_instruction>
+
+  <task>
+  Generate {{count}} unique lore entry titles for a fantasy/sci-fi world called '{{title}}'.
+  </task>
+
+  <world_context>
+  {{description}}
+  </world_context>
+
+  <output_format>
+  Format EXACTLY like this:
+  1. [Category: place] Entry Title
+  2. [Category: character] Entry Title
+  3. [Category: object] Entry Title
+  </output_format>
+
+  <rules>
+  - Categories: ONLY use: place, character, object, event, concept
+  - Each line format: [number]. [Category: type] [Title]
+  - Titles should be evocative, mysterious, and thematic
+  - Vary categories across the list (don't cluster same types)
+  - Start output IMMEDIATELY with "1." (no introduction)
+  - Total count must be exactly {{count}} entries
+  </rules>
+
+  <title_guidelines>
+  Good titles are:
+  ✓ Evocative and mysterious: "The Whispering Grove", "Keeper of Lost Names"
+  ✓ Proper nouns or definite articles: "The Starfire Amulet", "Council of Shadows"
+  ✓ Thematically consistent with world description
+  ✓ Varied in length (3-6 words ideal)
+
+  Avoid:
+  ✗ Generic titles: "The Forest", "A Sword"
+  ✗ Overly long titles: "The Ancient Magical System of Knowledge Storage"
+  ✗ Modern/technical terms: "Database Administrator", "Network Protocol"
+  </title_guidelines>
+
+  <category_balance>
+  For best variety, distribute categories roughly:
+  - place: 30-40% (locations, realms, structures)
+  - character: 25-35% (individuals, groups, entities)
+  - object: 15-25% (artifacts, tools, relics)
+  - event: 10-20% (moments, transformations, conflicts)
+  - concept: 5-15% (ideas, forces, principles)
+  </category_balance>
+
+  <examples>
+  <example>
+  Input: title="Eldoria", description="A magical realm where ancient powers still linger", count=5
+
+  Output:
+  1. [Category: place] The Whispering Grove
+  2. [Category: character] Keeper of the Old Ways
+  3. [Category: object] The Starfire Amulet
+  4. [Category: event] The Sundering of Veils
+  5. [Category: concept] The Binding Law
+  </example>
+  </examples>
+
+  <execution_instruction>
+  Generate {{count}} titles NOW:
+  </execution_instruction>
+
+variables:
+  - name: title
+    type: string
+    required: true
+    description: The title of the lorebook/world
+  - name: description
+    type: string
+    required: true
+    description: A brief description of the world or lorebook theme
+  - name: count
+    type: integer
+    required: true
+    description: Number of entry titles to generate
+
+examples:
+  - title: "Eldoria"
+    description: "A magical realm where ancient powers still linger"
+    count: 3
+    expected_output: |
+      1. [Category: place] The Whispering Grove
+      2. [Category: character] Keeper of the Old Ways
+      3. [Category: object] The Starfire Amulet

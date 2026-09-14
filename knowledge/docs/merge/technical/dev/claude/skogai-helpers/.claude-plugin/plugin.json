@@ -1,0 +1,29 @@
+{
+  "name": "skogai-helpers",
+  "version": "0.0.1",
+  "description": "Development workflow helpers for the SkogAI ecosystem - streamline common development tasks including knowledge syncing, documentation maintenance, and session tracking",
+  "author": {
+    "name": "Skogix",
+    "email": "emil@skogsund.se",
+    "url": "https://github.com/skogix"
+  },
+  "license": "GPL-3.0",
+  "keywords": [
+    "productivity",
+    "tools",
+    "utilities",
+    "skogai",
+    "documentation",
+    "knowledge-management"
+  ],
+  "commands": [
+    "./commands/sync-knowledge.md"
+  ],
+  "agents": [
+    "./agents/librarian.md"
+  ],
+  "hooks": "./hooks/remember-skills.json",
+  "skills": [
+    "./skills/knowledge-management.md"
+  ]
+}

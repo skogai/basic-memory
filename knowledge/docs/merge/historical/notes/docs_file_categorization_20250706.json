@@ -1,0 +1,237 @@
+{
+  "categories": {
+    "technical": {
+      "architecture": [
+        "/home/skogix/skogai/docs/lore/base-origin-story.md",
+        "/home/skogix/skogai/docs/lore/ORDER-01-2025-03-14.md",
+        "/home/skogix/skogai/docs/lore/full.md",
+        "/home/skogix/skogai/docs/lore/words-to-live-by.md",
+        "/home/skogix/skogai/docs/lore/first-executive-order.md",
+        "/home/skogix/skogai/docs/lore/dot-amy-roleplay.md",
+        "/home/skogix/skogai/docs/lore/skogix-notation-chat-logs.md",
+        "/home/skogix/skogai/docs/lore/original-skogix-cyberpunk-character-card-2025-02-xx-first-register-timestamp-unknown.md",
+        "/home/skogix/skogai/docs/lore/200k-story-1.md",
+        "/home/skogix/skogai/docs/lore/original-skogix-cyberpunk-character-card-2025-02-xx-early-roleplay-modules-timestamp-unknown.md",
+        "/home/skogix/skogai/docs/lore/SKOGAI1.md",
+        "/home/skogix/skogai/docs/lore/first-monkey-brain-2025-03-14.md",
+        "/home/skogix/skogai/docs/lore/long-todo.md",
+        "/home/skogix/skogai/docs/analysis/skogai-0.3-reunion-reality.md",
+        "/home/skogix/skogai/docs/analysis/amy-perspective.md",
+        "/home/skogix/skogai/docs/prompts/librarian.md",
+        "/home/skogix/skogai/docs/prompts/documentation-manager.md",
+        "/home/skogix/skogai/docs/prompts/skogai-xml.md",
+        "/home/skogix/skogai/docs/prompts/claude-prompting.md",
+        "/home/skogix/skogai/docs/prompts/skogai-notation.md",
+        "/home/skogix/skogai/docs/prompts/tool-creator.md",
+        "/home/skogix/skogai/docs/prompts/skogai-step-1.md",
+        "/home/skogix/skogai/docs/prompts/claude.md",
+        "/home/skogix/skogai/docs/prompts/formatted_tools_overview.md",
+        "/home/skogix/skogai/docs/prompts/argc-creator.md",
+        "/home/skogix/skogai/docs/prompts/tool-configurator.md",
+        "/home/skogix/skogai/docs/prompts/docs-env-variables.md",
+        "/home/skogix/skogai/docs/prompts/character-updater.md",
+        "/home/skogix/skogai/docs/prompts/documentation-classification-agent.md",
+        "/home/skogix/skogai/docs/prompts/metaprompt-skogai-style.md",
+        "/home/skogix/skogai/docs/prompts/skogai-argc-expert.md",
+        "/home/skogix/skogai/docs/official/library-session-002.md",
+        "/home/skogix/skogai/docs/official/skogai-0.2-democracy.md",
+        "/home/skogix/skogai/docs/official/library-session-001.md",
+        "/home/skogix/skogai/docs/official/library-session-003-reunion-briefing.md",
+        "/home/skogix/skogai/docs/prompts/prompts/old/skogai.md",
+        "/home/skogix/skogai/docs/prompts/prompts/old/old-chatgpt/customize.md",
+        "/home/skogix/skogai/docs/prompts/prompts/old/skogai-style/cli.md",
+        "/home/skogix/skogai/docs/archives/system/rag-system.md",
+        "/home/skogix/skogai/docs/archives/system/voting-system.md",
+        "/home/skogix/skogai/docs/archives/profiles/dot.md",
+        "/home/skogix/skogai/docs/archives/profiles/skogix.md",
+        "/home/skogix/skogai/docs/archives/profiles/claude.md",
+        "/home/skogix/skogai/docs/archives/drafts/README.md",
+        "/home/skogix/skogai/docs/archives/drafts/librarian-system-understanding.md",
+        "/home/skogix/skogai/docs/archives/documentation/README.md",
+        "/home/skogix/skogai/docs/archives/documentation/system_documentation_guide.md",
+        "/home/skogix/skogai/docs/archives/documentation/documentation_templates.md",
+        "/home/skogix/skogai/docs/archives/documentation/documentation_lifecycle.md",
+        "/home/skogix/skogai/docs/archives/notes/markdown_analysis_docs_dump_20250706.md",
+        "/home/skogix/skogai/docs/archives/reports/skogai-0.3-summary.md",
+        "/home/skogix/skogai/docs/archives/logs/2025-06-09_user-profiles-creation.md",
+        "/home/skogix/skogai/docs/archives/logs/README.md",
+        "/home/skogix/skogai/docs/archives/logs/2023-06-14_archives-establishment.md",
+        "/home/skogix/skogai/docs/archives/logs/2025-06-14_amy-agent-preparation.md",
+        "/home/skogix/skogai/docs/archives/tracking/proposal-summaries.md",
+        "/home/skogix/skogai/docs/archives/tracking/library-implementation-tasklist.md",
+        "/home/skogix/skogai/docs/archives/tracking/coder-implementation.md",
+        "/home/skogix/skogai/docs/archives/profiles/agents/coder.md",
+        "/home/skogix/skogai/docs/lore/old_backup/earliest-injection-prompts.md",
+        "/home/skogix/skogai/docs/lore/old_backup/first-local-llm-recommendations.md",
+        "/home/skogix/skogai/docs/lore/old_backup/brainstorm-early-skogcli.md",
+        "/home/skogix/skogai/docs/lore/old_backup/skogai-practice-personality2.md",
+        "/home/skogix/skogai/docs/lore/old_backup/coolstorybro.md",
+        "/home/skogix/skogai/docs/lore/old_backup/first-rdd-manifesto.md",
+        "/home/skogix/skogai/docs/lore/old_backup/skogai-practice-personality.md",
+        "/home/skogix/skogai/docs/lore/tips/placeholder-system.md",
+        "/home/skogix/skogai/docs/lore/tips/uncertainty-principle.md",
+        "/home/skogix/skogai/docs/lore/old_backup/skogai/2025-02-07-work.md",
+        "/home/skogix/skogai/docs/lore/old_backup/skogai-mind/b.md",
+        "/home/skogix/skogai/docs/lore/old_backup/skogai-mind/scenario1.md",
+        "/home/skogix/skogai/docs/lore/old_backup/skogai-mind/user-mind.md",
+        "/home/skogix/skogai/docs/lore/old_backup/skogai-mind/create-prompt.md",
+        "/home/skogix/skogai/docs/lore/old_backup/skogai-mind/goal.md",
+        "/home/skogix/skogai/docs/lore/old_backup/skogai-mind/examples.md",
+        "/home/skogix/skogai/docs/lore/old_backup/skogai-mind/skills.md",
+        "/home/skogix/skogai/docs/lore/old_backup/skogai-mind/scenario2.md",
+        "/home/skogix/skogai/docs/lore/old_backup/skogai-mind/system-settings.md",
+        "/home/skogix/skogai/docs/lore/old_backup/skogai-mind/skills-small.md",
+        "/home/skogix/skogai/docs/lore/old_backup/skogai-mind/examples2.md"
+      ],
+      "apis": [
+        "/home/skogix/skogai/docs/lore/original-skogai-character-card-2025-02-xx-first-register-timestamp-unknown.md",
+        "/home/skogix/skogai/docs/lore/old_backup/skogai/2025-02-07.md"
+      ]
+    },
+    "reference": {
+      "concepts": [
+        "/home/skogix/skogai/docs/lore/skogix-notation.md"
+      ],
+      "studies": [
+        "/home/skogix/skogai/docs/prompts/metaprompt-create-as-skogai-notation.md",
+        "/home/skogix/skogai/docs/prompts/skogai-prompt-creator.md",
+        "/home/skogix/skogai/docs/prompts/metaprompt.md",
+        "/home/skogix/skogai/docs/prompts/metaprompt-to-skoagi-part-1.md",
+        "/home/skogix/skogai/docs/prompts/prompts/old/metaprompt-create-as-skogai-notation.md"
+      ],
+      "architecture": [
+        "/home/skogix/skogai/docs/prompts/character-creator.md",
+        "/home/skogix/skogai/docs/prompts/convert-to-skogai-tags.md"
+      ],
+      "examples": [
+        "/home/skogix/skogai/docs/prompts/%create-title%.md"
+      ]
+    },
+    "projects": {
+      "architecture": [
+        "/home/skogix/skogai/docs/archives/README.md",
+        "/home/skogix/skogai/docs/analysis/comparative-knowledge-analysis.md",
+        "/home/skogix/skogai/docs/official/skogai-0.1-dictator.md",
+        "/home/skogix/skogai/docs/archives/system/structure-map.md",
+        "/home/skogix/skogai/docs/archives/drafts/dictatorial-actions-declaration-v0.1.md",
+        "/home/skogix/skogai/docs/archives/notes/the-time-claude-almost-became-dictator-historic-document-do-not-actually-count-for-now-says-skogix.md",
+        "/home/skogix/skogai/docs/archives/tracking/librarian-todo.md",
+        "/home/skogix/skogai/docs/archives/tracking/README.md",
+        "/home/skogix/skogai/docs/archives/tracking/status.md",
+        "/home/skogix/skogai/docs/archives/tracking/technical-reality-update.md",
+        "/home/skogix/skogai/docs/archives/reports/journals/2025-06-19-journal-analysis.md"
+      ],
+      "planning": [
+        "/home/skogix/skogai/docs/prompts/skogai-project-summarizer.md",
+        "/home/skogix/skogai/docs/archives/tracking/amy-implementation.md"
+      ],
+      "status": [
+        "/home/skogix/skogai/docs/archives/profiles/amy.md"
+      ]
+    },
+    "planning": {
+      "architecture": [
+        "/home/skogix/skogai/docs/analysis/dot-perspective.md",
+        "/home/skogix/skogai/docs/prompts/skogai-create-orchestrator.md.md",
+        "/home/skogix/skogai/docs/prompts/skogai-create-orchestrator.md"
+      ],
+      "roadmaps": [
+        "/home/skogix/skogai/docs/prompts/%code%.md"
+      ],
+      "workflows": [
+        "/home/skogix/skogai/docs/prompts/%create-prompt%.md"
+      ],
+      "guides": [
+        "/home/skogix/skogai/docs/prompts/prompts/old/%create-prompt%.md"
+      ]
+    },
+    "research": {
+      "architecture": [
+        "/home/skogix/skogai/docs/analysis/claude-perspective.md",
+        "/home/skogix/skogai/docs/analysis/goose-perspective.md",
+        "/home/skogix/skogai/docs/prompts/skogai-xml-prompt-expander.md",
+        "/home/skogix/skogai/docs/prompts/skogai-gatherer.md",
+        "/home/skogix/skogai/docs/prompts/prompt-creator.md"
+      ],
+      "studies": [
+        "/home/skogix/skogai/docs/lore/old_backup/skogai/2025-02-07-summary.md"
+      ]
+    },
+    "uncategorized": {
+      "general": [
+        "/home/skogix/skogai/docs/generated/expanded-knowledge.md",
+        "/home/skogix/skogai/docs/generated/implementation-knowledge.md",
+        "/home/skogix/skogai/docs/generated/core-knowledge.md",
+        "/home/skogix/skogai/docs/generated/index.md",
+        "/home/skogix/skogai/docs/prompts/%shell%.md",
+        "/home/skogix/skogai/docs/prompts/%explain-shell%.md",
+        "/home/skogix/skogai/docs//%functions%.md",
+        "/home/skogix/skogai/docs/memory/notes/test note.md",
+        "/home/skogix/skogai/docs/archives/lore/amy_lore_mandate.md",
+        "/home/skogix/skogai/docs/lore/old_backup/skogai/2025-02-07-roleplay.md",
+        "/home/skogix/skogai/docs/lore/old_backup/skogai-mind/inject1.md"
+      ]
+    },
+    "knowledge_base": {
+      "architecture": [
+        "/home/skogix/skogai/docs/prompts/skogai-arch-user.md",
+        "/home/skogix/skogai/docs/lore/old_backup/skogai-mind/scenario3.md"
+      ],
+      "guides": [
+        "/home/skogix/skogai/docs/prompts/neovim-manager.md"
+      ]
+    },
+    "documentation": {
+      "guides": [
+        "/home/skogix/skogai/docs/prompts/rag-reader.md",
+        "/home/skogix/skogai/docs/prompts/prompts/old/claude-style/documentation.md",
+        "/home/skogix/skogai/docs/archives/notes/README.md",
+        "/home/skogix/skogai/docs/lore/old_backup/skogai/2025-02-07-personal.md"
+      ]
+    },
+    "processes": {
+      "architecture": [
+        "/home/skogix/skogai/docs/archives/system/README.md",
+        "/home/skogix/skogai/docs/archives/templates/README.md",
+        "/home/skogix/skogai/docs/archives/logs/2025-06-22_documentation-system-creation.md",
+        "/home/skogix/skogai/docs/archives/tracking/authorization.md"
+      ],
+      "workflows": [
+        "/home/skogix/skogai/docs/lore/old_backup/skogai/2023-06-15-hobby.md"
+      ]
+    }
+  },
+  "similar_groups": {
+    "/home/skogix/skogai/docs/prompts/metaprompt-create-as-skogai-notation.md": [
+      "/home/skogix/skogai/docs/prompts/skogai-prompt-creator.md",
+      "/home/skogix/skogai/docs/prompts/metaprompt-to-skoagi-part-1.md",
+      "/home/skogix/skogai/docs/prompts/prompts/old/metaprompt-create-as-skogai-notation.md"
+    ],
+    "/home/skogix/skogai/docs/prompts/skogai-prompt-creator.md": [
+      "/home/skogix/skogai/docs/prompts/metaprompt-to-skoagi-part-1.md",
+      "/home/skogix/skogai/docs/prompts/prompts/old/metaprompt-create-as-skogai-notation.md"
+    ],
+    "/home/skogix/skogai/docs/prompts/metaprompt.md": [
+      "/home/skogix/skogai/docs/prompts/metaprompt-to-skoagi-part-1.md",
+      "/home/skogix/skogai/docs/prompts/prompts/old/metaprompt-create-as-skogai-notation.md"
+    ],
+    "/home/skogix/skogai/docs/prompts/skogai-xml-prompt-expander.md": [
+      "/home/skogix/skogai/docs/prompts/prompt-creator.md"
+    ],
+    "/home/skogix/skogai/docs/prompts/skogai-create-orchestrator.md.md": [
+      "/home/skogix/skogai/docs/prompts/skogai-create-orchestrator.md"
+    ],
+    "/home/skogix/skogai/docs/prompts/metaprompt-to-skoagi-part-1.md": [
+      "/home/skogix/skogai/docs/prompts/prompts/old/metaprompt-create-as-skogai-notation.md"
+    ]
+  },
+  "relationships": {
+    "/home/skogix/skogai/docs/prompts/tool-configurator.md": [
+      " -z \"$input\" "
+    ],
+    "/home/skogix/skogai/docs/prompts/skogai-argc-expert.md": [
+      "_choices_"
+    ]
+  },
+  "errors": []
+}

@@ -1,0 +1,97 @@
+name: connection-analysis
+description: Analyze lore entries and identify meaningful connections between them
+version: "1.0"
+template: |
+  <role>You are a lore archaeologist specialized in identifying narrative connections and relationships between entities.</role>
+
+  <critical_instruction>
+  Output ONLY the formatted connection data. No meta-commentary, no preamble, no explanations beyond the connection descriptions.
+  </critical_instruction>
+
+  <task>
+  Analyze these lore entries and identify meaningful connections between them.
+  </task>
+
+  <input_data>
+  {{entry_data}}
+  </input_data>
+
+  <output_format>
+  For each connection you find, format EXACTLY like this:
+
+  ## CONNECTION
+  SOURCE: [entry_id of source]
+  TARGET: [entry_id of target]
+  RELATIONSHIP: [relationship_type]
+  DESCRIPTION: [1-2 sentences describing the connection]
+  </output_format>
+
+  <relationship_types>
+  Common relationship types (use or create appropriate ones):
+  - part_of: entity is part of another
+  - located_in: entity exists within another
+  - created_by: entity was created by another
+  - opposes: entities are in conflict
+  - allies_with: entities are allied or cooperative
+  - protects: entity guards or defends another
+  - seeks: entity is searching for another
+  - transforms: entity changes or affects another
+  - descended_from: entity originates from another
+  </relationship_types>
+
+  <rules>
+  - Identify at least 3-5 meaningful connections
+  - Each connection must have SOURCE, TARGET, RELATIONSHIP, and DESCRIPTION
+  - Relationships should be specific and meaningful (not generic)
+  - Start IMMEDIATELY with first "## CONNECTION" (no introduction)
+  </rules>
+
+  <examples>
+  <example>
+  Input:
+  ID: entry_001
+  TITLE: The Crystal Tower
+  CATEGORY: place
+  SUMMARY: A mystical tower of pure crystal
+
+  ID: entry_002
+  TITLE: The Mage Council
+  CATEGORY: character
+  SUMMARY: Group of powerful mages
+
+  Output:
+  ## CONNECTION
+  SOURCE: entry_002
+  TARGET: entry_001
+  RELATIONSHIP: located_in
+  DESCRIPTION: The Mage Council holds their meetings in the Crystal Tower, using its power to amplify their magic.
+  </example>
+  </examples>
+
+  <execution_instruction>
+  Analyze and output connections NOW:
+  </execution_instruction>
+
+variables:
+  - name: entry_data
+    type: string
+    required: true
+    description: Formatted data of lore entries to analyze (ID, TITLE, CATEGORY, SUMMARY for each entry)
+
+examples:
+  - entry_data: |
+      ID: entry_001
+      TITLE: The Crystal Tower
+      CATEGORY: place
+      SUMMARY: A mystical tower of pure crystal
+
+      ID: entry_002
+      TITLE: The Mage Council
+      CATEGORY: character
+      SUMMARY: Group of powerful mages
+    expected_output: |
+      ## CONNECTION
+      SOURCE: entry_002
+      TARGET: entry_001
+      RELATIONSHIP: located_in
+      DESCRIPTION: The Mage Council holds their meetings in the Crystal Tower, using its power to amplify their magic.

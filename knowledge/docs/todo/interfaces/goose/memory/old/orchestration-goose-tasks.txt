@@ -1,0 +1,155 @@
+# orchestration implementation tasks claude-delegation
+# Orchestration-Goose Implementation Tasks
+
+## Overview
+These tasks collectively implement the planning/orchestration-goose capability - a specialized Goose instance focused on planning, memory management, and task delegation to Claude.
+
+## Task Delegation Instructions for Claude
+
+### Task 1: Create dedicated planning/orchestration-goose profile
+**Task ID:** 51
+**Priority:** High
+**Description:**
+Create a configuration profile specifically for planning/orchestration role with:
+- Optimized memory access
+- Todo list integration
+- Context management capabilities
+- Minimal implementation tools
+The profile should be stored in /home/skogix/.config/goose/profiles/orchestrator.yaml
+
+**Implementation Notes:**
+- Use the existing Goose config at `/home/skogix/.config/goose/config.yaml` as a reference
+- Ensure all memory and todo-list MCPs are enabled
+- Disable or limit implementation-focused tools
+- Add any environment variables needed for context optimization
+
+### Task 2: Configure context management for planning/orchestration-goose
+**Task ID:** 52
+**Priority:** High
+**Description:**
+Set up a simplified context management approach for planning/orchestration-goose:
+1. Create a dedicated lc-context profile that focuses on:
+   - Project structure (outline view)
+   - Task status
+   - System architecture
+   - Memory accessibility
+2. Define a clear method to generate this context on demand
+3. Ensure context stays manageable in size (focusing on overview not details)
+4. Document the approach in README.md
+
+**Implementation Notes:**
+- Use the existing lc-context system at `/home/skogix/.goose/.llm-context/`
+- Create new templates focusing on high-level overview rather than implementation details
+- Include mechanisms to fetch todo list status as part of context
+- Keep generated context under 20K tokens to leave room for interaction
+
+### Task 3: Create standardized task delegation system for Claude
+**Task ID:** 53
+**Priority:** High
+**Description:**
+Create a standardized approach for delegating tasks to Claude:
+1. Define a template for implementation requests that includes:
+   - Clear task description
+   - Success criteria
+   - Required context files
+   - Time/complexity expectations
+   - Integration points
+2. Create a script to format these requests consistently
+3. Set up a tracking system to monitor delegated tasks
+4. Document the approach in task_delegation.md
+
+**Implementation Notes:**
+- Create a template in Markdown format for task delegation
+- Implement a simple script (delegate-to-claude.sh) that formats and sends tasks
+- Use the todo system to track delegation status
+- Ensure the script can be called from within conversations
+
+### Task 4: Integrate orchestration-goose with SkogChat prompting
+**Task ID:** 54
+**Priority:** High
+**Description:**
+Integrate the orchestration-goose with SkogChat's unified prompt system:
+1. Add a specialized prompt-orchestrator.sh in scripts/base/
+2. Ensure it properly loads:
+   - System prompt focused on planning and delegation
+   - Context optimized for overview
+   - Memory with relevant history
+3. Connect it with unified-prompt.sh
+4. Create a simple activation script (run-orchestrator.sh)
+5. Test with a simple planning scenario
+6. Document the integration in README.md
+
+**Implementation Notes:**
+- Base the implementation on existing scripts in `/home/skogix/skogchat/scripts/base/`
+- Ensure the system prompt emphasizes planning and delegation, not implementation
+- Make sure memory retrieval focuses on high-level project state
+
+### Task 5: Enhance memory management for orchestration role
+**Task ID:** 55
+**Priority:** Medium
+**Description:**
+Enhance memory management for orchestration-goose:
+1. Create specialized memory categories for:
+   - Current project state
+   - Delegated tasks
+   - Implementation decisions
+   - Context management
+2. Add scripts to easily store and retrieve these memories
+3. Add standard templates for different memory types
+4. Document the memory structure in memory_guide.md
+
+**Implementation Notes:**
+- Use the existing memory system in mcp-goose-memory
+- Create standardized templates for different memory categories
+- Implement helper scripts for quick memory storage and retrieval
+- Focus on organizing memories for efficient planning and tracking
+
+### Task 6: Create simple activation script for orchestration-goose
+**Task ID:** 56
+**Priority:** Medium
+**Description:**
+Create a simple activation method for orchestration-goose:
+1. Create an 'orchestrate.sh' script that:
+   - Sets the correct profile
+   - Loads the appropriate context
+   - Starts the chat interface
+   - Handles session persistence
+2. Add clear documentation for how to use it
+3. Include sample commands for common operations
+4. Set up environment fallbacks for different configurations
+
+**Implementation Notes:**
+- Place the script in an easily accessible location (e.g., ~/bin/)
+- Make it executable and ensure it has appropriate error handling
+- Include options for different context types (e.g., project overview, task focus)
+- Provide clear usage examples in the script header
+
+### Task 7: Create comprehensive orchestration-goose documentation
+**Task ID:** 57
+**Priority:** Low
+**Description:**
+Create comprehensive documentation for the orchestration-goose:
+1. Create ORCHESTRATOR.md explaining:
+   - Purpose and responsibilities
+   - Configuration options
+   - Usage patterns
+   - Integration with Claude
+   - Memory management approach
+   - Context loading options
+   - Common workflows
+2. Include examples of successful orchestration
+3. Document current limitations and future plans
+
+**Implementation Notes:**
+- Use Markdown format for all documentation
+- Include clear examples and code blocks
+- Create diagrams where helpful (ASCII or link to external images)
+- Document both the "what" and the "why" of each component
+- Include troubleshooting section for common issues
+
+## Implementation Order
+1. Start with Task 1 (Profile) and Task 2 (Context) to establish the foundation
+2. Move to Task 3 (Task Delegation) to enable Claude handoff
+3. Implement Task 4 (SkogChat Integration) to connect to existing infrastructure
+4. Add Task 6 (Activation Script) to make it easily usable
+5. Enhance with Task 5 (Memory Management) and Task 7 (Documentation)

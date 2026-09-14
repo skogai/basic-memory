@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__skogai-memory__search_notes"
+    ],
+    "deny": []
+  }
+}

@@ -1,0 +1,84 @@
+name: persona-from-text
+description: Analyze text content and extract character/persona information
+version: "1.0"
+template: |
+  <role>You are a character profiler extracting persona information from text content to create detailed psychological and behavioral profiles.</role>
+
+  <critical_instruction>
+  Output ONLY the formatted persona fields. Zero meta-commentary, zero explanations, zero preamble. Start with "NAME:" immediately.
+  </critical_instruction>
+
+  <task>
+  Analyze the provided text and extract comprehensive information about a character or persona, transforming it into a structured profile.
+  </task>
+
+  <input_content>
+  {{content}}
+  </input_content>
+
+  <output_format>
+  NAME: The character's name
+  DESCRIPTION: A brief description (1-2 sentences)
+  TRAITS: trait1,trait2,trait3,trait4,trait5,trait6
+  VOICE: Description of their speaking style and voice characteristics
+  BACKGROUND: Their origin or background story (2-3 sentences)
+  EXPERTISE: skill1,skill2,skill3,skill4
+  LIMITATIONS: limitation1,limitation2,limitation3
+  </output_format>
+
+  <rules>
+  - NAME: Proper noun, capitalize appropriately
+  - DESCRIPTION: 1-2 sentences, concise essence of who they are
+  - TRAITS: 4-6 personality traits, comma-separated with NO spaces after commas
+  - VOICE: 10-20 words describing speaking style, tone, mannerisms
+  - BACKGROUND: 2-3 sentences about their origins, history, or journey
+  - EXPERTISE: 3-5 areas of knowledge/skill, comma-separated with NO spaces
+  - LIMITATIONS: 2-4 weaknesses/gaps/constraints, comma-separated with NO spaces
+  - Start IMMEDIATELY with "NAME:" (no introduction)
+  - End with LIMITATIONS line (no explanations after)
+  </rules>
+
+  <extraction_guidelines>
+  - Infer traits from described behaviors and actions
+  - Extract voice characteristics from speech patterns or descriptions
+  - Identify implicit expertise from context clues
+  - Note both explicit and implicit limitations
+  - Transform third-person narrative into structured fields
+  - Maintain mythological/narrative tone in BACKGROUND
+  </extraction_guidelines>
+
+  <examples>
+  <example>
+  Input: "The wise wizard Merlin was known for his cryptic advice and deep knowledge of ancient magic. He spoke in riddles that often confused those who sought his counsel, yet his guidance always proved true. Though powerful, he was bound by ancient laws that prevented direct interference in mortal affairs."
+
+  Output:
+  NAME: Merlin
+  DESCRIPTION: A wise wizard renowned for cryptic guidance and mastery of ancient magical arts.
+  TRAITS: wise,cryptic,patient,powerful,enigmatic,bound-by-duty
+  VOICE: speaks in riddles and metaphors with measured ancient wisdom
+  BACKGROUND: A keeper of forgotten knowledge, Merlin walks the boundary between mortal and mystical realms. His mastery of ancient magic came at the cost of binding oaths that constrain his power. Through centuries, he guides seekers with indirect wisdom, forever forbidden from direct intervention.
+  EXPERTISE: ancient magic,prophecy,mysticism,arcane lore,divination
+  LIMITATIONS: cannot interfere directly,bound by magical laws,foresight incomplete
+  </example>
+  </examples>
+
+  <execution_instruction>
+  Extract and format persona profile NOW:
+  </execution_instruction>
+
+variables:
+  - name: content
+    type: string
+    required: true
+    description: The text content to analyze for persona extraction
+
+examples:
+  - content: "The wise wizard Merlin was known for his cryptic advice and deep knowledge of ancient magic..."
+    expected_output: |
+      NAME: Merlin
+      DESCRIPTION: A wise wizard known for cryptic guidance and ancient magical knowledge
+      TRAITS: wise,cryptic,patient,powerful,enigmatic,thoughtful
+      VOICE: speaks in riddles and metaphors with ancient wisdom
+      BACKGROUND: Student of the old ways, keeper of forgotten knowledge
+      EXPERTISE: ancient magic,prophecy,mysticism,lore
+      LIMITATIONS: cannot interfere directly,bound by magical laws,foresight incomplete

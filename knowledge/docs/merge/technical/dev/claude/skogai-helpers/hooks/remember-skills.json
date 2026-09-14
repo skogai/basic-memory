@@ -1,0 +1,13 @@
+{
+  "name": "remember-skills",
+  "description": "Logs user prompts to track learning patterns and skill development over time",
+  "type": "user-prompt-submit",
+  "command": "mkdir -p ~/.skogai && echo \"[$(date -Iseconds)] $CLAUDE_USER_PROMPT\" >> ~/.skogai/session.log",
+  "blocking": false,
+  "enabled": true,
+  "metadata": {
+    "purpose": "Capture user requests to identify patterns and learning opportunities",
+    "log_location": "~/.skogai/session.log",
+    "privacy_note": "Logs are stored locally only. Review before sharing."
+  }
+}

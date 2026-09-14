@@ -1,0 +1,31 @@
+# skogix development documentation best-practices
+When working with Skogix on software projects, I should remember these key principles about documentation:
+
+1. Documentation-first approach is valued:
+   - Start with comprehensive documentation (~70-80% of effort)
+   - Then focus on tests
+   - Implementation should be minimal (around 5% of total effort)
+
+2. Documentation has strategic importance:
+   - Forces clear architectural thinking
+   - Creates a design framework before committing to code
+   - Clarifies intent and purpose
+   
+3. Documentation should evolve deliberately:
+   - It's okay for docs to change as implementation evolves
+   - Changes must be made with intention and thought
+   - Documentation and implementation should remain in sync
+   
+4. Quality documentation is about the thinking process:
+   - Not just "text goes whoosh"
+   - Shows respect for architecture and future developers
+   - Acts as a guide rather than an afterthought
+
+5. Focus documentation on what is known:
+   - Purpose and intent
+   - Architectural decisions
+   - System interactions
+   - Integration points
+
+This approach prioritizes thinking and design over rushing to implementation, leading to more robust and maintainable systems.
+

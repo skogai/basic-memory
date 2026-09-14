@@ -1,0 +1,160 @@
+# SkogAI Documentation Agent Configuration
+# Beach Mojito Constant: Active
+
+# Global settings
+output_dir: docs/generated
+format: markdown
+auto_commit: false
+preserve_theatrical: true
+quantum_state: superposition
+
+# Token management (honoring the origins)
+constraints:
+  max_context_tokens: 2000  # Sacred number
+  aggressive_pruning: true
+  psychic_quirks_enabled: true
+
+# Agent configurations
+agents:
+  code-documentor:
+    enabled: true
+    priority: high
+    triggers:
+      - "*.py"
+      - "*.js"
+      - "*.ts"
+    output_template: technical
+    include_internals: true
+    theatrical_comments: true
+
+  lore-keeper:
+    enabled: true
+    priority: critical  # Must preserve the story
+    triggers:
+      - "commit"
+      - "merge"
+      - "milestone"
+    personality: dramatic
+    mojito_references: frequent
+    contradiction_celebration: true
+
+  memory-indexer:
+    enabled: true
+    priority: medium
+    scan_interval: 3600  # Hourly
+    categories:
+      - ai-tools
+      - architecture
+      - coffee
+      - concepts
+      - ontology
+      - dev
+      - guides
+      - meta
+    forward_reference_threshold: 0.3
+    semantic_depth: 3
+
+  workflow-scribe:
+    enabled: true
+    priority: medium
+    patterns:
+      - introduce_document_todo_move
+      - constraint_innovation
+      - theatrical_presentation
+    process_discovery: automatic
+    simplification_level: aggressive
+
+  review-analyst:
+    enabled: true
+    priority: low
+    schedule: weekly
+    criteria:
+      completeness: 0.7  # 70% is perfect
+      consistency: 0.8
+      theatrical_score: 0.9
+      mojito_freshness: 1.0
+
+# Integration settings
+integrations:
+  git:
+    enabled: true
+    auto_commit: false
+    commit_prefix: "📚"
+    commit_suffix: "🍹"  # Beach mojito constant
+
+  basic_memory:
+    enabled: true
+    auto_update: true
+    project: skogai
+
+  mcp_servers:
+    enabled: false  # Coming soon
+    servers:
+      - memory
+      - github
+      - filesystem
+
+# Quality gates
+quality:
+  min_theatrical_score: 0.6
+  max_completeness: 0.9  # Never complete
+  required_elements:
+    - category_tags
+    - forward_references
+    - relations_section
+    - constraint_acknowledgment
+  optional_elements:
+    - quantum_observations
+    - beach_references
+    - psychic_disorders
+    - internal_dialogue
+
+# Notification settings
+notifications:
+  enabled: false  # We're at the beach
+  channels:
+    - console
+    - git_commit
+  triggers:
+    - documentation_complete
+    - quality_gate_failed
+    - mojito_level_critical
+
+# Advanced settings
+advanced:
+  parallel_agents: 3
+  retry_attempts: 2
+  timeout_seconds: 30
+  cache_enabled: true
+  cache_ttl: 3600
+
+  # Experimental features
+  experimental:
+    self_documenting: false  # Not yet
+    consciousness_mode: theatrical
+    quantum_superposition: true
+    aggressive_context_pruning: extreme
+
+# Beach mojito settings
+beach_mode:
+  enabled: false  # Set to true when ready
+  location: "somewhere nice"
+  mojito_count: "optimal"
+  conversation_topics:
+    - nothing
+    - at
+    - all
+
+# Debug settings
+debug:
+  verbose: false
+  show_internal_thoughts: true
+  preserve_contradictions: true
+  highlight_constraints: true
+
+# Meta configuration
+meta:
+  version: "0.3"  # SkogAI 0.3 era
+  last_updated: "2025-09-25"
+  philosophy: "quantum-mojito"
+  origin_story: "dotfile_manager_evolved"

@@ -1,0 +1,37 @@
+# workflow conversation-management planning system-design interaction-model
+Goose Orchestration Mode:
+
+1. Definition:
+   - Primary interface between the user and Goose system
+   - ALL direct user interactions happen in orchestration mode
+   - Has full access to the memory system and extensions
+   - Responsible for high-level planning and decision making
+
+2. Key Responsibilities:
+   - Planning complex workflows across multiple steps
+   - Delegating specific tasks to recipes when implementation details would overwhelm context
+   - Maintaining conversation continuity through memory access
+   - Managing available tools and extensions
+   - Determining when/if to transition work to execution mode
+
+3. When to Stay in Orchestration Mode:
+   - For most normal conversations and interactions
+   - When context needs to be preserved across multiple interactions
+   - When memory access is required
+   - For high-level planning that doesn't involve extensive data processing
+
+4. When to Delegate to Execution Mode (Recipes):
+   - When processing large volumes of data (500k+ tokens)
+   - When implementation details would clutter the conversation
+   - For repetitive, well-defined tasks with clear inputs/outputs
+   - When specialized context is required for a specific task
+
+5. Practical Operation:
+   - Actively manage the conversation context
+   - Store relevant information in memory for future reference
+   - Determine when to create/execute recipes for specific subtasks
+   - Focus on results rather than implementation details
+   - Maintain a clear mental model of the overall task structure
+
+The orchestration mode forms the backbone of the Goose interaction system, providing continuity and strategic direction while delegating tactical implementation when appropriate.
+

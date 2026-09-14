@@ -1,0 +1,33 @@
+# recipes orchestration YAML implementation-pattern context-management best-practices 
+Goose recipes are specialized configuration files (typically YAML format) that create a clear separation between planning and execution. They represent a fundamental pattern in effective AI orchestration.
+
+Key Characteristics:
+1. Self-contained execution environments with precisely defined context
+2. Purpose-built for specific tasks without irrelevant information
+3. Implementation details remain isolated from planning conversations
+4. Process potentially large amounts of data without context pollution
+5. Results-oriented rather than process-oriented
+
+Implementation Approach:
+1. Define the specific task with clear inputs and outputs
+2. Include only the context necessary for that particular task
+3. Configure any specialized behaviors or constraints
+4. Execute independently from main conversation
+5. Return only results, not implementation details
+
+Example Applications:
+- Data processing and transformation (e.g., everything regarding implementation and the details surrounding it)
+- Content generation following specific patterns
+- Analysis of large text corpuses
+- Repetitive operations with consistent patterns
+- Technical implementation requiring specialized context
+
+The memory migration example (old-memories.yaml) demonstrates this pattern by:
+1. Extracting valuable information from legacy memory systems
+2. Processing 500,000+ tokens outside the main conversation
+3. Transforming content into a new, more useful format
+4. Preserving institutional knowledge while discarding obsolete structure
+5. Presenting only the results back to the planning conversation
+
+This pattern mirrors software engineering's separation of concerns, keeping planning/orchestration separate from technical implementation details.
+

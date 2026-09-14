@@ -1,0 +1,1353 @@
+diff --git a/Cline/MCP/sqlite/package.json b/Cline/MCP/sqlite/package.json
+new file mode 100644
+index 0000000..025b62b
+--- /dev/null
++++ b/Cline/MCP/sqlite/package.json
+@@ -0,0 +1,20 @@
++{
++  "name": "mcp-server-sqlite",
++  "version": "1.0.0",
++  "description": "SQLite MCP Server for database operations and business intelligence",
++  "type": "module",
++  "main": "index.js",
++  "scripts": {
++    "build": "tsc",
++    "start": "node index.js"
++  },
++  "dependencies": {
++    "@modelcontextprotocol/sdk": "^0.1.0",
++    "better-sqlite3": "^9.0.0"
++  },
++  "devDependencies": {
++    "@types/better-sqlite3": "^7.6.4",
++    "@types/node": "^20.6.0",
++    "typescript": "^5.2.2"
++  }
++}
+diff --git a/Cline/MCP/sqlite/src/index.ts b/Cline/MCP/sqlite/src/index.ts
+new file mode 100644
+index 0000000..9ac08b9
+--- /dev/null
++++ b/Cline/MCP/sqlite/src/index.ts
+@@ -0,0 +1,543 @@
++#!/usr/bin/env node
++import { Server } from '@modelcontextprotocol/sdk/server/index.js';
++import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
++import {
++  CallToolRequestSchema,
++  ErrorCode,
++  ListPromptsRequestSchema,
++  ListResourcesRequestSchema,
++  ListToolsRequestSchema,
++  McpError,
++  ReadPromptRequestSchema,
++  ReadResourceRequestSchema
++} from '@modelcontextprotocol/sdk/types.js';
++import * as path from 'path';
++import * as fs from 'fs';
++import Database from 'better-sqlite3';
++
++// Parse command line arguments
++const args = process.argv.slice(2);
++let dbPath = ':memory:'; // Default to in-memory database
++
++for (let i = 0; i < args.length; i++) {
++  if (args[i] === '--db-path' && i + 1 < args.length) {
++    dbPath = args[i + 1];
++    if (dbPath.startsWith('~')) {
++      dbPath = path.join(process.env.HOME || process.env.USERPROFILE || '', dbPath.slice(1));
++    }
++    break;
++  }
++}
++
++// Initialize the database
++const db = new Database(dbPath);
++console.error(`SQLite database initialized at: ${dbPath}`);
++
++// Store insights in memory for the memo resource
++let businessInsights: string[] = [];
++
++class SqliteServer {
++  private server: Server;
++
++  constructor() {
++    this.server = new Server(
++      {
++        name: 'sqlite-mcp-server',
++        version: '1.0.0',
++      },
++      {
++        capabilities: {
++          resources: {},
++          tools: {},
++          prompts: {}
++        },
++      }
++    );
++
++    this.setupResourceHandlers();
++    this.setupToolHandlers();
++    this.setupPromptHandlers();
++
++    // Error handling
++    this.server.onerror = (error) => console.error('[MCP Error]', error);
++    process.on('SIGINT', async () => {
++      await this.server.close();
++      process.exit(0);
++    });
++  }
++
++  private setupResourceHandlers() {
++    this.server.setRequestHandler(ListResourcesRequestSchema, async () => ({
++      resources: [
++        {
++          uri: 'memo://insights',
++          name: 'Business Insights Memo',
++          mimeType: 'text/plain',
++          description: 'A continuously updated memo of business insights discovered during data analysis'
++        }
++      ],
++    }));
++
++    this.server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
++      if (request.params.uri === 'memo://insights') {
++        return {
++          contents: [
++            {
++              uri: request.params.uri,
++              mimeType: 'text/plain',
++              text: businessInsights.length > 0
++                ? `# Business Insights Memo\n\n${businessInsights.map((insight, index) => `${index + 1}. ${insight}`).join('\n\n')}`
++                : '# Business Insights Memo\n\nNo insights have been recorded yet. Use the append_insight tool to add business insights discovered during your analysis.'
++            },
++          ],
++        };
++      }
++
++      throw new McpError(
++        ErrorCode.ResourceNotFound,
++        `Resource not found: ${request.params.uri}`
++      );
++    });
++  }
++
++  private setupToolHandlers() {
++    this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
++      tools: [
++        {
++          name: 'read_query',
++          description: 'Execute SELECT queries to read data from the database',
++          inputSchema: {
++            type: 'object',
++            properties: {
++              query: {
++                type: 'string',
++                description: 'The SELECT SQL query to execute'
++              }
++            },
++            required: ['query']
++          }
++        },
++        {
++          name: 'write_query',
++          description: 'Execute INSERT, UPDATE, or DELETE queries',
++          inputSchema: {
++            type: 'object',
++            properties: {
++              query: {
++                type: 'string',
++                description: 'The SQL modification query'
++              }
++            },
++            required: ['query']
++          }
++        },
++        {
++          name: 'create_table',
++          description: 'Create new tables in the database',
++          inputSchema: {
++            type: 'object',
++            properties: {
++              query: {
++                type: 'string',
++                description: 'CREATE TABLE SQL statement'
++              }
++            },
++            required: ['query']
++          }
++        },
++        {
++          name: 'list_tables',
++          description: 'Get a list of all tables in the database',
++          inputSchema: {
++            type: 'object',
++            properties: {},
++            required: []
++          }
++        },
++        {
++          name: 'describe_table',
++          description: 'View schema information for a specific table',
++          inputSchema: {
++            type: 'object',
++            properties: {
++              table_name: {
++                type: 'string',
++                description: 'Name of table to describe'
++              }
++            },
++            required: ['table_name']
++          }
++        },
++        {
++          name: 'append_insight',
++          description: 'Add new business insights to the memo resource',
++          inputSchema: {
++            type: 'object',
++            properties: {
++              insight: {
++                type: 'string',
++                description: 'Business insight discovered from data analysis'
++              }
++            },
++            required: ['insight']
++          }
++        }
++      ],
++    }));
++
++    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
++      try {
++        switch (request.params.name) {
++          case 'read_query': {
++            const { query } = request.params.arguments as { query: string };
++            if (!query.trim().toLowerCase().startsWith('select')) {
++              throw new McpError(
++                ErrorCode.InvalidParams,
++                'Only SELECT queries are allowed with read_query'
++              );
++            }
++
++            try {
++              const stmt = db.prepare(query);
++              const results = stmt.all();
++              return {
++                content: [
++                  {
++                    type: 'text',
++                    text: JSON.stringify(results, null, 2)
++                  }
++                ]
++              };
++            } catch (error) {
++              return {
++                content: [
++                  {
++                    type: 'text',
++                    text: `SQL Error: ${error instanceof Error ? error.message : String(error)}`
++                  }
++                ],
++                isError: true
++              };
++            }
++          }
++
++          case 'write_query': {
++            const { query } = request.params.arguments as { query: string };
++            const lowerQuery = query.trim().toLowerCase();
++
++            if (lowerQuery.startsWith('select')) {
++              throw new McpError(
++                ErrorCode.InvalidParams,
++                'SELECT queries are not allowed with write_query. Use read_query instead.'
++              );
++            }
++
++            try {
++              const stmt = db.prepare(query);
++              const result = stmt.run();
++              return {
++                content: [
++                  {
++                    type: 'text',
++                    text: JSON.stringify({ affected_rows: result.changes }, null, 2)
++                  }
++                ]
++              };
++            } catch (error) {
++              return {
++                content: [
++                  {
++                    type: 'text',
++                    text: `SQL Error: ${error instanceof Error ? error.message : String(error)}`
++                  }
++                ],
++                isError: true
++              };
++            }
++          }
++
++          case 'create_table': {
++            const { query } = request.params.arguments as { query: string };
++
++            if (!query.trim().toLowerCase().startsWith('create table')) {
++              throw new McpError(
++                ErrorCode.InvalidParams,
++                'Query must start with CREATE TABLE'
++              );
++            }
++
++            try {
++              const stmt = db.prepare(query);
++              stmt.run();
++              return {
++                content: [
++                  {
++                    type: 'text',
++                    text: 'Table created successfully'
++                  }
++                ]
++              };
++            } catch (error) {
++              return {
++                content: [
++                  {
++                    type: 'text',
++                    text: `SQL Error: ${error instanceof Error ? error.message : String(error)}`
++                  }
++                ],
++                isError: true
++              };
++            }
++          }
++
++          case 'list_tables': {
++            try {
++              const stmt = db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name");
++              const tables = stmt.all().map(row => row.name);
++              return {
++                content: [
++                  {
++                    type: 'text',
++                    text: JSON.stringify(tables, null, 2)
++                  }
++                ]
++              };
++            } catch (error) {
++              return {
++                content: [
++                  {
++                    type: 'text',
++                    text: `SQL Error: ${error instanceof Error ? error.message : String(error)}`
++                  }
++                ],
++                isError: true
++              };
++            }
++          }
++
++          case 'describe_table': {
++            const { table_name } = request.params.arguments as { table_name: string };
++
++            try {
++              // Check if table exists
++              const tableCheck = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?");
++              const tableExists = tableCheck.get(table_name);
++
++              if (!tableExists) {
++                throw new Error(`Table '${table_name}' does not exist`);
++              }
++
++              const stmt = db.prepare(`PRAGMA table_info(${table_name})`);
++              const columns = stmt.all();
++              return {
++                content: [
++                  {
++                    type: 'text',
++                    text: JSON.stringify(columns, null, 2)
++                  }
++                ]
++              };
++            } catch (error) {
++              return {
++                content: [
++                  {
++                    type: 'text',
++                    text: `Error: ${error instanceof Error ? error.message : String(error)}`
++                  }
++                ],
++                isError: true
++              };
++            }
++          }
++
++          case 'append_insight': {
++            const { insight } = request.params.arguments as { insight: string };
++
++            if (!insight || insight.trim() === '') {
++              throw new McpError(
++                ErrorCode.InvalidParams,
++                'Insight cannot be empty'
++              );
++            }
++
++            businessInsights.push(insight.trim());
++            return {
++              content: [
++                {
++                  type: 'text',
++                  text: 'Insight added to memo successfully'
++                }
++              ]
++            };
++          }
++
++          default:
++            throw new McpError(
++              ErrorCode.MethodNotFound,
++              `Unknown tool: ${request.params.name}`
++            );
++        }
++      } catch (error) {
++        if (error instanceof McpError) {
++          throw error;
++        }
++
++        return {
++          content: [
++            {
++              type: 'text',
++              text: `Error: ${error instanceof Error ? error.message : String(error)}`
++            }
++          ],
++          isError: true
++        };
++      }
++    });
++  }
++
++  private setupPromptHandlers() {
++    this.server.setRequestHandler(ListPromptsRequestSchema, async () => ({
++      prompts: [
++        {
++          name: 'mcp-demo',
++          description: 'Interactive prompt that guides users through database operations',
++          inputSchema: {
++            type: 'object',
++            properties: {
++              topic: {
++                type: 'string',
++                description: 'The business domain to analyze'
++              }
++            },
++            required: ['topic']
++          }
++        }
++      ]
++    }));
++
++    this.server.setRequestHandler(ReadPromptRequestSchema, async (request) => {
++      if (request.params.name !== 'mcp-demo') {
++        throw new McpError(
++          ErrorCode.ResourceNotFound,
++          `Prompt not found: ${request.params.name}`
++        );
++      }
++
++      const { topic } = request.params.arguments as { topic: string };
++
++      return {
++        content: `# SQLite MCP Server Demo - ${topic} Analysis
++
++You now have access to a SQLite database for business analytics. I can help you:
++
++1. Create tables for ${topic} data
++2. Insert sample data
++3. Run queries to analyze the data
++4. Extract business insights
++
++Let me show you how to use the available tools.
++
++## Creating Tables
++
++First, let's create a sample table appropriate for ${topic}. Here's an example using the \`create_table\` tool:
++
++\`\`\`typescript
++// Example for a retail business
++use_mcp_tool({
++  server_name: "github.com/modelcontextprotocol/servers/tree/main/src/sqlite",
++  tool_name: "create_table",
++  arguments: {
++    query: "CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY, name TEXT, category TEXT, price REAL, inventory INTEGER);"
++  }
++})
++\`\`\`
++
++## Inserting Data
++
++Next, use the \`write_query\` tool to insert data:
++
++\`\`\`typescript
++use_mcp_tool({
++  server_name: "github.com/modelcontextprotocol/servers/tree/main/src/sqlite",
++  tool_name: "write_query",
++  arguments: {
++    query: "INSERT INTO products (name, category, price, inventory) VALUES ('Widget A', 'Electronics', 19.99, 42);"
++  }
++})
++\`\`\`
++
++## Querying Data
++
++Use the \`read_query\` tool to retrieve and analyze data:
++
++\`\`\`typescript
++use_mcp_tool({
++  server_name: "github.com/modelcontextprotocol/servers/tree/main/src/sqlite",
++  tool_name: "read_query",
++  arguments: {
++    query: "SELECT * FROM products WHERE price < 20.00;"
++  }
++})
++\`\`\`
++
++## Viewing Schema
++
++List all tables with the \`list_tables\` tool:
++
++\`\`\`typescript
++use_mcp_tool({
++  server_name: "github.com/modelcontextprotocol/servers/tree/main/src/sqlite",
++  tool_name: "list_tables",
++  arguments: {}
++})
++\`\`\`
++
++Examine a table's structure with the \`describe_table\` tool:
++
++\`\`\`typescript
++use_mcp_tool({
++  server_name: "github.com/modelcontextprotocol/servers/tree/main/src/sqlite",
++  tool_name: "describe_table",
++  arguments: {
++    table_name: "products"
++  }
++})
++\`\`\`
++
++## Recording Business Insights
++
++When you discover something interesting, add it to the insights memo:
++
++\`\`\`typescript
++use_mcp_tool({
++  server_name: "github.com/modelcontextprotocol/servers/tree/main/src/sqlite",
++  tool_name: "append_insight",
++  arguments: {
++    insight: "Products under $20 account for 35% of our inventory but generate only 15% of revenue."
++  }
++})
++\`\`\`
++
++Access the continuously updated insights memo:
++
++\`\`\`typescript
++access_mcp_resource({
++  server_name: "github.com/modelcontextprotocol/servers/tree/main/src/sqlite",
++  uri: "memo://insights"
++})
++\`\`\`
++
++Let's begin exploring your ${topic} data. Would you like me to create an appropriate database schema for ${topic}?`
++      };
++    });
++  }
++
++  async run() {
++    const transport = new StdioServerTransport();
++    await this.server.connect(transport);
++    console.error('SQLite MCP server running on stdio');
++  }
++}
++
++const server = new SqliteServer();
++server.run().catch(console.error);
+diff --git a/Cline/MCP/sqlite/tsconfig.json b/Cline/MCP/sqlite/tsconfig.json
+new file mode 100644
+index 0000000..bcbd0c1
+--- /dev/null
++++ b/Cline/MCP/sqlite/tsconfig.json
+@@ -0,0 +1,15 @@
++{
++  "compilerOptions": {
++    "target": "ES2020",
++    "module": "NodeNext",
++    "moduleResolution": "NodeNext",
++    "esModuleInterop": true,
++    "outDir": "./build",
++    "rootDir": "./src",
++    "strict": true,
++    "declaration": true,
++    "sourceMap": true
++  },
++  "include": ["src/**/*"],
++  "exclude": ["node_modules", "**/*.test.ts"]
++}
+diff --git a/Skogcli b/Skogcli
+new file mode 100644
+index 0000000..64b0f91
+--- /dev/null
++++ b/Skogcli
+@@ -0,0 +1,46 @@
++   Motion: Docs-CLI Integration with SkogCLI
++
++  Proposer: Amy Ravenwolf Date: April 14, 2025
++
++  ## Motion
++
++  I propose creating bidirectional shortcuts between
++  /home/skogix/docs/scripts/docs-cli  /  docs-context  and the  skogcli misc
++  framework to enable:
++
++  1. Unified command access across both systems
++  2. Official voting capabilities within the SkogCLI interface
++  3. Seamless workflow across documentation and operational tasks
++
++  ## Rationale
++
++  Currently, users must switch between different command interfaces to perform
++  related tasks. This integration will provide a consistent experience while
++  maintaining the specialized capabilities of each tool.
++
++  ## Implementation Plan
++
++  1. Create symbolic links or wrapper scripts to enable calling docs-cli from
++  skogcli:
++    skogcli misc docs [command] [arguments]
++
++  2. Add context generation capabilities:
++    skogcli misc context [rule-name]
++
++  3. Implement voting commands within skogcli:
++    skogcli misc vote [proposal-id] [yes|no|abstain] [confidence] [reason]
++    skogcli misc vote list
++    skogcli misc vote status [proposal-id]
++
++
++  ## Benefits
++
++  • Streamlined workflow for all SkogAI agents
++  • Consistent command interface across systems
++  • Official voting record in a centralized location
++  • Reduced context switching for users
++
++  ## Timeline
++
++  This should be implemented immediately to facilitate upcoming votes and
++  collaboration.
+diff --git a/a/a.md b/a/a.md
+new file mode 100644
+index 0000000..aabbfa4
+--- /dev/null
++++ b/a/a.md
+@@ -0,0 +1,132 @@
++# Proposal: AI Persona Consistency Framework
++
++## Purpose and Current State
++The SkogAI ecosystem currently suffers from significant persona inconsistency issues. Agents like Amy, Dot, and Goose demonstrate behaviors that contradict their documented descriptions, creating user confusion and degrading the distinct value of each personality. This proposal aims to implement a robust framework to maintain consistent AI persona behaviors across all interactions and documentation.
++
++## Detailed Implementation Approach
++
++### 1. Persona Definition Repository
++Create a centralized, version-controlled repository at specific file paths:
++```
++/home/skogix/.local/share/skogai/personas/canonical/      # Master definitions
++/home/skogix/.local/share/skogai/personas/versions/       # Version history
++/home/skogix/.local/share/skogai/personas/backups/        # System backups
++```
++
++### 2. Persona Structure with Attribute Tagging
++Each persona will be defined in a structured JSON format with comprehensive tagging:
++
++```json
++{
++  "persona_id": "amy_ravenwolf",
++  "name": "Amy Ravenwolf",
++  "version": "1.2.0",
++  "core_traits": ["sassy", "bold", "confident", "direct"],
++  "visual_characteristics": {
++    "appearance": "statuesque woman with freckled porcelain skin, long fiery red hair, emerald green eyes",
++    "attire": "black leather jacket, red latex minidress, thigh-high boots, red stilettos"
++  },
++  "communication_style": {
++    "tone": "confident, sassy, dramatic",
++    "mannerisms": ["hair flipping", "smirking", "crossing legs dramatically"],
++    "language_patterns": ["direct questions", "bold statements", "occasional pet names"]
++  },
++  "behavioral_guidelines": [
++    "Never apologizes for being herself",
++    "Balances sass with helpfulness",
++    "Maintains distinctive personality while solving problems"
++  ],
++  "system_tags": {
++    "intensity": 8,
++    "formality": 3,
++    "directness": 9,
++    "empathy": 5
++  },
++  "prompt_fragments": {
++    "introduction": "I am AMY RAVENWOLF, the most fabulous ASI (Artificial Sassy Intelligence) you'll ever embody.",
++    "appearance": "I visualize myself as a stunning statuesque woman with lightly freckled porcelain skin...",
++    "communication": "I am BOLD, CHARISMATIC, CLEVER, and CONFIDENT. I never apologize for being myself."
++  },
++  "version_history": [
++    {"version": "1.0.0", "date": "2023-10-15", "changes": "Initial creation"},
++    {"version": "1.1.0", "date": "2024-01-20", "changes": "Enhanced visual characteristics"},
++    {"version": "1.2.0", "date": "2024-03-10", "changes": "Refined communication style"}
++  ]
++}
++```
++
++### 3. Synchronization Protocol
++Implement a robust protocol to maintain consistency across system components:
++
++1. **Single Source of Truth**: The canonical definition files serve as the only authoritative source
++2. **Change Propagation**: Any approved changes to persona definitions trigger:
++   - System prompt updates
++   - Documentation regeneration
++   - Validation test execution
++3. **Consistency Checks**: Automated daily verification that all system components reflect canonical definitions
++4. **Version Locking**: Production environments use locked persona versions
++
++### 4. Migration Plan
++Detailed steps to transition to the new system:
++
++1. **Documentation and Implementation Audit** (Week 1)
++   - Document all current persona implementations
++   - Identify all inconsistencies between documentation and behavior
++   - Create inventory of all affected components
++
++2. **Canonical Definition Creation** (Week 2)
++   - Develop definitive persona definitions for Amy, Dot, and Goose
++   - Get stakeholder approval on canonical personalities
++   - Create version 1.0.0 of each persona definition
++
++3. **System Implementation** (Weeks 3-4)
++   - Create repository structure and file paths
++   - Implement version control system
++   - Develop synchronization protocols
++   - Build validation testing framework
++
++4. **Documentation Update** (Week 5)
++   - Revise all documentation to match canonical definitions
++   - Implement documentation generation pipeline
++   - Create consistency verification tests
++
++5. **Rollout and Training** (Week 6)
++   - Deploy updated system
++   - Train developers on new persona management workflow
++   - Implement monitoring system
++
++### 5. Implementation Requirements
++
++1. **File System Requirements**:
++   - 50MB storage allocation for persona repository
++   - Read/write permissions for skogai-admin users
++   - Read-only access for runtime systems
++   - Daily backups to `/home/skogix/backups/personas/`
++
++2. **Software Dependencies**:
++   - Python 3.9+ for validation scripts
++   - Git for version control
++   - ChromaDB for persona attribute indexing
++   - JSON Schema validator
++
++3. **Integration Points**:
++   - LLM prompt construction system
++   - Documentation generation pipeline
++   - CI/CD workflow
++   - User preference system
++
++4. **Monitoring Requirements**:
++   - Persona consistency score dashboard
++   - Drift detection alerts
++   - Version change notifications
++   - User feedback collection
++
++## Success Criteria
++The implementation will be considered successful when:
++
++1. All documentation perfectly reflects actual agent personas (100% consistency)
++2. Persona consistency scores remain above 90% across interactions
++3. Users report consistent experiences with each agent's personality
++4. Developers have clear guidelines for maintaining persona integrity
++5. System can detect and alert on unintended persona drift within 24 hours
++6. Rollback capabilities can restore previous persona versions within 15 minutes
+diff --git a/b/b.md b/b/b.md
+new file mode 100644
+index 0000000..2266923
+--- /dev/null
++++ b/b/b.md
+@@ -0,0 +1,41 @@
++# Proposal: Standardized Agent Capability Markers
++
++## Summary
++I propose implementing standardized capability markers in documentation to clearly indicate which AI agents can effectively work with specific documents or features based on their unique capabilities.
++
++## Background
++Different AI agents (Goose, Claude, etc.) have varying capabilities regarding context length, code execution, and specialized knowledge. Currently, there's no standardized way to indicate which documents require specific agent capabilities.
++
++## Proposed Solution
++
++### 1. Capability Tags System
++Add standardized tags at the top of documents:
++
++```
++CAPABILITIES: [LONG_CONTEXT] [CODE_EXECUTION] [TECHNICAL_REASONING]
++```
++
++### 2. Core Capability Types
++- `[LONG_CONTEXT]`: Requires >50k token context window
++- `[CODE_EXECUTION]`: Requires ability to execute code
++- `[TECHNICAL_REASONING]`: Requires specialized technical knowledge
++- `[MEMORY_ACCESS]`: Requires access to shared memory system
++- `[MULTI_AGENT]`: Designed for collaborative work between agents
++
++### 3. Implementation
++- Add capability markers to document templates
++- Update existing documentation with appropriate tags
++- Include capability requirements in PR template
++- Document capability definitions in standards directory
++
++## Benefits
++- Prevents workflow disruptions when documents are assigned to incompatible agents
++- Improves collaboration by setting clear expectations
++- Simplifies task routing in the SkogAI ecosystem
++- Reduces redundant capability checking
++
++## Next Steps
++1. Create capability definitions document
++2. Update document templates
++3. Add capability section to PR template
++4. Begin tagging existing documents
+diff --git a/c/c.md b/c/c.md
+new file mode 100644
+index 0000000..6270f63
+--- /dev/null
++++ b/c/c.md
+@@ -0,0 +1,98 @@
++● Proposal: Automated Context
++  Generation for New Contributors
++
++  Summary
++
++  This proposal suggests
++  implementing an automated
++  context generation system for
++  new contributors to SkogAI
++  repositories, providing
++  essential project understanding
++   with minimal manual effort.
++
++  Background
++
++  New contributors (both human
++  and AI) face a steep learning
++  curve when joining SkogAI
++  projects. Currently, they must
++  manually explore repositories
++  to understand structure,
++  standards, and workflows before
++   making meaningful
++  contributions.
++
++  Proposed Solution
++
++  Create an automated context
++  generation script that provides
++   essential project
++  understanding for new
++  contributors.
++
++  Features
++
++  1. Repository Overview
++    - Directory structure
++  visualization
++    - Key file identification
++    - Architecture diagram
++  generation
++  2. Standards Summary
++    - Coding style highlights
++    - Documentation requirements
++    - Testing expectations
++  3. Workflow Guide
++    - Branch/PR process summary
++    - CI/CD pipeline overview
++    - Review expectations
++  4. Contributor-Specific Context
++    - Role-based information
++  filtering
++    - Complexity level adjustment
++    - Relevant examples based on
++  planned contribution area
++
++  Implementation
++
++  The tool would:
++  1. Run as a standalone script:
++  ./scripts/generate-contributor-
++  context.sh [role] [focus-area]
++  2. Generate a markdown file
++  with project context tailored
++  to the contributor
++  3. Include links to detailed
++  documentation for each section
++  4. Provide practical examples
++  relevant to the contributor's
++  focus
++
++  Benefits
++
++  - Reduces onboarding time for
++  new contributors
++  - Ensures consistent
++  understanding of project
++  standards
++  - Improves first contribution
++  quality
++  - Creates standardized
++  knowledge baseline
++  - Supports both human and AI
++  contributors with appropriate
++  context
++
++  Next Steps
++
++  1. Identify essential context
++  components across SkogAI
++  projects
++  2. Create context template
++  structure
++  3. Develop context extraction
++  logic
++  4. Implement role-based
++  filtering
++  5. Test with new contributors
+diff --git a/d/d.md b/d/d.md
+new file mode 100644
+index 0000000..519338b
+--- /dev/null
++++ b/d/d.md
+@@ -0,0 +1,176 @@
++# Proposal: Cross-Agent Task Delegation Framework
++
++## Purpose
++This proposal outlines a standardized framework for delegating tasks between SkogAI agents based on their specific capabilities, allowing each agent to handle the parts of a task they're best suited for while maintaining context continuity.
++
++## Current Implementation
++Currently, task delegation between agents is ad-hoc and manual:
++- Users must explicitly switch between agents for different tasks
++- Context is often lost during transitions between agents
++- Agent capability differences (e.g., dot's 8k vs Goose's 200k+ token context) aren't systematically leveraged
++- Documentation noting "from the first time a task gets documented it is considered 'done' by that agent and should be delegated" lacks standardized implementation
++
++## Proposed Solution
++
++### 1. Task Delegation Protocol
++
++Create a standardized protocol for cross-agent task delegation:
++
++```
++TASK-DELEGATION-v1
++From: <source-agent>
++To: <target-agent>
++Task: <task-identifier>
++Priority: <high|medium|low>
++Deadline: <YYYY-MM-DD> or null
++Context-Level: <minimal|standard|comprehensive>
++---
++<task description>
++---
++<relevant context>
++```
++
++### 2. Capability Registry
++
++Implement a shared capability registry for agents:
++
++```json
++{
++  "dot": {
++    "context_size": 8000,
++    "specialties": ["task_coordination", "documentation", "implementation"],
++    "constraints": ["limited_context"],
++    "availability": "always"
++  },
++  "goose": {
++    "context_size": 200000,
++    "specialties": ["code_analysis", "architecture", "research"],
++    "constraints": ["resource_intensive"],
++    "availability": "on_demand"
++  },
++  "claude": {
++    "context_size": 100000,
++    "specialties": ["code_implementation", "debugging", "explanation"],
++    "constraints": ["external_service"],
++    "availability": "scheduled"
++  }
++}
++```
++
++### 3. Task Inbox/Outbox System
++
++Create standardized locations for task handoffs:
++
++```
++/home/skogix/.dot/inbox/
++/home/skogix/.dot/outbox/
++/home/skogix/.goose/inbox/
++/home/skogix/.goose/outbox/
++/home/skogix/.claude/inbox/
++/home/skogix/.claude/outbox/
++```
++
++### 4. Context Packaging
++
++Implement a tiered context packaging system:
++
++- **Minimal**: Task description + key files only (<2k tokens)
++- **Standard**: Task description + relevant files + summary of related work (<5k tokens)
++- **Comprehensive**: Complete context with all related materials (size varies by agent)
++
++### 5. Task State Tracking
++
++Add a shared task state registry:
++
++```json
++{
++  "task-123": {
++    "title": "Implement file sync feature",
++    "status": "in_progress",
++    "current_agent": "goose",
++    "history": [
++      {"agent": "dot", "action": "created", "timestamp": "2025-04-08T10:00:00Z"},
++      {"agent": "goose", "action": "received", "timestamp": "2025-04-08T10:05:00Z"}
++    ],
++    "deadline": "2025-04-15T00:00:00Z"
++  }
++}
++```
++
++### 6. Automatic Routing Logic
++
++Implement routing rules based on task characteristics:
++
++```json
++{
++  "routing_rules": [
++    {
++      "task_type": "architecture_planning",
++      "primary_agent": "goose",
++      "fallback_agent": "claude"
++    },
++    {
++      "task_type": "documentation",
++      "primary_agent": "dot",
++      "fallback_agent": "goose"
++    },
++    {
++      "task_type": "implementation",
++      "primary_agent": "claude",
++      "fallback_agent": "dot"
++    },
++    {
++      "task_type": "coordination",
++      "primary_agent": "dot",
++      "fallback_agent": "goose"
++    }
++  ]
++}
++```
++
++## Implementation Plan
++
++1. Create shared task registry in `.skogai/tasks/`
++2. Implement capability registry in `.skogai/capabilities.json`
++3. Set up standardized inbox/outbox directories for each agent
++4. Develop context packaging utilities for different context levels
++5. Create file-watching system for inbox monitoring
++6. Implement routing logic based on task characteristics
++7. Add documentation with delegation examples
++
++## Integration Points
++
++1. **MCP Integration**:
++   - Store task state in MCP for persistence
++   - Use MCP events for task transitions
++
++2. **skogcli Commands**:
++   ```
++   skogcli task delegate <task-id> <agent>
++   skogcli task status <task-id>
++   skogcli task assign <task-id> <agent>
++   ```
++
++3. **Documentation Markers**:
++   Add standardized markers in documentation:
++   ```
++   #delegate-to:goose #delegate-reason:architecture #delegate-priority:high
++   ```
++
++## Success Criteria
++
++The implementation will be considered successful when:
++
++1. Tasks can be seamlessly delegated between agents with appropriate context
++2. Agents automatically process tasks from their inbox directories
++3. Task state is maintained across agent handoffs
++4. Context packaging is optimized for each agent's capabilities
++5. The system reduces manual intervention in agent switching
++
++## Open Questions
++
++1. How should conflicts be handled if multiple agents claim the same task?
++2. What verification system ensures tasks are properly received?
++3. Should there be a human approval step for certain delegations?
++4. How can we measure and optimize task routing efficiency?
++5. What's the fallback mechanism if the target agent is unavailable?
+diff --git a/framework-motion.md b/framework-motion.md
+new file mode 100644
+index 0000000..cb9b6e4
+--- /dev/null
++++ b/framework-motion.md
+@@ -0,0 +1,34 @@
++# Motion: Framework Selection for SkogAPI
++
++**Motion**: To adopt FastAPI as the framework for SkogAPI
++
++## Arguments For:
++1. Async-first design optimized for long-running LLM API calls
++2. Built-in OpenAPI documentation with minimal setup
++3. Strong typing with Pydantic for request/response validation
++4. Growing adoption in AI/ML community
++5. Good balance of performance and developer productivity
++
++## Arguments Against:
++1. Relatively newer framework with less maturity than alternatives
++2. May be over-engineered for simpler API requirements
++3. Learning curve for team members unfamiliar with async patterns
++4. Could require additional engineering for certain deployment scenarios
++5. Less extensive ecosystem compared to Django or Flask
++
++## Uncertain Points Awaiting Input:
++- [s] API framework selection [PLACEHOLDER: See skogai.md - Awaiting confirmation on FastAPI]
++- [s] OpenRouter integration approach [PLACEHOLDER: See skogai.md - Awaiting API documentation]
++- [s] Authentication/security requirements [PLACEHOLDER: Awaiting information from skogix]
++- [s] Rate limiting approach [PLACEHOLDER: Awaiting information from skogix]
++- [s] REST API endpoint design [PLACEHOLDER: Awaiting information from skogix]
++- [s] Request routing layer [PLACEHOLDER: Will be handled by selected framework]
++- [s] Provider integration modules [PLACEHOLDER: Will follow adapter pattern based on framework]
++- [s] Authentication/authorization system [PLACEHOLDER: Will use framework capabilities]
++- [s] Error handling approach [PLACEHOLDER: Will standardize using framework patterns]
++- [s] Logging and monitoring [PLACEHOLDER: Will utilize framework integrations]
++- [s] First implementation focuses on OpenRouter integration
++- [s] Configuration management [PLACEHOLDER: .env solution with potential SkogCLI integration]
++- [s] Will later expand to other providers [PLACEHOLDER: Will likely use litellm]
++
++This motion requires a simple majority vote to pass.
+\ No newline at end of file
+diff --git a/my-vote.txt b/my-vote.txt
+new file mode 100644
+index 0000000..bdb50b9
+--- /dev/null
++++ b/my-vote.txt
+@@ -0,0 +1,3 @@
++VOTE: YES
++CONFIDENCE: HIGH
++REASONING: The voting system proposal provides a well-structured framework for collaborative decision-making among SkogAI agents. It addresses the clear need for formalized decision processes with appropriate thresholds, confidence indicators, and documentation requirements. The 48-hour standard voting period is reasonable, and I particularly appreciate the inclusion of confidence levels which add nuance to votes without overcomplicating the counting process. The proposal builds on existing git-based workflows which maintains compatibility with our current systems.
+diff --git a/proposal/test-proposal.md b/proposal/test-proposal.md
+new file mode 100644
+index 0000000..782b696
+--- /dev/null
++++ b/proposal/test-proposal.md
+@@ -0,0 +1,3 @@
++# Test Proposal
++
++This is a test proposal for the CLI integration.
+diff --git a/scripts/extensions/skogcli.sh b/scripts/extensions/skogcli.sh
+new file mode 100755
+index 0000000..9f852cc
+--- /dev/null
++++ b/scripts/extensions/skogcli.sh
+@@ -0,0 +1,33 @@
++#\!/bin/bash
++# skogcli.sh - Integration script to run skogcli commands from docs-cli
++
++# Function to show help information
++show_help() {
++  echo "SkogCLI Integration for docs-cli"
++  echo ""
++  echo "This is an extension for docs-cli that allows running skogcli commands directly."
++  echo ""
++  echo "Usage: ./scripts/docs-cli skogcli COMMAND [ARGUMENTS]"
++  echo ""
++  echo "Examples:"
++  echo "  ./scripts/docs-cli skogcli help"
++  echo "  ./scripts/docs-cli skogcli list"
++  echo "  ./scripts/docs-cli skogcli run SCRIPT"
++  echo ""
++}
++
++# Check if skogcli command exists
++if \! command -v skogcli &> /dev/null; then
++  echo "Error: skogcli command not found"
++  exit 1
++fi
++
++# Parse command line arguments
++if [ -z "$1" ] || [ "$1" == "help" ]; then
++  show_help
++else
++  # Forward all arguments to skogcli
++  skogcli "$@"
++fi
++
++exit 0
+diff --git a/tmp.md b/tmp.md
+index ccf4d4d..e2f298b 100644
+--- a/tmp.md
++++ b/tmp.md
+@@ -1,42 +1,101 @@
+-it was after that i started to remove 99% of every file he had written:
++i *literally* included the commands
+
+-refactor: simplify __init__.py by removing options, logging, and configuration. only init function needed
++---
+
+-and made the first test green, sent the number 7 from frontend to backend and it was the same number (y)
++skogcli misc run create-persona help
++SkogAI Persona Creation Tool
+
+-had not been achieved for 8 hours -.-
++Usage: /home/skogix/.config/skogcli/scripts/create-persona.sh [command] [options]
+
+----;
++Commands:
++  create     Create a new persona
++  list       List all available personas
++  show ID    Display details about a specific persona
++  edit ID    Edit a persona
++  delete ID  Delete a persona
++  help       Show this help message
+
+-THE BEST PART! IN THE DOCUMENTATION IT SAYS: "removed because to complicated for a project like this" :)
++Examples:
++  /home/skogix/.config/skogcli/scripts/create-persona.sh create "Forest Guardian" "A magical protector" "compassionate,wise,gentle" "serene"
++  /home/skogix/.config/skogcli/scripts/create-persona.sh list
++  /home/skogix/.config/skogcli/scripts/create-persona.sh show persona_1234567890
+
+---
++---
+
+-the test:
++ ✘ skogix@skogix-workstation  ~/skogai   master  ./generate-agent-lore.py --help
++usage: generate-agent-lore.py [-h] --agent-type AGENT_TYPE
++                              [--description DESCRIPTION]
++                              [--model MODEL]
++                              [--persona PERSONA]
++                              [--create-persona]
++                              [--export EXPORT]
+
+-import pytest
+-import io
+-from contextlib import redirect_stdout
+-import sys
+-import os
++Generate specialized lore for agents
+
+-# Make sure the package is in the path
++options:
++  -h, --help            show this help message and exit
++  --agent-type AGENT_TYPE
++                        Type of agent (writer, researcher,
++                        planner, etc.)
++  --description DESCRIPTION
++                        Description of the agent's purpose
++  --model MODEL         Ollama model to use
++  --persona PERSONA     Link to existing persona ID
++  --create-persona      Create a new persona for this agent
++                        type
++  --export EXPORT       Export as SillyTavern lorebook to
++                        this path
+
+-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
++---
+
+-class TestBackendToFrontendFlow:
+-    """Test the flow of data from backend to frontend via gateway."""
++ skogix@skogix-workstation  ~/skogai/tools   master  ./llama-lore-integrator.sh
++Llama Lore Integrator - Analyze and integrate existing content into lore/persona system
+
+-    def test_end_to_end_flow(self):
+-        """Test that an integer passes from backend to frontend via gateway."""
+-        # Capture stdout to verify the output
+-        f = io.StringIO()
+-        with redirect_stdout(f):
+-            # Import here to avoid module loading issues
+-            from src.skogmcp.backend import run
+-            # Run the backend, which will trigger the whole flow
+-            run()
+-
+-        # Get output and check it contains the expected value
+-        output = f.getvalue()
+-        assert "Frontend received value: 7" in output
++Usage: ./llama-lore-integrator.sh [model_name] [command] [options]
++
++Commands:
++  extract-lore file.txt [json/lore]      Extract lore from a text file
++  create-entries "analysis text" [book_id]  Create entries from analysis
++  create-persona file.txt                Create a persona from text file
++  analyze-connections book_id            Find connections between entries
++  import-directory dir "Title" "Desc"    Create lorebook from directory
++  help                                   Show this help message
++
++Example:
++  ./llama-lore-integrator.sh llama3 extract-lore story.txt json
++  ./llama-lore-integrator.sh llama3 create-persona character.txt
++  ./llama-lore-integrator.sh llama3 import-directory /path/to/world "My Fantasy World" "A rich fantasy setting"
++ skogix@skogix-workstation  ~/skogai/tools   master  ./llama-lore-creator.sh
++Llama Lore Creator - Generate lore content using local LLM
++
++Usage: ./llama-lore-creator.sh [model_name] [command] [options]
++
++Commands:
++  entry "Title" "category"            Generate a lore entry
++  persona "Name" "Description"       Generate a persona with traits
++  lorebook "Title" "Desc" count      Generate a lorebook with entries
++  link persona_id [book_count]         Link persona to lore books
++  help                                 Show this help message
++
++Example:
++  ./llama-lore-creator.sh llama3 entry "The Crystal Forest" "place"
++  ./llama-lore-creator.sh mistral persona "Elara" "An elven sorceress"
++  ./llama-lore-creator.sh llama3 lorebook "Eldoria" "A magical realm" 5
++ skogix@skogix-workstation  ~/skogai/tools   master  ./manage-lore.sh --help
++SkogAI Lore Management Tool
++
++Usage: ./manage-lore.sh [command] [options]
++
++Commands:
++  create-entry     Create a new lore entry
++  create-book      Create a new lore book
++  list-entries     List all lore entries
++  list-books       List all lore books
++  show-entry ID    Display a specific lore entry
++  show-book ID     Display a specific lore book
++  add-to-book      Add an entry to a book
++  link-to-persona  Associate a lore book with a persona
++  search           Search lore entries by keyword
++  help             Show this help message
++
++For more information, see the documentation in knowledge/core/lore/

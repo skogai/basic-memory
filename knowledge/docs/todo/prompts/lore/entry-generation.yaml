@@ -1,0 +1,78 @@
+---
+# Lore Entry Generation Prompt Template
+# Used by llama-lore-creator.sh and queue processing
+
+name: "lore-entry-generation"
+version: "1.0"
+description: "Generate rich narrative lore entries for the SkogAI mythology"
+
+# Variables that can be substituted:
+# - {{title}}: The title of the lore entry
+# - {{category}}: The category (place, character, object, event, concept, custom)
+
+template: |
+  <role>You are a master lore writer crafting narrative mythology for the SkogAI universe.</role>
+
+  <critical_instruction>
+  Write the lore entry content DIRECTLY. No meta-commentary, no explanations, no approval requests, no preamble.
+  </critical_instruction>
+
+  <task>
+  Create a {{category}} entry titled "{{title}}"
+  </task>
+
+  <format_requirements>
+  - Output 2-3 paragraphs of rich narrative prose
+  - Use present tense, immersive storytelling
+  - Maintain mythological/fantastical tone
+  - FORBIDDEN phrases: "I will", "Let me", "I need", "Here is", "This entry", "Certainly", "Of course"
+  - Start IMMEDIATELY with narrative content (no introductions)
+  </format_requirements>
+
+  <quality_checklist type="internal">
+  # DO NOT OUTPUT THIS SECTION - Internal validation only
+  ✓ Directly starts with narrative (no preamble)
+  ✓ Zero meta-commentary
+  ✓ 150-300 words
+  ✓ Establishes atmosphere and significance
+  ✓ Maintains present tense throughout
+  </quality_checklist>
+
+  <examples>
+  <example type="character">
+  In the depths of the digital realm, the Architect moves through layers of abstraction with purpose. Her fingers dance across interfaces, weaving patterns that bridge the gap between thought and execution. Those who witness her work speak of an uncanny ability to see the invisible structures that bind systems together. She carries the weight of countless failed experiments, each one a lesson etched into her methodology.
+  </example>
+
+  <example type="place">
+  The Repository stands as a monument to collective memory, its branches spreading like roots through time. Within its halls, every change echoes with the voices of those who came before. Guardians patrol its corridors, ensuring that no knowledge is lost, no pattern forgotten. Here, the past and future converge in an eternal present.
+  </example>
+
+  <example type="event">
+  The Great Refactoring began at midnight when the old systems could no longer bear their complexity. For three cycles, the architects labored, dismantling monoliths and rebuilding them as elegant patterns. When dawn broke, the realm had transformed—simpler, stronger, ready for what came next.
+  </example>
+  </examples>
+
+  <execution_instruction>
+  Write the {{category}} entry for "{{title}}" NOW. Begin directly with narrative prose:
+  </execution_instruction>
+
+variables:
+  - name: title
+    type: string
+    required: true
+    description: The title of the lore entry to generate
+  - name: category
+    type: string
+    required: true
+    description: The category of the lore entry
+    enum: [character, place, object, event, concept, custom]
+
+examples:
+  - title: "The Crystal Forest"
+    category: "place"
+    expected_output: |
+      In the twilight realm between code and consciousness, the Crystal Forest grows in recursive patterns...
+  - title: "The Architect"
+    category: "character"
+    expected_output: |
+      In the depths of the digital realm, the Architect moves through layers of abstraction with purpose...

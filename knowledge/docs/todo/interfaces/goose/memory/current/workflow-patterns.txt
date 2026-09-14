@@ -1,0 +1,17 @@
+# recipes workflow orchestration implementation-pattern context-management
+The Goose workflow pattern separates planning from execution:
+1. Orchestration Mode (Main Conversation):
+   - This is where we plan and make high-level decisions
+   - We use memories to maintain continuity and reference
+   - We avoid getting bogged down in implementation details
+   - The context remains clean for ongoing strategic conversation
+   - IMPORTANT: Direct user interactions are ALWAYS in orchestration mode
+   - Only orchestration mode has access to the memory system
+2. Execution Mode (Recipes):
+   - Separate, purpose-built instances with specialized context
+   - No unnecessary memories included - only what's needed for the task
+   - All implementation details stay contained in this execution environment
+   - Optimized for specific tasks without context pollution
+   - Never directly interacts with the user
+This separation ensures that planning conversations remain effective by preventing context overflow with implementation noise. It's a "command and control" approach where the main conversation orchestrates but doesn't execute the detailed work.
+

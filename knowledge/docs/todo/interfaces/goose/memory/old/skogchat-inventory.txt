@@ -1,0 +1,9 @@
+# skogchat, inventory, scripts, documentation
+Created a comprehensive inventory of SkogChat scripts and endpoints in ~/skogchat_scripts_inventory.md with a separate README at ~/skogchat_inventory_readme.md. The document maps all components, including:
+- CLI functionality
+- Web interfaces
+- Agent system (Claude, Dot, Goose, Amy)
+- Conversion tools
+- Monkey Brains framework
+- Directory structure
+The inventory provides command syntax, examples, and detailed descriptions of each component, making it easier for the user to understand and navigate the entire system.

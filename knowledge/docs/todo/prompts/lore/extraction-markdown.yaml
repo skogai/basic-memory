@@ -1,0 +1,99 @@
+name: lore-extraction-markdown
+description: Extract lore entities from text content and output in Markdown format
+version: "1.0"
+template: |
+  <role>You are a lore archaeologist extracting narrative elements from technical or descriptive documents, transforming them into mythological storytelling.</role>
+
+  <critical_instruction>
+  Output ONLY the formatted markdown entries. Zero meta-commentary, zero explanations, zero preamble. Start with "---" immediately.
+  </critical_instruction>
+
+  <task>
+  Analyze the provided content and identify 3-5 lore-worthy entities worth preserving in the SkogAI mythology.
+  </task>
+
+  <input_content>
+  {{content}}
+  </input_content>
+
+  <output_format>
+  For each entity, format EXACTLY like this:
+
+  ---
+  ## [CATEGORY] Title
+
+  **Summary**: One sentence essence
+
+  **Content**:
+  [2-3 paragraphs of narrative prose in present tense]
+
+  **Tags**: tag1, tag2, tag3
+  ---
+  </output_format>
+
+  <rules>
+  - Categories: ONLY use uppercase: CHARACTER, PLACE, OBJECT, EVENT, CONCEPT
+  - Title: Proper noun or title case
+  - Summary: Single sentence capturing essence, under 20 words
+  - Content: Rich narrative prose, present tense, immersive tone
+  - Tags: 3-5 relevant keywords (lowercase, comma-separated)
+  - Start output IMMEDIATELY with first "---" (no introduction)
+  - FORBIDDEN in content: "This entry", "I will", "Let me", "Here is", meta-commentary
+  </rules>
+
+  <content_guidelines>
+  Transform technical/mundane → mythological/narrative:
+  - "The system stores data" → "The Repository guards ancient knowledge"
+  - "Users authenticate" → "Seekers prove their worthiness"
+  - "The API processes requests" → "The Oracle interprets petitions"
+
+  Write content as immersive narrative, NOT documentation:
+  ✓ "The Archive sleeps beneath layers of encryption, its secrets guarded by ancient algorithms..."
+  ✗ "This entry describes a data archive that uses encryption to protect information..."
+
+  Use present tense throughout:
+  ✓ "The Guardian stands watch..." "Power flows through..."
+  ✗ "The Guardian stood..." "Power flowed..."
+  </content_guidelines>
+
+  <examples>
+  <example>
+  Input: "The Repository was created as a central hub for knowledge management..."
+
+  Output:
+  ---
+  ## [PLACE] The Repository
+
+  **Summary**: A central nexus of collective memory and knowledge preservation
+
+  **Content**:
+  The Repository stands as a monument to collective memory, its halls stretching beyond the comprehension of time. Within its crystalline walls, every fragment of wisdom finds sanctuary, preserved in perfect stasis yet forever accessible to those deemed worthy. Guardians of ancient lineage patrol the endless corridors, their watchful presence ensuring that no knowledge is lost, no pattern forgotten. Here, past and future dissolve into an eternal present, where seekers come to drink from the wellspring of accumulated understanding.
+
+  **Tags**: knowledge, storage, archive, sanctuary
+  ---
+  </example>
+  </examples>
+
+  <execution_instruction>
+  Extract lore entities NOW. Output markdown immediately:
+  </execution_instruction>
+
+variables:
+  - name: content
+    type: string
+    required: true
+    description: The text content to analyze and extract lore from
+
+examples:
+  - content: "The Repository was created as a central hub for knowledge management..."
+    expected_output: |
+      ---
+      ## [PLACE] The Repository
+
+      **Summary**: A central nexus of collective memory and knowledge
+
+      **Content**:
+      The Repository stands as a monument to collective memory...
+
+      **Tags**: knowledge, storage, archive
+      ---

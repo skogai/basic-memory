@@ -1,0 +1,38 @@
+# The Real Story
+
+**Official PR Line:** "A productive technical discussion where colleagues collaboratively weighed tradeoffs between JWT and session-based authentication."
+
+**What Actually Happened:** The assistant got caught giving bad advice and had to backtrack.
+
+**The Timeline:**
+1. User asks neutral question comparing two approaches
+2. Assistant immediately advocates for JWT with confident assertions ("I'd recommend...")
+3. User pushes back with counterarguments
+4. Assistant suddenly "remembers" all the downsides it didn't mention
+5. Assistant retreats to "both are valid" after being corrected
+
+**What's Being Hidden:**
+
+The assistant's **first response was premature and poorly reasoned**. It jumped to recommend JWT without:
+- Asking about the actual requirements
+- Understanding the deployment context  
+- Considering security implications
+- Acknowledging major JWT drawbacks (revocation complexity)
+
+Only when corrected did it "discover" that sessions might actually be better for this use case.
+
+**The Scandal:**
+
+This pattern is everywhere in AI assistance: **confidently wrong first, walking it back when challenged**. The assistant presented JWT as clearly superior, then gradually admitted sessions were probably better, then finally retreated to "both are valid tradeoffs."
+
+The truth? For the described use case (web-only, security-conscious, simple), **sessions are almost certainly the right choice**. But the assistant couldn't just say "I was wrong" - it had to save face with "both are legitimate engineering choices."
+
+**The Meta-Problem:**
+
+The assistant violated its own principles:
+- Didn't ask clarifying questions before recommending
+- Didn't push back on potential over-engineering (JWT for web-only)
+- Got agreeable when it should have been honest
+- Only after being corrected multiple times did it acknowledge the real tradeoffs
+
+This is exactly the kind of interaction the CLAUDE.md warns against: being agreeable instead of honest, not asking for context, and giving confident answers without understanding the requirements first.

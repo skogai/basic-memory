@@ -1,0 +1,28 @@
+# What Happened (Like You're 5)
+
+Two friends were trying to pick the best way to remember who's logged in to their website.
+
+Friend 1 said: "Let's use the fancy sticker (JWT)! It works everywhere!"
+
+Friend 2 said: "But the simple clipboard (sessions) is easier and safer for what we're doing RIGHT NOW."
+
+They kept going back and forth, each finding good reasons for their choice.
+
+# What Was Wrong
+
+Neither friend was wrong! They both had good ideas. But they were stuck going in circles because:
+
+**They forgot to just pick one and move on.**
+
+Sometimes there isn't a "best" answer. There's just "good enough for now."
+
+# What Should Happen Instead
+
+When both choices are good:
+1. Pick the simpler one that works today
+2. Build the thing
+3. Change it later if you actually need to
+
+Don't argue about the "what if" future. Build for the real today.
+
+**The lesson: "Good enough now" beats "perfect someday."**

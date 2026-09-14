@@ -1,0 +1,1191 @@
+[
+  {
+    "timestamp": "2025-09-25T21:51:24.642573",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 9.949060650000002,
+        "total_duration_ms": 931666,
+        "total_api_duration_ms": 490137,
+        "total_lines_added": 1490,
+        "total_lines_removed": 0
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T21:51:34.425229",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 10.148728650000002,
+        "total_duration_ms": 941487,
+        "total_api_duration_ms": 503860,
+        "total_lines_added": 1575,
+        "total_lines_removed": 0
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T21:51:41.364929",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 10.148728650000002,
+        "total_duration_ms": 948383,
+        "total_api_duration_ms": 503860,
+        "total_lines_added": 1575,
+        "total_lines_removed": 0
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T21:51:43.469374",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 10.335628650000002,
+        "total_duration_ms": 950537,
+        "total_api_duration_ms": 512650,
+        "total_lines_added": 1575,
+        "total_lines_removed": 0
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T21:52:21.789776",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 10.498306900000003,
+        "total_duration_ms": 988820,
+        "total_api_duration_ms": 517030,
+        "total_lines_added": 1575,
+        "total_lines_removed": 0
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T21:52:26.822595",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 12.196456900000003,
+        "total_duration_ms": 993874,
+        "total_api_duration_ms": 531012,
+        "total_lines_added": 1575,
+        "total_lines_removed": 0
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T21:52:34.284408",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 12.250945150000003,
+        "total_duration_ms": 1001342,
+        "total_api_duration_ms": 534620,
+        "total_lines_added": 1575,
+        "total_lines_removed": 0
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T21:52:34.613339",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 12.250945150000003,
+        "total_duration_ms": 1001642,
+        "total_api_duration_ms": 534620,
+        "total_lines_added": 1575,
+        "total_lines_removed": 0
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T21:52:36.546629",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 12.250945150000003,
+        "total_duration_ms": 1003551,
+        "total_api_duration_ms": 534620,
+        "total_lines_added": 1575,
+        "total_lines_removed": 0
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T21:53:24.098492",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 12.320071800000004,
+        "total_duration_ms": 1051157,
+        "total_api_duration_ms": 550272,
+        "total_lines_added": 1575,
+        "total_lines_removed": 0
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T21:53:24.459240",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 12.320071800000004,
+        "total_duration_ms": 1051523,
+        "total_api_duration_ms": 550272,
+        "total_lines_added": 1575,
+        "total_lines_removed": 0
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T21:54:58.831982",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 12.501390850000003,
+        "total_duration_ms": 1145875,
+        "total_api_duration_ms": 643682,
+        "total_lines_added": 1575,
+        "total_lines_removed": 0
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T21:55:04.840621",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 12.723759100000004,
+        "total_duration_ms": 1151877,
+        "total_api_duration_ms": 653332,
+        "total_lines_added": 1575,
+        "total_lines_removed": 0
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T21:57:59.270901",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 13.147646550000003,
+        "total_duration_ms": 1326305,
+        "total_api_duration_ms": 822309,
+        "total_lines_added": 1575,
+        "total_lines_removed": 0
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T21:58:04.981800",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 13.443839550000003,
+        "total_duration_ms": 1332029,
+        "total_api_duration_ms": 834439,
+        "total_lines_added": 1575,
+        "total_lines_removed": 0
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T22:05:16.655578",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 13.60086815,
+        "total_duration_ms": 1763695,
+        "total_api_duration_ms": 901427,
+        "total_lines_added": 1575,
+        "total_lines_removed": 0
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T22:05:16.928831",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 13.60086815,
+        "total_duration_ms": 1763995,
+        "total_api_duration_ms": 901427,
+        "total_lines_added": 1575,
+        "total_lines_removed": 0
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T22:05:59.959451",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 13.7070988,
+        "total_duration_ms": 1807000,
+        "total_api_duration_ms": 911251,
+        "total_lines_added": 1575,
+        "total_lines_removed": 0
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T22:06:00.238594",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 13.7070988,
+        "total_duration_ms": 1807300,
+        "total_api_duration_ms": 911251,
+        "total_lines_added": 1575,
+        "total_lines_removed": 0
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T22:07:10.122066",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 13.746907850000001,
+        "total_duration_ms": 1877173,
+        "total_api_duration_ms": 927546,
+        "total_lines_added": 1575,
+        "total_lines_removed": 0
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T22:07:10.406607",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 13.746907850000001,
+        "total_duration_ms": 1877473,
+        "total_api_duration_ms": 927546,
+        "total_lines_added": 1575,
+        "total_lines_removed": 0
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T22:11:02.926703",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 14.149037299999998,
+        "total_duration_ms": 2109967,
+        "total_api_duration_ms": 1108124,
+        "total_lines_added": 2167,
+        "total_lines_removed": 4
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T22:11:03.199870",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 14.149037299999998,
+        "total_duration_ms": 2110267,
+        "total_api_duration_ms": 1108124,
+        "total_lines_added": 2167,
+        "total_lines_removed": 4
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T22:25:26.327166",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 14.181591499999996,
+        "total_duration_ms": 2973377,
+        "total_api_duration_ms": 1118680,
+        "total_lines_added": 2167,
+        "total_lines_removed": 4
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T22:25:26.619644",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 14.181591499999996,
+        "total_duration_ms": 2973677,
+        "total_api_duration_ms": 1118680,
+        "total_lines_added": 2167,
+        "total_lines_removed": 4
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T22:27:57.203881",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 14.508389499999993,
+        "total_duration_ms": 3124258,
+        "total_api_duration_ms": 1194272,
+        "total_lines_added": 2167,
+        "total_lines_removed": 4
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T22:27:57.490597",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 14.508389499999993,
+        "total_duration_ms": 3124558,
+        "total_api_duration_ms": 1194272,
+        "total_lines_added": 2167,
+        "total_lines_removed": 4
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T22:30:48.656887",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 14.661638199999992,
+        "total_duration_ms": 3295710,
+        "total_api_duration_ms": 1248436,
+        "total_lines_added": 2167,
+        "total_lines_removed": 4
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T22:30:48.971503",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 14.661638199999992,
+        "total_duration_ms": 3296010,
+        "total_api_duration_ms": 1248436,
+        "total_lines_added": 2167,
+        "total_lines_removed": 4
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T22:31:08.752675",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 14.661818199999992,
+        "total_duration_ms": 3315809,
+        "total_api_duration_ms": 1249505,
+        "total_lines_added": 2167,
+        "total_lines_removed": 4
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T22:31:09.589595",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 16.75004694999999,
+        "total_duration_ms": 3316655,
+        "total_api_duration_ms": 1257339,
+        "total_lines_added": 2167,
+        "total_lines_removed": 4
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T22:31:13.764988",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 16.92783819999999,
+        "total_duration_ms": 3320832,
+        "total_api_duration_ms": 1261223,
+        "total_lines_added": 2167,
+        "total_lines_removed": 4
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T22:31:18.000601",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 16.92853659999999,
+        "total_duration_ms": 3325047,
+        "total_api_duration_ms": 1262445,
+        "total_lines_added": 2167,
+        "total_lines_removed": 4
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T22:31:18.730672",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 17.11615659999999,
+        "total_duration_ms": 3325798,
+        "total_api_duration_ms": 1267081,
+        "total_lines_added": 2167,
+        "total_lines_removed": 4
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T22:31:23.068576",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 17.29531019999999,
+        "total_duration_ms": 3330123,
+        "total_api_duration_ms": 1272311,
+        "total_lines_added": 2167,
+        "total_lines_removed": 4
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T22:31:26.596572",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 17.29531019999999,
+        "total_duration_ms": 3333621,
+        "total_api_duration_ms": 1272311,
+        "total_lines_added": 2167,
+        "total_lines_removed": 4
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T22:31:27.165199",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 17.48142644999999,
+        "total_duration_ms": 3334232,
+        "total_api_duration_ms": 1276152,
+        "total_lines_added": 2167,
+        "total_lines_removed": 4
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T22:31:32.047476",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 17.48142644999999,
+        "total_duration_ms": 3339090,
+        "total_api_duration_ms": 1276152,
+        "total_lines_added": 2167,
+        "total_lines_removed": 4
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T22:31:33.142577",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 17.67771944999999,
+        "total_duration_ms": 3340208,
+        "total_api_duration_ms": 1281898,
+        "total_lines_added": 2167,
+        "total_lines_removed": 4
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T22:31:38.465345",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 17.67970744999999,
+        "total_duration_ms": 3345523,
+        "total_api_duration_ms": 1284997,
+        "total_lines_added": 2167,
+        "total_lines_removed": 4
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  },
+  {
+    "timestamp": "2025-09-25T22:31:39.174476",
+    "input_data": {
+      "session_id": "bf1bf6ff-110a-408e-b284-3e8520d33cf0",
+      "transcript_path": "/home/skogix/.claude/projects/-home-skogix-skogai-docs/bf1bf6ff-110a-408e-b284-3e8520d33cf0.jsonl",
+      "cwd": "/home/skogix/skogai/docs/agents/documentation",
+      "model": {
+        "id": "claude-opus-4-1-20250805",
+        "display_name": "Opus 4.1"
+      },
+      "workspace": {
+        "current_dir": "/home/skogix/skogai/docs/agents/documentation",
+        "project_dir": "/home/skogix/skogai/docs"
+      },
+      "version": "1.0.124",
+      "output_style": {
+        "name": "default"
+      },
+      "cost": {
+        "total_cost_usd": 17.87349319999999,
+        "total_duration_ms": 3346206,
+        "total_api_duration_ms": 1289643,
+        "total_lines_added": 2167,
+        "total_lines_removed": 4
+      },
+      "exceeds_200k_tokens": false
+    },
+    "status_line_output": "\u001b[32m~/skogai/docs/agents/documentation\u001b[0m \u001b[34m(develop\u001b[0m \u001b[31m\u2717\u001b[0m\u001b[34m)\u001b[0m \u001b[90m[Opus]\u001b[0m"
+  }
+]

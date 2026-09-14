@@ -1,0 +1,27 @@
+# skogcli testing basic-memory project-management
+# SkogCLI Project Testing Notes
+
+On 2025-04-12, we tested the interaction between the Basic Memory system and the skogai-memory extension with the SkogCLI project.
+
+## Test Sequence
+1. Confirmed the existence of the SkogCLI project using `uvx basic-memory project list`
+2. Created a Basic Memory project at `/home/skogix/skogcli`
+3. Created test notes that were intended for the SkogCLI project
+4. Discovered notes were going to the "main" project instead
+5. Verified via `uvx basic-memory project info` that SkogCLI was set as active project at the command line level
+6. Found discrepancy where skogai-memory extension still showed "main" as the active project
+
+## Key Findings
+- The SkogCLI project exists in `/home/skogix/skogcli`
+- The project was properly initialized with a `.basic-memory` directory
+- The command line tool recognized the project as active
+- The skogai-memory extension continued working with the "main" project
+- Notes created through the extension were stored in "main" even after changing the active project
+
+## Technical Notes
+- Database location: `/home/skogix/skogcli/.basic-memory/memory.db`
+- No entities were present in the SkogCLI project during testing
+- Watch service was not running for the SkogCLI project
+
+This experience demonstrates the separation between command line project management and extension API behavior in Basic Memory.
+

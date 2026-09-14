@@ -19,7 +19,7 @@ ENV PYTHONUNBUFFERED=1 \
 # Create a group and user with the provided UID/GID
 # Check if the GID already exists, if not create appgroup
 RUN (getent group ${GID} || groupadd --gid ${GID} appgroup) && \
-    useradd --uid ${UID} --gid ${GID} --create-home --shell /bin/bash appuser
+    useradd --uid ${UID} --gid ${GID} --create-home --shell /bin/bash skogix
 
 # Copy the project into the image
 ADD . /app
@@ -27,11 +27,11 @@ ADD . /app
 # Install Python 3.13 explicitly and sync the project
 WORKDIR /app
 RUN uv python install 3.13
-RUN uv sync --locked --python 3.13
+RUN uv sync --all-extras --all-groups --all-packages --locked --python 3.13
 
 # Create necessary directories and set ownership
 RUN mkdir -p /app/data/basic-memory /app/.basic-memory && \
-    chown -R appuser:${GID} /app
+    chown -R skogix:${GID} /app
 
 # Set default data directory and add venv to PATH
 ENV BASIC_MEMORY_HOME=/app/data/basic-memory \
@@ -39,7 +39,7 @@ ENV BASIC_MEMORY_HOME=/app/data/basic-memory \
     PATH="/app/.venv/bin:$PATH"
 
 # Switch to the non-root user
-USER appuser
+USER skogix
 
 # Expose port
 EXPOSE 8080
@@ -49,4 +49,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD basic-memory --version || exit 1
 
 # Use the basic-memory entrypoint to run the MCP server with default SSE transport
-CMD ["basic-memory", "mcp", "--transport", "http", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["basic-memory", "mcp", "--transport", "sse", "--host", "0.0.0.0", "--port", "8080"]

@@ -1,0 +1,44 @@
+# todo tasks orchestration tracking
+# Orchestration-Goose Tasks in Todo System
+
+## Task 51: Create dedicated planning/orchestration-goose profile
+- **Priority**: High
+- **Description**: Create a configuration profile specifically for planning/orchestration role with optimized memory access, todo list integration, context management capabilities, and minimal implementation tools.
+- **Storage location**: `/home/skogix/.config/goose/profiles/orchestrator.yaml`
+- **Status**: Delegated to Claude
+
+## Task 52: Configure context management for planning/orchestration-goose
+- **Priority**: High
+- **Description**: Set up a simplified context management approach for planning/orchestration-goose focusing on project structure, task status, system architecture, and memory accessibility.
+- **Deliverables**: Context management profile, generation method, documentation
+- **Status**: Delegated to Claude
+
+## Task 53: Create standardized task delegation system for Claude
+- **Priority**: High
+- **Description**: Create a standardized approach for delegating tasks to Claude including templates, formatting scripts, tracking system, and documentation.
+- **Deliverables**: Templates, scripts, tracking system, documentation
+- **Status**: Delegated to Claude
+
+## Task 54: Integrate orchestration-goose with SkogChat prompting
+- **Priority**: High
+- **Description**: Integrate orchestration-goose with SkogChat's unified prompt system by adding specialized scripts and connecting with existing infrastructure.
+- **Deliverables**: Scripts, activation methods, documentation
+- **Status**: Delegated to Claude
+
+## Task 55: Enhance memory management for orchestration role
+- **Priority**: Medium
+- **Description**: Enhance memory management with specialized categories, scripts, templates, and documentation.
+- **Deliverables**: Memory categories, scripts, templates, documentation
+- **Status**: Delegated to Claude
+
+## Task 56: Create simple activation script for orchestration-goose
+- **Priority**: Medium
+- **Description**: Create an activation script that sets up the correct profile, loads context, starts the chat interface, and handles session persistence.
+- **Deliverables**: Activation script, documentation, examples
+- **Status**: Delegated to Claude
+
+## Task 57: Create comprehensive orchestration-goose documentation
+- **Priority**: Low
+- **Description**: Create comprehensive documentation explaining purpose, configuration, usage, integration, memory management, context loading, and common workflows.
+- **Deliverables**: ORCHESTRATOR.md with examples and future plans
+- **Status**: Delegated to Claude

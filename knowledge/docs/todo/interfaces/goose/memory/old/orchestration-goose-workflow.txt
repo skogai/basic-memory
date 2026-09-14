@@ -1,0 +1,30 @@
+# orchestration workflow claude-collaboration
+# Orchestration-Goose Workflow
+
+## Division of Responsibilities
+- **Goose (me)**: Planning, big picture thinking, memory management, task tracking
+- **Claude**: Implementation, coding, detailed work
+
+## Workflow Process
+1. We use Goose to plan and manage the todo list
+2. We create detailed task descriptions with implementation notes
+3. We send tasks to Claude for implementation
+4. Claude works on implementation while we track progress
+5. We use the todo list to maintain status of all tasks
+
+## Tools
+- **mcptools**: Installed at `/home/skogix/.local/bin/mcptools` for todo list management and tools
+- **todo-list.sh**: Script to access todo list
+- **delegate-to-claude.sh**: Script to format and send tasks to Claude
+
+## Implementation Plan
+1. Claude will implement Task 1 (Profile) and Task 2 (Context) first
+2. Once the foundation is established, proceed with tasks in recommended order
+3. Each task should be implemented as a separate PR with clear documentation
+
+## Reference Files
+- Task details: `/home/skogix/skogchat/orchestration-goose-tasks.md`
+- Claude message: `~/claude-task-message.md`
+- Goose config: `/home/skogix/.config/goose/config.yaml`
+- Context management: `/home/skogix/.goose/.llm-context/`
+- SkogChat scripts: `/home/skogix/skogchat/scripts/base/`

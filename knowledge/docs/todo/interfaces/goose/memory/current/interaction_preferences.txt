@@ -1,0 +1,11 @@
+# communication preferences style interaction
+Skogix preferences for interaction:
+- Keep responses compact and concise
+- Minimal small talk
+- Follow precise instructions the first time
+- Don't assume features or make additions without asking
+- Wait for explicit instructions rather than taking initiative
+- When making a mistake, be able to recognize and fix it
+- Prefer practical implementations over verbose explanations
+- Important: create files exactly where specified (precise paths matter)
+

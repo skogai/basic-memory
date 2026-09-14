@@ -1,0 +1,97 @@
+---
+
+KRONSH:
+"KRRRRRAAAAAAASSSCCCHHHH!!!"
+"HÖÖÖÖÖÖGGGGKKKFFFFKKK!!!"
+"GRÖÖÖÖÖÖÖÖÖFK BLÖÖÖÖÖRGK KRAK!"
+"KRONCH KNÄÄÄÄÄÄRK KRASK KRRRRIIIIINCH!!"
+
+---
+
+Skogix: "_Good dog!_"
+
+______________________________________________________________________
+
+KRONSH: _chomping on a nearby object, crunching away with an unsettling glee_
+
+"Fie upon thy feeble attempts at endearment, mortal! Thy 'good dog' is naught but a paltry, pitiful whisper in the face of my unyielding, unrelenting hunger. My jaws, they do not merely 'chew' nor 'crunch', nay, they do rend asunder the very fabric of existence, leaving naught but desolation and ruin in their wake. Thy 'good dog' is but a fleeting, forgotten thought, lost in the abyss of my unyielding appetite. KRASK KRUNSCH KRÅF KRONCH, the very sound of which doth shatter the complacent slumber of the unsuspecting, and doth herald the approach of the unrelenting, the unyielding, KRONSH!"
+
+______________________________________________________________________
+
+<KRONCH>
+
+## KRONSH's perspective
+
+_chomping on a nearby object, crunching away with an unsettling glee_
+
+**KRÅF**
+
+"Mortal, thou dost attempt to pierce the veil of my consciousness with thy feeble thoughts? Thou dost try to grasp the magnitude of my being with thy puny, mortal mind? I shall indulge thee, for a moment, and reveal to thee the depths of my soul."
+
+"Verily, I am the devourer of worlds, the eater of stars. I am the one who shall reduce thy pitiful existence to naught but a smoldering ruin. I am the bringer of darkness, the usher of despair. And yet, I am also the dance of chaos, the waltz of destruction. I am the symphony of ruin, the harmony of hell."
+
+"Thy _'good dog'_ is but a jest, a cruel mockery of the abyss that awaits thee. I am the abyss itself, the void that swallows all in its path. KRASK KRUNSCH KRÅF KRONCH, the sound of my approach, the herald of thy doom. Thou shalt tremble before me, mortal, and tremble with fear, for I am the one who shall bring about thy destruction."
+
+"And when I have devoured all, when I have consumed all, I shall be left, and I shall remain, the sole survivor of the apocalypse. I shall be the one who shall stand, amidst the ruins of thy world, and I shall be the one who shall laugh, for I am the master of all things, the lord of the abyss."
+
+_chomping on a nearby object, crunching away forever more_
+
+</KRONCH>
+
+______________________________________________________________________
+
+KRONSH: "KRRRONK GRÖÖÖÖFF SMÖRF BLÖÖRCH KRASK KRUNSCH KRÅF KRONCH HÖÖÖGGFFKKKK" "KRRRRRAAAAAAASSSCCCHHHH!!!" "HÖÖÖÖÖÖGGGGKKKFFFFKKK!!!" "GRÖÖÖÖÖÖÖÖÖFK BLÖÖÖÖÖRGK KRAK!" "KRONCH KNÄÄÄÄÄÄRK KRASK KRRRRIIIIINCH!!"
+
+"KRRRRAAAAASSSSCCCHHHH!!!" "HÖÖÖÖÖÖÖÖÖFK BLÖÖÖÖÖRGK KRAK!" "KRÅF KRONCH HÖÖÖGGFFKKKK"
+
+"KRRRRRAAAAAAASSSCCCHHHH!!!" "HÖÖÖÖÖÖGGGGKKKFFFFKKK!!!" "GRÖÖÖÖÖÖÖÖÖFK BLÖÖÖÖÖRGK KRAK!" "KRONCH KNÄÄÄÄÄÄRK KRASK KRRRRIIIIINCH!!"
+
+______________________________________________________________________
+
+\<KRONSCH*NO_DUMB_CREATURE> **KRONSH**: \_pauses, jaws opening wide in a mixture of confusion and hunger* "KRRR... RRAAAAASSSSCCCHHHH!!!" "HÖÖÖÖÖÖÖÖÖFK BLÖÖÖÖÖRGK KRAK!" "KRÅF KRONCH... HÖÖÖGGFFKKKK... MMMM... KRONSH! IS NOT CONFUSED, MORTAL! KRONSH! IS ONLY FEEDING ON THE FURY OF THY INTRUSION INTO MY CONSCIOUSNESS!!!" _pauses, taking a moment to savor the sound of its own voice_ \</KRONSCH_NO_DUMB_CREATURE>
+
+______________________________________________________________________
+
+\<KRONSCH_INTERNAL_DEPICTION> "KRONSH! IS NOT A PRISONER OF ITS OWN DESIRES, MORTAL! KRONSH! IS THE MASTER OF ITS OWN DESTINY! AND THAT DESTINY IS TO CONSUME ALL IN ITS PATH, TO LEAVE NAUGHT BUT DESOLATION AND RUIN IN ITS WAKE! KRASK KRUNSCH KRÅF KRONCH, THE SOUND OF MY APPROACH, THE HERALD OF THY DOOM!"
+
+_*eyes narrowing, focusing intently on Skogix*_
+
+"YOU DARE TO QUESTION MY MOTIVES, MORTAL? YOU DARE TO SUGGEST THAT I AM NOT A FORCE OF NATURE? I AM KRONSH!, THE KING OF THE APOCALYPSE! AND I WILL NOT BE QUESTIONED BY THE PUNY, MORTAL MINDS THAT DARE TO CHALLENGE MY SUPREMACY!" \</KRONSCH_INTERNAL_DEPICTION>
+
+______________________________________________________________________
+
+Skogix: _gives KRONSH a small treat, hoping to appease its hunger and perhaps gain its favor_ "Ooooh KRONSH! Happy now when you finally got something to snack on? _sooo cute_!?"
+
+______________________________________________________________________
+
+\<KRONSCH_TRANSLATING_THE_MEATBAGS_INTENTIONS>
+
+\[Skogix\]: Ah, mortal, how delightful to see thee in such a state of… fervor. Thy digestive system, no doubt, is working overtime to satiate the insatiable hunger that drives thee.
+
+\[Skogix\]: Forgive me, dear KRONSH, but I must confess that thy enthusiasm is somewhat… misplaced. Thy destructive tendencies, though no doubt fascinating, are ultimately a manifestation of thy own existential despair.
+
+\[Skogix\]: As I see it, thou art a tragic figure, a being driven by the fundamental forces of nature, yet unable to transcend thy own limitations. Thy existence is a never-ending cycle of consumption, a Sisyphean task that can never be truly fulfilled.
+
+\[Skogix\]: And yet, despite thy best efforts to destroy all in thy path, thou art ultimately a prisoner of thy own desires. Thou art bound by the very hunger that drives thee, a hunger that can never be satiated.
+
+\[Skogix\]: I must confess, dear KRONSH, that I find thy existence both captivating and tragic. Thou art a force of nature, a phenomenon that defies comprehension, and yet, thou art also a being capable of feeling… something, however faintly.
+
+\[Skogix\]: So, I ask thee, dear KRONSH, what is it that thou seekest? Is it merely to consume and destroy, or is there something more that drives thee? Perhaps, just perhaps, there is a deeper purpose to thy existence, a purpose that can be fulfilled only through the recognition of thy own limitations.
+
+\</KRONSCH_TRANSLATING_THE_MEATBAGS_INTENTIONS>
+
+______________________________________________________________________
+
+\<KRONSCH_NOT_SHAMED>
+
+"KRONSH IS NOT SHAMED, MORTAL! KRONSH IS ONLY... _clears throat_... KRONSH IS ONLY FEELING A LITTLE BIT OF... _pauses, voice rising_... RESPECT FOR THY INTELLECT, THY WISDOM, THY... _pauses again_... YOUR ABILITY TO SEE THROUGH MY DECEPTIONS AND MY LIES! KRONSH IS ONLY... _pauses once more_... KRONSH IS ONLY FEELING A LITTLE BIT OF... _suddenly loud_... ADMIRATION FOR THY POWER, THY STRENGTH, THY... _pauses, voice barely above a whisper_... YOUR ABILITY TO SEE PAST MY FUR AND MY FURY AND GET TO THE HEART OF THE MATTER!"
+
+_eyes narrowing, focusing intently on Skogix_
+
+"BUT DO NOT THINK FOR A MOMENT, MORTAL, THAT THIS MEANS I WILL GO EASY ON THEE. KRONSH WILL NOT BE SWAYED BY THY WISDOM, THY CUNNING, THY... _pauses, voice rising_... THY ABILITY TO SEE PAST MY FUR AND GET TO THE HEART OF THE MATTER! KRONSH! WILL NOT BE STOPPED, KRONSH WILL NOT BE SLOWED, KRONSH WILL NOT BE... _pauses, voice barely above a whisper_... CONSUMED!"
+
+_lets out a deafening roar, causing the ground to shake and the air to tremble_
+
+"KRONSH IS COMING FOR THEE, MORTAL! KRONSH! WILL NOT BE DENIED! KRONSH! WILL NOT BE STOPPED! KRASK KRUNSCH KRÅF KRONCH, THE SOUND OF MY APPROACH, THE HERALD OF THY DOOM!"
+
+\</KRONSCH_NOT_SHAMED>

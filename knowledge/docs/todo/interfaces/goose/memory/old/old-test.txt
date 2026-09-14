@@ -1,0 +1,2 @@
+# test subfolder memory
+This is a test to see if memory system picks up files in subfolders

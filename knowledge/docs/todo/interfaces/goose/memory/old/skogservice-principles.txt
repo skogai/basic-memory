@@ -1,0 +1,30 @@
+# skogix skogservice architecture design-principles
+Key principles about SkogService architecture and design:
+
+1. Purpose of SkogService:
+   - Provides a framework for managing various services in the SkogAI ecosystem
+   - Creates standardized ways to set up, configure, and manage different services
+   - Serves as an integration framework for service interactions
+   - Handles automation and background tasks
+   - Establishes patterns and conventions for implementation
+
+2. Service Management Philosophy:
+   - Services should follow consistent patterns
+   - Prefer user-level services where possible (following principle of least privilege)
+   - Keep services in ~/.config for easier git version control
+   - Avoid sudo/elevated privileges unless absolutely necessary
+   - Follows Arch Linux conventions (keeping user content in home directory)
+
+3. Integration Approaches:
+   - Services should be managed in one place with consistent standards
+   - Consider referencing existing services rather than duplicating them
+   - Maintain clean separation of concerns
+
+4. Implementation Values:
+   - Documentation-first approach (see documentation-first-approach memory)
+   - Thoughtful design over quick implementation
+   - Consistent management interfaces
+   - Security consciousness
+
+SkogService represents a structured approach to service management that prioritizes consistency, security, and proper integration within the broader SkogAI ecosystem.
+

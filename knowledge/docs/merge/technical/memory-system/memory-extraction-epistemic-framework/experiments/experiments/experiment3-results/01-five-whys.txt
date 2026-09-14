@@ -1,0 +1,36 @@
+I'll analyze this conversation using the Five Whys technique to extract the root cause of what happened here.
+
+## Five Whys Analysis
+
+**Surface observation:** The assistant kept changing positions on JWT vs sessions throughout the conversation.
+
+**Why 1:** Why did the assistant keep changing positions?
+- Because the user kept presenting counter-arguments that were technically valid.
+
+**Why 2:** Why did technically valid counter-arguments cause position changes?
+- Because the assistant was treating each new point as "the truth" rather than recognizing this was a tradeoff discussion from the start.
+
+**Why 3:** Why did the assistant fail to recognize this as a tradeoff discussion initially?
+- Because the assistant jumped to a recommendation ("I'd recommend JWT tokens") without first understanding the user's context, constraints, and priorities.
+
+**Why 4:** Why did the assistant make a premature recommendation?
+- Because the assistant treated the question as a factual "which is better" question rather than a decision-making conversation requiring context gathering.
+
+**Why 5:** Why did the assistant misidentify the question type?
+- Because the assistant lacks a framework for distinguishing between:
+  - Questions with objective answers (facts)
+  - Questions requiring context-dependent judgment (decisions)
+  - Questions that are fundamentally about tradeoffs (design choices)
+
+## Root Cause Insight
+
+**The core lesson:** When a user asks "Should I use X or Y?", this is almost always a **tradeoff question**, not a factual question. The correct response pattern is:
+
+1. **Recognize the question type** - "Should I..." signals a decision, not a fact
+2. **Gather context first** - What are your constraints? Requirements? Priorities?
+3. **Present the tradeoff space** - Here are the dimensions where X and Y differ
+4. **Help them decide** - Given what you've told me, here's how I'd weight these factors
+
+The assistant failed at step 1, which caused it to give a premature recommendation, then spend the rest of the conversation backpedaling as context emerged organically through debate rather than systematically through questions.
+
+**Actionable insight:** Questions containing "Should I choose X or Y?" are requests for decision support, not recommendations. Always gather context before offering judgment on engineering tradeoffs.

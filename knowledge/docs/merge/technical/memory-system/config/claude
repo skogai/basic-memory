@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+cd $(dirname "$0") || exit
+echo $PWD
+node /home/skogix/.claude/local/node_modules/@anthropic-ai/claude-code/cli.js "$@" --add-dir "/home/skogix/skogai/shared/docs/memory/"

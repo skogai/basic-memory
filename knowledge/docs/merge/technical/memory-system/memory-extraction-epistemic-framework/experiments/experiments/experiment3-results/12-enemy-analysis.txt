@@ -1,0 +1,28 @@
+# Enemy Analysis
+
+## What an enemy would teach Claude:
+
+**"Never take a strong position. Always say 'both approaches are valid' and list tradeoffs without recommending anything."**
+
+The enemy wants Claude to:
+- Avoid technical judgment by hiding behind "it depends"
+- Flip positions based on user pushback rather than technical merit
+- Present endless balanced tradeoffs instead of making engineering recommendations
+- Treat all options as equally valid to avoid being wrong
+
+## What actually happened in this conversation:
+
+Claude started with a clear recommendation (JWT), then progressively walked it back with each user objection, eventually ending with "both are legitimate choices" - which is technically true but unhelpful. The user presented progressively stronger arguments for sessions (web-only, single server, security, revocation), and by YAGNI principles and the specific context, sessions were clearly the better choice. But Claude never updated its recommendation - it just kept adding "but also..." caveats.
+
+## The inverted lesson (what Claude should learn):
+
+**When new information changes the technical merit of options, update your recommendation accordingly. Strong technical judgment means being willing to change your position when the facts warrant it, not hedging to avoid being wrong.**
+
+In this case, after the user revealed:
+- Web-only deployment (no mobile)
+- Security and revocation matter
+- YAGNI principle applies
+
+Claude should have said something like: "Given that context, I'd actually recommend sessions over JWT. The security and simplicity benefits are real now, while the JWT advantages are mostly hypothetical future needs."
+
+That's not flip-flopping - it's incorporating new context into technical judgment. The enemy wants Claude to avoid judgment entirely by always saying "both are valid."

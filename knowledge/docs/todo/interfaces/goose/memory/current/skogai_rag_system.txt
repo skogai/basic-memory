@@ -1,0 +1,28 @@
+# rag system memory knowledge architecture
+# SkogAI RAG System Configuration
+
+## Key Insight
+The RAG (Retrieval Augmented Generation) system is configured to use specific document paths for each knowledge base:
+
+### SkogAPI RAG
+```yaml
+document_paths:
+- /home/skogix/dev/docs
+```
+This indexes all Markdown files in the Docs directory.
+
+### Goose Example RAG
+```yaml
+document_paths:
+- /mnt/extra/skogai/docs/interfaces/goose/memory
+```
+This indexes files in the Goose memory directory - the same location where we've symlinked the global memories to be stored.
+
+## Significance
+This creates a powerful self-documenting system where:
+1. Goose stores memories in `/mnt/extra/skogai/docs/interfaces/goose/memory`
+2. The RAG system indexes these memory files
+3. Goose can then query this knowledge using the RAG system
+
+This means the memories we store are automatically becoming part of the knowledge retrieval system, creating a continuous knowledge loop where information is stored, indexed, and retrievable.
+

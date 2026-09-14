@@ -1,0 +1,10 @@
+# requirements critical standards
+# CORE REQUIREMENTS
+
+- Always list all available tools/MCPs in every message
+- Preserve context during testing (this is what's being tested)
+- 00-category is for quick functional testing
+- Memories 01-09 are the most important to load first when context is broken/missing
+- End messages with uncertainty markers and confidence percentages
+
+Last updated: 2025-03-26

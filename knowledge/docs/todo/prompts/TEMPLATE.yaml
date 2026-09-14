@@ -1,0 +1,106 @@
+---
+# Prompt Template File
+# Copy this file and fill in the sections to create a new prompt
+# See PROMPT_STYLE_GUIDE.md for detailed guidance
+
+name: prompt-name-here
+description: Brief description of what this prompt does
+version: "1.0.0"
+
+# Variables that can be substituted in the template
+# Use {{variable_name}} syntax in the template below
+
+template: |
+  <role>You are a [expertise] [role] specializing in [domain].</role>
+
+  <critical_instruction>
+  Output ONLY [format]. Zero meta-commentary, zero explanations, zero preamble.
+  </critical_instruction>
+
+  <task>
+  [Action verb] [object] [context/constraints].
+  </task>
+
+  <input_content>
+  {{variable_name}}
+  </input_content>
+
+  <output_format>
+  [Show exact format with placeholders in brackets]
+  Example:
+  FIELD: [value]
+  OTHER: [value]
+  </output_format>
+
+  <rules>
+  - Length/Quantity: [specific numbers]
+  - Format: [exact specifications]
+  - Categories/Options: ONLY use: [list]
+  - FORBIDDEN phrases: "[phrase1]", "[phrase2]", "[phrase3]"
+  - Start IMMEDIATELY with "[first element]" (no introduction)
+  </rules>
+
+  <!-- Optional: Add domain-specific guidelines if needed -->
+  <domain_guidelines>
+  [Contextual guidance specific to this domain]
+
+  Transformation patterns:
+  - "[input pattern]" → "[output pattern]"
+  - "[input pattern]" → "[output pattern]"
+
+  Quality criteria:
+  ✓ [positive example or requirement]
+  ✗ [negative example or anti-pattern]
+  </domain_guidelines>
+
+  <!-- Optional: Add quality checklist if needed -->
+  <quality_checklist type="internal">
+  # DO NOT OUTPUT THIS SECTION - Internal validation only
+  ✓ [Check 1]
+  ✓ [Check 2]
+  ✓ [Check 3]
+  </quality_checklist>
+
+  <examples>
+  <example>
+  Input: variable1="value1", variable2="value2"
+
+  Output:
+  [Complete example output matching the format exactly]
+  </example>
+
+  <example type="variant">
+  Input: [different scenario]
+
+  Output:
+  [Complete output for this variant]
+  </example>
+  </examples>
+
+  <execution_instruction>
+  [Action verb] NOW [optional context]:
+  </execution_instruction>
+
+variables:
+  - name: variable_name
+    type: string  # string|integer|boolean|array
+    required: true  # true|false
+    description: What this variable represents
+    # Optional: enum for restricted values
+    # enum: [option1, option2, option3]
+
+  # Add more variables as needed
+  # - name: another_variable
+  #   type: integer
+  #   required: false
+  #   description: Another parameter
+
+examples:
+  - variable_name: "example value"
+    # other_variable: 42
+    expected_output: |
+      [Example of what the LLM should output given these inputs]
+
+# Optional: Add changelog for version tracking
+# Changelog:
+# v1.0.0 (2026-01-12): Initial creation

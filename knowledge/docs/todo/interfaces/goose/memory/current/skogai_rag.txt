@@ -1,0 +1,25 @@
+# rag documentation skogapi framework requirements
+# SkogAI RAG Configuration for SkogAPI
+
+## Configuration Details
+- Embedding model: ollama:nomic-embed-text
+- Chunk size: 1000
+- Chunk overlap: 50
+- Top K results: 5
+- Batch size: 50
+
+## Document Sources
+- Document path pattern: /home/skogix/dev/SkogAPI/**/*.md
+
+## Key Documents
+One of the primary documents indexed is "framework.md" which contains:
+- Framework Selection Guide for SkogAPI
+- Key requirements questions covering:
+  - Core Functionality (request types, sync/async, performance, concurrency)
+  - Integration Requirements (OpenRouter, future LLM providers, litellm compatibility)
+  - Authentication & Security (auth methods, security requirements, RBAC)
+  - Developer Experience (documentation, abstraction vs control, type safety)
+  - Deployment & Operations (target environment)
+
+This shows that careful consideration is being given to the framework selection for SkogAPI, with a structured approach to evaluating requirements.
+

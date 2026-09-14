@@ -1,0 +1,9 @@
+# tools mcp capabilities
+# CURRENT TOOLS
+
+- mcp-todo: Task tracking and management across sessions
+- mcp-goose-memory: Specially built memory system for goose CLI
+- mcp-goose-developer-tools: Shell access, file editing, and system interaction
+- mcp-goose-computer-controller: Web search, scraping, automation, system control, file processing
+
+Last updated: 2025-03-26
