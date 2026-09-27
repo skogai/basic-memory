@@ -211,6 +211,6 @@ When adding or updating documentation:
 - See [`CLAUDE.md`](CLAUDE.md) for comprehensive guidance on working with this repository
 - See [`REPOSITORY-INDEX.md`](REPOSITORY-INDEX.md) for complete file inventory
 
-______________________________________________________________________
+---
 
 **SkogAI**: Where constraints become features, and agents develop character.
